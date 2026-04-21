@@ -54,8 +54,8 @@ export default function App() {
   const renderStartRef = useRef<number>(0);
   const renderTotalRowsRef = useRef<number>(128);
   // Light transport params (research knobs)
-  const [maxBounces, setMaxBounces] = useState(0);
-  const [ambient, setAmbient] = useState(0.08);
+  const [maxBounces] = useState(0);
+  const [ambient] = useState(0.08);
   const [spp, setSpp] = useState(64);
   const [gridSize, setGridSize] = useState(128);
   const [hemiRes, setHemiRes] = useState(256);
@@ -65,10 +65,22 @@ export default function App() {
   const [gsPhaseBits, setGsPhaseBits] = useState(0); // 0 = no quantization
   const [gsNoiseSigma, setGsNoiseSigma] = useState(0.0); // radians
   const [gsLivePreview, setGsLivePreview] = useState(true);
-  const [gsPreviewDelayMs, setGsPreviewDelayMs] = useState(40); // ms between iters when live preview on
+  const [gsPreviewDelayMs] = useState(0); // unused, kept for API compat
   const [gsProgress, setGsProgress] = useState(0);
   const [gsItersDone, setGsItersDone] = useState(0);
   const [gsPhase, setGsPhase] = useState<'idle' | 'running'>('idle');
+
+  // Parallax test
+  const [parallaxState, setParallaxState] = useState<'idle' | 'generating' | 'done'>('idle');
+  const [parallaxProgress, setParallaxProgress] = useState(0);
+  const [parallaxFrames, setParallaxFrames] = useState<Uint8ClampedArray[]>([]);
+  const [parallaxFrameIdx, setParallaxFrameIdx] = useState(0);
+  const [parallaxPlaying, setParallaxPlaying] = useState(false);
+  const [parallaxOrbitRadius, setParallaxOrbitRadius] = useState(200); // mm
+  const [parallaxOrbitAxis, setParallaxOrbitAxis] = useState<'horizontal' | 'vertical'>('horizontal');
+  const parallaxPlayRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const PARALLAX_FRAMES = 24;
+  const PARALLAX_EYE_CENTER = { x: 278, y: 273, z: -800 };
 
   // Hover-on-hogel diagnostic preview
   const [hogelPreview, setHogelPreview] = useState<{
@@ -230,6 +242,50 @@ export default function App() {
     }
   }, []);
 
+  // Auto-play parallax frames
+  useEffect(() => {
+    if (parallaxPlaying && parallaxFrames.length > 0) {
+      parallaxPlayRef.current = setInterval(() => {
+        setParallaxFrameIdx(i => (i + 1) % parallaxFrames.length);
+      }, 80);
+    } else if (parallaxPlayRef.current) {
+      clearInterval(parallaxPlayRef.current);
+      parallaxPlayRef.current = null;
+    }
+    return () => { if (parallaxPlayRef.current) clearInterval(parallaxPlayRef.current); };
+  }, [parallaxPlaying, parallaxFrames.length]);
+
+  // Generate parallax sequence: reconstruct from 24 positions on a circle
+  const generateParallax = useCallback(async () => {
+    if (!window.holosim || renderState !== 'done') return;
+    setParallaxState('generating');
+    setParallaxProgress(0);
+    setParallaxFrames([]);
+    setParallaxFrameIdx(0);
+    setParallaxPlaying(false);
+
+    const frames: Uint8ClampedArray[] = [];
+    const OUT = holoState.fullWidth ?? 1024;
+    const { x: ex, y: ey, z: ez } = PARALLAX_EYE_CENTER;
+    const r = parallaxOrbitRadius;
+
+    for (let i = 0; i < PARALLAX_FRAMES; i++) {
+      const t = (i / PARALLAX_FRAMES) * Math.PI * 2;
+      const eyeX = parallaxOrbitAxis === 'horizontal' ? ex + Math.cos(t) * r : ex;
+      const eyeY = parallaxOrbitAxis === 'vertical'   ? ey + Math.sin(t) * r : ey;
+      const eyeZ = parallaxOrbitAxis === 'horizontal' ? ez + Math.sin(t) * r : ez + Math.cos(t) * r;
+
+      const r2 = await window.holosim!.gpuSessionReconstruct(eyeX, eyeY, eyeZ);
+      if (!r2.ok || !r2.data) break;
+      frames.push(decode(r2.data.reconBase64));
+      setParallaxProgress((i + 1) / PARALLAX_FRAMES);
+    }
+
+    setParallaxFrames(frames);
+    setParallaxState('done');
+    setParallaxPlaying(true);
+  }, [renderState, parallaxOrbitRadius, parallaxOrbitAxis, holoState.fullWidth, decode]);
+
   // Mouse handler on main viewport → pick hogel under cursor, fetch preview
   const handleReconMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (renderState !== 'done' || !holoState.gridW || !holoState.gridH) return;
@@ -315,8 +371,7 @@ export default function App() {
                   drawRecon(decode(prev.data.reconBase64), OUT, OUT);
                 }
               }
-              // Pacing: gsPreviewDelayMs between iterations for a visibly smooth animation.
-              // 0 = as fast as possible (still yields to event loop).
+              // Yield to event loop between iterations so UI stays responsive.
               await new Promise(resolve => setTimeout(resolve, gsLivePreview ? gsPreviewDelayMs : 0));
             }
           }
@@ -357,7 +412,7 @@ export default function App() {
       return;
     }
     setRunning(r => !r);
-  }, [nativeStatus.available, renderState, maxBounces, ambient, spp, gridSize, hemiRes, decode, drawRecon, gsEnabled, gsIterations, gsPhaseBits, gsNoiseSigma, gsLivePreview, gsPreviewDelayMs]);
+  }, [nativeStatus.available, renderState, spp, gridSize, hemiRes, decode, drawRecon, gsEnabled, gsIterations, gsPhaseBits, gsNoiseSigma, gsLivePreview, maxBounces, ambient]);
 
   const progressPct = nativeStatus.available
     ? (renderProgress * 100).toFixed(1)
@@ -486,32 +541,6 @@ export default function App() {
             </div>
           </section>
 
-          {/* Diagnostics Section */}
-          {nativeStatus.scene && (
-            <section className="space-y-4">
-              <h2 className="text-sm font-medium text-neutral-400 uppercase tracking-wider flex items-center gap-2">
-                <Layers className="w-4 h-4" />
-                Scene: {nativeStatus.scene.sceneName}
-              </h2>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg flex flex-col">
-                  <span className="text-neutral-500 mb-1">Triangles</span>
-                  <span className="font-mono text-amber-400">{nativeStatus.scene.triangleCount}</span>
-                </div>
-                <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg flex flex-col">
-                  <span className="text-neutral-500 mb-1">Materials</span>
-                  <span className="font-mono text-amber-400">{nativeStatus.scene.materialCount}</span>
-                </div>
-                <div className="col-span-2 p-3 bg-neutral-900 border border-neutral-800 rounded-lg flex flex-col">
-                  <span className="text-neutral-500 mb-1">Ray Trace Test</span>
-                  <span className={`font-mono ${nativeStatus.traceHit ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {nativeStatus.traceHit ? 'Hit ✓' : 'Miss ✗'}
-                  </span>
-                </div>
-              </div>
-            </section>
-          )}
-
           {/* Light Transport / Panel Research Controls */}
           {nativeStatus.available && (
             <section className="space-y-4">
@@ -521,16 +550,14 @@ export default function App() {
               </h2>
               <div className="space-y-3 text-xs">
                 {[
-                  { label: 'Max bounces (0 = direct+ambient)', value: maxBounces, setter: setMaxBounces, min: 0, max: 6, step: 1, testid: 'slider-max-bounces' },
-                  { label: 'Ambient term (indirect proxy)', value: ambient, setter: setAmbient, min: 0, max: 0.3, step: 0.005, fixed: 3, testid: 'slider-ambient' },
                   { label: 'Samples per pixel', value: spp, setter: setSpp, min: 1, max: 1024, step: 1, testid: 'slider-spp' },
                   { label: 'Hogel grid (N×N)', value: gridSize, setter: setGridSize, min: 16, max: 256, step: 16, testid: 'slider-grid-size' },
                   { label: 'Hemisphere resolution', value: hemiRes, setter: setHemiRes, min: 32, max: 512, step: 32, testid: 'slider-hemi-res' },
-                ].map(({ label, value, setter, min, max, step, fixed, testid }) => (
+                ].map(({ label, value, setter, min, max, step, testid }) => (
                   <div key={label}>
                     <div className="flex justify-between text-neutral-400 mb-1">
                       <span>{label}</span>
-                      <span className="font-mono text-amber-300">{fixed != null ? (value as number).toFixed(fixed) : value}</span>
+                      <span className="font-mono text-amber-300">{value}</span>
                     </div>
                     <input
                       type="range"
@@ -543,8 +570,7 @@ export default function App() {
                   </div>
                 ))}
                 <p className="text-neutral-600 text-[10px]">
-                  Bounces=0 + ambient is the fastest (direct-only + constant indirect proxy).
-                  Bounces≥1 uses unbiased NEE path tracing for indirect.
+                  {gridSize}×{gridSize} hogels · {hemiRes}×{hemiRes} each · {(gridSize * gridSize * hemiRes * hemiRes / 1e6).toFixed(1)}M pixels total
                 </p>
               </div>
             </section>
@@ -604,24 +630,6 @@ export default function App() {
                     />
                     <span>Show live convergence preview</span>
                   </label>
-                  {gsLivePreview && (
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs text-neutral-400">
-                        <span>Animation pacing</span>
-                        <span className="text-neutral-300 tabular-nums">{gsPreviewDelayMs} ms/iter</span>
-                      </div>
-                      <input
-                        type="range"
-                        min={0}
-                        max={200}
-                        step={5}
-                        value={gsPreviewDelayMs}
-                        onChange={e => setGsPreviewDelayMs(Number(e.target.value))}
-                        className="w-full accent-emerald-500"
-                        data-testid="gs-preview-delay"
-                      />
-                    </div>
-                  )}
                   {gsPhase === 'running' && (
                     <div className="w-full bg-neutral-800 h-1 rounded overflow-hidden">
                       <div
@@ -669,9 +677,10 @@ export default function App() {
             </div>
             {holoState.gridW && (
               <div className="text-xs font-mono text-neutral-500 space-y-0.5">
-                <div>{holoState.gridW}×{holoState.gridH} hogels · {holoState.hemiRes}px hemisphere · λ=532nm</div>
-                <div>Full hologram: {holoState.fullWidth}×{holoState.fullHeight}px</div>
-                {holoState.time != null && <div className="text-emerald-400">Hologram assembly: {holoState.time}ms</div>}
+                <div>{holoState.gridW}×{holoState.gridH} hogels ({holoState.gridW! * holoState.gridH!} total) · {holoState.hemiRes}px hemisphere</div>
+                <div>{((holoState.gridW! * holoState.gridH! * holoState.hemiRes! * holoState.hemiRes!) / 1e6).toFixed(1)}M pixels · λ=532nm</div>
+                <div>Reconstruction: {holoState.fullWidth}×{holoState.fullHeight}px</div>
+                {holoState.time != null && <div className="text-emerald-400">Total time: {holoState.time}ms</div>}
               </div>
             )}
           </section>
@@ -679,41 +688,91 @@ export default function App() {
           <section className="space-y-4">
             <h2 className="text-sm font-medium text-neutral-400 uppercase tracking-wider flex items-center gap-2">
               <Layers className="w-4 h-4" />
-              Pipeline Architecture
+              Cornell Box Scene
             </h2>
-            <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-sm text-neutral-400 space-y-3">
-              <p>
-                <strong className="text-neutral-200 block">1. Path Tracer</strong>
-                Simulates lightfield hemisphere (64×64) from current hogel ({stats.currentX}, {stats.currentY}).
-              </p>
-              <div className="w-full h-px bg-neutral-800"></div>
-              <p>
-                <strong className="text-neutral-200 block">2. Interference Generator</strong>
-                Generates 512×512 subpixel diffraction grating from lightfield.
-              </p>
-              <div className="w-full h-px bg-neutral-800"></div>
-              <p>
-                <strong className="text-neutral-200 block">3. True FFT Reconstructor</strong>
-                Validates the grating mathematically via 2D Radix-2 Ping-Pong passes over diffraction array.
-              </p>
-              <div className="w-full h-px bg-neutral-800"></div>
-              <p>
-                <strong className="text-neutral-200 block">4. Camera Sensor (Expanding Window)</strong>
-                FFT light map is accumulated with positional parallax.
-              </p>
-            </div>
-            
-            <div className="h-64 mt-4 w-full bg-neutral-950 border border-neutral-800 rounded-xl overflow-hidden relative">
+            <div className="h-64 w-full bg-neutral-950 border border-neutral-800 rounded-xl overflow-hidden relative">
                <DiagnosticsVisualizer
                  hoveredHogel={hogelPreview
                    ? { hx: hogelPreview.hx, hy: hogelPreview.hy, gridW: holoState.gridW ?? gridSize, gridH: holoState.gridH ?? gridSize }
                    : undefined}
+                 parallaxOrbit={parallaxState !== 'idle' ? {
+                   centerX: PARALLAX_EYE_CENTER.x,
+                   centerY: PARALLAX_EYE_CENTER.y,
+                   centerZ: PARALLAX_EYE_CENTER.z,
+                   radius: parallaxOrbitRadius,
+                   axis: parallaxOrbitAxis,
+                   frameIdx: parallaxFrameIdx,
+                   totalFrames: PARALLAX_FRAMES,
+                 } : undefined}
                />
                <div className="absolute top-2 left-2 px-2 py-1 bg-black/60 backdrop-blur rounded text-[10px] text-neutral-400 font-mono">
                  Cornell Box · {gridSize}×{gridSize} hogels (drag to rotate)
                </div>
             </div>
           </section>
+
+          {/* Parallax test */}
+          {nativeStatus.available && (
+            <section className="space-y-4">
+              <h2 className="text-sm font-medium text-neutral-400 uppercase tracking-wider flex items-center gap-2">
+                <Layers className="w-4 h-4" />
+                Parallax Test
+              </h2>
+              <div className="space-y-3 text-xs">
+                <div>
+                  <div className="flex justify-between text-neutral-400 mb-1">
+                    <span>Orbit radius (mm)</span>
+                    <span className="font-mono text-amber-300">{parallaxOrbitRadius}</span>
+                  </div>
+                  <input type="range" min={50} max={600} step={50} value={parallaxOrbitRadius}
+                    onChange={e => setParallaxOrbitRadius(Number(e.target.value))}
+                    className="w-full accent-amber-500" />
+                </div>
+                <div className="flex gap-2">
+                  {(['horizontal', 'vertical'] as const).map(ax => (
+                    <button key={ax}
+                      onClick={() => setParallaxOrbitAxis(ax)}
+                      className={`flex-1 py-1.5 rounded text-xs font-medium border transition-colors ${parallaxOrbitAxis === ax ? 'bg-amber-600 border-amber-500 text-white' : 'bg-neutral-900 border-neutral-700 text-neutral-400 hover:border-neutral-600'}`}>
+                      {ax}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={generateParallax}
+                  disabled={renderState !== 'done' || parallaxState === 'generating'}
+                  className="w-full py-2 rounded-lg font-medium text-xs bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  {parallaxState === 'generating' ? `Generating… ${(parallaxProgress * 100).toFixed(0)}%` : `Generate ${PARALLAX_FRAMES} frames`}
+                </button>
+                {parallaxState === 'generating' && (
+                  <div className="w-full bg-neutral-800 h-1 rounded overflow-hidden">
+                    <div className="h-full bg-amber-500 transition-all" style={{ width: `${parallaxProgress * 100}%` }} />
+                  </div>
+                )}
+                {parallaxState === 'done' && parallaxFrames.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => setParallaxPlaying(p => !p)}
+                        className="px-3 py-1.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-300 hover:bg-neutral-700 transition-colors text-xs">
+                        {parallaxPlaying ? '⏸ Pause' : '▶ Play'}
+                      </button>
+                      <span className="font-mono text-neutral-500">{parallaxFrameIdx + 1} / {parallaxFrames.length}</span>
+                    </div>
+                    <input type="range" min={0} max={parallaxFrames.length - 1} step={1}
+                      value={parallaxFrameIdx}
+                      onChange={e => { setParallaxPlaying(false); setParallaxFrameIdx(Number(e.target.value)); }}
+                      className="w-full accent-amber-500" />
+                    <PreviewCanvas
+                      data={parallaxFrames[parallaxFrameIdx]}
+                      width={holoState.fullWidth ?? 1024}
+                      height={holoState.fullHeight ?? 1024}
+                      label={`Frame ${parallaxFrameIdx + 1} · ${parallaxOrbitAxis} orbit`}
+                    />
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
 
         </aside>
 

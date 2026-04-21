@@ -300,7 +300,7 @@ __global__ void render_hemispheres(
 
     for (int s = 0; s < spp; s++) {
         float u = (2.0f * ((float)px + rng_f32(&rng_state)) / fres) - 1.0f;
-        float v = (2.0f * ((float)py + rng_f32(&rng_state)) / fres) - 1.0f;
+        float v = 1.0f - (2.0f * ((float)py + rng_f32(&rng_state)) / fres);  // Y-flip: row 0 = top = +Y
         float r = sqrtf(u*u + v*v);
         if (r > 1.0f) continue;
 
@@ -395,9 +395,8 @@ __global__ void downsample_to_preview(
 }
 
 // Scatter the GS-reconstructed intensity from one batch of hogels into the
-// output accumulator with Gaussian-aperture weighting.
-// Each hogel pushes its contribution to the ~(2*half_w+1)^2 output pixels
-// it covers. Uses atomicAdd.
+// output accumulator. Each hogel fills its tile (box filter, flat weight=1).
+// Uses atomicAdd.
 __global__ void scatter_hogel_contributions(
     const float* __restrict__ intensity_batch, // [batch × hemi_res × hemi_res] float
     float* __restrict__ output_accum,          // [out_w × out_h] float (atomic)
@@ -409,8 +408,8 @@ __global__ void scatter_hogel_contributions(
     int out_w, int out_h,
     float box_w, float box_h,
     float eye_x, float eye_y, float eye_z,
-    float sigma_panel,   // Gaussian σ in panel coordinates (mm)
-    int half_w           // ceil(2.5 * sigma_panel/box_w * out_w) + 1
+    float sigma_panel,   // unused (kept for API compat)
+    int half_w           // half-width of the hogel tile in output pixels
 ) {
     // blockIdx.y = hogel index within batch
     // blockIdx.x * blockDim.x + threadIdx.x = index within scatter window
@@ -424,7 +423,6 @@ __global__ void scatter_hogel_contributions(
     float cell_h = box_h / (float)grid_h;
     float hcx = (gx + 0.5f) * cell_w;
     float hcy = (gy + 0.5f) * cell_h;
-    float inv2s2 = 1.0f / (2.0f * sigma_panel * sigma_panel);
 
     // Hogel centre in output-pixel space (Y-flipped: panel y=0 → output bottom)
     float cx_out = hcx / box_w * (float)out_w;
@@ -447,12 +445,6 @@ __global__ void scatter_hogel_contributions(
     float panel_x = ((float)px + 0.5f) / (float)out_w * box_w;
     float panel_y = (1.0f - ((float)py + 0.5f) / (float)out_h) * box_h;
 
-    // Gaussian weight (panel-space distance from hogel centre)
-    float ddx = panel_x - hcx;
-    float ddy = panel_y - hcy;
-    float w = expf(-(ddx*ddx + ddy*ddy) * inv2s2);
-    if (w < 1e-4f) return;
-
     // Direction from observer through panel point
     float dx = panel_x - eye_x;
     float dy = panel_y - eye_y;
@@ -474,14 +466,15 @@ __global__ void scatter_hogel_contributions(
 
     float hr = (float)hemi_res;
     int hu = min((int)((phi_cos * r_fish * 0.5f + 0.5f) * hr), hemi_res - 1);
-    int hv = min((int)((phi_sin * r_fish * 0.5f + 0.5f) * hr), hemi_res - 1);
+    // Y-flip: hemisphere stored row 0 = top = +phi_sin, so invert V axis
+    int hv = min((int)((0.5f - phi_sin * r_fish * 0.5f) * hr), hemi_res - 1);
 
     long long hpx = (long long)hogel_in_batch * hemi_res * hemi_res + (long long)hv * hemi_res + hu;
     float intensity = intensity_batch[hpx];
 
     int out_idx = py * out_w + px;
-    atomicAdd(&output_accum[out_idx], w * intensity);
-    atomicAdd(&weight_accum[out_idx], w);
+    atomicAdd(&output_accum[out_idx], intensity);
+    atomicAdd(&weight_accum[out_idx], 1.0f);
 }
 
 // Normalize the scatter accumulators and apply filmic tonemapping → RGBA.

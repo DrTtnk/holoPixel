@@ -15,15 +15,50 @@ const LW = LX[1] - LX[0], LD = LZ[1] - LZ[0];
 
 interface Props {
   hoveredHogel?: { hx: number; hy: number; gridW: number; gridH: number };
+  parallaxOrbit?: {
+    // All coords in Cornell Box space (mm)
+    centerX: number; centerY: number; centerZ: number;
+    radius: number;
+    axis: 'horizontal' | 'vertical';
+    frameIdx?: number;   // current active frame (0-based)
+    totalFrames?: number;
+  };
 }
 
-export function DiagnosticsVisualizer({ hoveredHogel }: Props) {
+// Build a polyline ring in Three.js space (Cornell Box mm / 100 → Three.js units)
+function orbitPoints(
+  cx_mm: number, cy_mm: number, cz_mm: number,
+  radius_mm: number,
+  axis: 'horizontal' | 'vertical',
+  segments = 64
+): Float32Array {
+  const pts: number[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * Math.PI * 2;
+    if (axis === 'horizontal') {
+      pts.push(
+        (cx_mm + Math.cos(t) * radius_mm) / 100,
+        cy_mm / 100,
+        (cz_mm + Math.sin(t) * radius_mm) / 100,
+      );
+    } else {
+      pts.push(
+        cx_mm / 100,
+        (cy_mm + Math.sin(t) * radius_mm) / 100,
+        (cz_mm + Math.cos(t) * radius_mm) / 100,
+      );
+    }
+  }
+  return new Float32Array(pts);
+}
+
+export function DiagnosticsVisualizer({ hoveredHogel, parallaxOrbit }: Props) {
   // Hogel indicator position on the panel (z=0)
   const hogelX = hoveredHogel
     ? (hoveredHogel.hx + 0.5) / hoveredHogel.gridW * W
     : cx;
   const hogelY = hoveredHogel
-    ? (hoveredHogel.hy + 0.5) / hoveredHogel.gridH * H
+    ? (1 - (hoveredHogel.hy + 0.5) / hoveredHogel.gridH) * H
     : cy;
 
   return (
@@ -120,6 +155,31 @@ export function DiagnosticsVisualizer({ hoveredHogel }: Props) {
         </bufferGeometry>
         <lineBasicMaterial color="#10b981" transparent opacity={0.5} />
       </line>
+
+      {/* ── Parallax orbit circle ── */}
+      {parallaxOrbit && (() => {
+        const { centerX, centerY, centerZ, radius, axis, frameIdx, totalFrames = 24 } = parallaxOrbit;
+        const ringPts = orbitPoints(centerX, centerY, centerZ, radius, axis);
+        // Active camera position on the orbit
+        const t = frameIdx !== undefined ? (frameIdx / totalFrames) * Math.PI * 2 : 0;
+        const camPos: [number, number, number] = axis === 'horizontal'
+          ? [(centerX + Math.cos(t) * radius) / 100, centerY / 100, (centerZ + Math.sin(t) * radius) / 100]
+          : [centerX / 100, (centerY + Math.sin(t) * radius) / 100, (centerZ + Math.cos(t) * radius) / 100];
+        return (
+          <>
+            <line>
+              <bufferGeometry>
+                <bufferAttribute attach="attributes-position" args={[ringPts, 3]} />
+              </bufferGeometry>
+              <lineBasicMaterial color="#f59e0b" transparent opacity={0.7} />
+            </line>
+            <mesh position={camPos}>
+              <sphereGeometry args={[0.15, 12, 12]} />
+              <meshBasicMaterial color="#f59e0b" />
+            </mesh>
+          </>
+        );
+      })()}
     </Canvas>
   );
 }

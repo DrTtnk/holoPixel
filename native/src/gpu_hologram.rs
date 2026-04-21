@@ -199,12 +199,11 @@ impl GpuHologramSession {
         let weight_accum_dev = stream.alloc_zeros::<f32>(out_pixels).expect("alloc weight_accum");
         let recon_dev       = stream.alloc_zeros::<u8>(out_pixels * 4).expect("alloc recon");
 
-        // Precompute scatter geometry
+        // Precompute scatter geometry (box fill: each hogel fills its tile, flat weight)
         let cell_w = BOX_W / grid_w as f32;
         let cell_h = BOX_H / grid_h as f32;
-        let sigma_panel = 0.7f32 * cell_w.min(cell_h);
-        let sigma_out_x = sigma_panel / BOX_W * out_w as f32;
-        let half_w = (2.5f32 * sigma_out_x).ceil() as i32 + 1;
+        let sigma_panel = 0.5f32 * cell_w.min(cell_h); // kept for API compat, not used as Gaussian
+        let half_w = ((0.5f32 * cell_w / BOX_W * out_w as f32).ceil() as i32).max(1);
 
         Self {
             grid_w, grid_h, hemi_res, spp, out_w, out_h, max_bounces, ambient,
