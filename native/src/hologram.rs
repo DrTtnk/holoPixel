@@ -7,7 +7,6 @@ use crate::scene::{self, Vec3};
 use crate::renderer;
 
 // ── Physical constants ────────────────────────────────────
-const WAVELENGTH: f64 = 532e-9; // 532 nm green laser
 const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 
 // ── Display panel geometry ────────────────────────────────
@@ -16,29 +15,6 @@ const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 
 const BOX_W: f32 = 552.8; // Cornell Box width (x)
 const BOX_H: f32 = 548.8; // Cornell Box height (y)
-
-// ── 2D FFT (row-column decomposition) ─────────────────────
-
-fn fft2(data: &mut [Complex64], width: usize, height: usize) {
-    let mut planner = FftPlanner::new();
-
-    let fft_row = planner.plan_fft_forward(width);
-    for row in data.chunks_exact_mut(width) {
-        fft_row.process(row);
-    }
-
-    let fft_col = planner.plan_fft_forward(height);
-    let mut col = vec![Complex64::new(0.0, 0.0); height];
-    for x in 0..width {
-        for y in 0..height {
-            col[y] = data[y * width + x];
-        }
-        fft_col.process(&mut col);
-        for y in 0..height {
-            data[y * width + x] = col[y];
-        }
-    }
-}
 
 fn ifft2(data: &mut [Complex64], width: usize, height: usize) {
     let mut planner = FftPlanner::new();

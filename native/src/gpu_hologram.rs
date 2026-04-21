@@ -3,7 +3,7 @@ use cudarc::nvrtc::Ptx;
 use cudarc::cufft::{CudaFft, FftDirection, sys as cufft_sys};
 use std::sync::Arc;
 
-use crate::scene::{self, Vec3, Triangle, Material, MaterialKind};
+use crate::scene::{self, MaterialKind};
 
 const CUDA_SRC: &str = include_str!("kernels.cu");
 const BOX_W: f32 = 552.8;
@@ -81,32 +81,6 @@ fn compile_cuda() -> Ptx {
     Ptx::from_src(ptx.to_src().replace(".version 8.8", ".version 8.0"))
 }
 
-/// Pack scene triangles into flat f32 array for GPU.
-/// Layout per triangle: v0.xyz, v1.xyz, v2.xyz, normal.xyz, material_idx (13 floats)
-fn pack_triangles(scene: &scene::Scene) -> Vec<f32> {
-    let mut data = Vec::with_capacity(scene.triangles.len() * 13);
-    for tri in &scene.triangles {
-        data.extend_from_slice(&[tri.v0.x, tri.v0.y, tri.v0.z]);
-        data.extend_from_slice(&[tri.v1.x, tri.v1.y, tri.v1.z]);
-        data.extend_from_slice(&[tri.v2.x, tri.v2.y, tri.v2.z]);
-        data.extend_from_slice(&[tri.normal.x, tri.normal.y, tri.normal.z]);
-        data.push(f32::from_bits(tri.material_idx as u32));
-    }
-    data
-}
-
-/// Pack materials into flat f32 array for GPU.
-/// Layout per material: albedo.xyz, emission.xyz, kind (7 floats)
-fn pack_materials(scene: &scene::Scene) -> Vec<f32> {
-    let mut data = Vec::with_capacity(scene.materials.len() * 7);
-    for mat in &scene.materials {
-        data.extend_from_slice(&[mat.albedo.x, mat.albedo.y, mat.albedo.z]);
-        data.extend_from_slice(&[mat.emission.x, mat.emission.y, mat.emission.z]);
-        let kind_int: i32 = match mat.kind { MaterialKind::Diffuse => 0, MaterialKind::Emissive => 1 };
-        data.push(f32::from_bits(kind_int as u32));
-    }
-    data
-}
 // ── Session-based batched GPU pipeline ────────────────────
 
 use cudarc::driver::CudaSlice;

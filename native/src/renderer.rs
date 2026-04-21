@@ -11,7 +11,6 @@ const LIGHT_Z0: f32 = 227.0;
 const LIGHT_Z1: f32 = 332.0;
 const LIGHT_Y: f32 = 548.8 - 0.01;
 const LIGHT_AREA: f32 = (LIGHT_X1 - LIGHT_X0) * (LIGHT_Z1 - LIGHT_Z0);
-const LIGHT_NORMAL: Vec3 = Vec3::new(0.0, -1.0, 0.0); // facing down
 const LIGHT_EMISSION: Vec3 = Vec3::new(40.0, 40.0, 40.0);
 
 // ── Random number generator (xorshift64) ──────────────────
