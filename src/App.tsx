@@ -82,6 +82,7 @@ export default function App() {
   const [parallaxOrbitRadius, setParallaxOrbitRadius] = useState(200); // mm
   const [parallaxOrbitAxis, setParallaxOrbitAxis] = useState<'horizontal' | 'vertical'>('horizontal');
   const parallaxPlayRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const parallaxCanvasesRef = useRef<HTMLCanvasElement[]>([]);
 
   // Hover-on-hogel diagnostic preview
   const [hogelPreview, setHogelPreview] = useState<{
@@ -256,13 +257,28 @@ export default function App() {
     return () => { if (parallaxPlayRef.current) { clearInterval(parallaxPlayRef.current); parallaxPlayRef.current = null; } };
   }, [parallaxPlaying, parallaxFrames.length]);
 
+  // Pre-render parallax frames to offscreen canvases for zero-cost playback
+  useEffect(() => {
+    if (parallaxFrames.length === 0) { parallaxCanvasesRef.current = []; return; }
+    const OUT = holoState.fullWidth ?? 1024;
+    parallaxCanvasesRef.current = parallaxFrames.map(frame => {
+      const c = document.createElement('canvas');
+      c.width = OUT; c.height = OUT;
+      c.getContext('2d')!.putImageData(new ImageData(frame, OUT, OUT), 0, 0);
+      return c;
+    });
+  }, [parallaxFrames, holoState.fullWidth]);
+
   // Draw current parallax frame to main viewport canvas
   useEffect(() => {
-    if (parallaxFrames.length === 0 || !canvasRef.current) return;
-    const frame = parallaxFrames[parallaxFrameIdx];
-    const OUT = holoState.fullWidth ?? 1024;
-    drawRecon(frame, OUT, OUT);
-  }, [parallaxFrames, parallaxFrameIdx, holoState.fullWidth, drawRecon]);
+    const prebuilt = parallaxCanvasesRef.current[parallaxFrameIdx];
+    if (!prebuilt || !canvasRef.current) return;
+    const ctx = canvasRef.current.getContext('2d')!;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(prebuilt, 0, 0, canvasRef.current.width, canvasRef.current.height);
+  }, [parallaxFrameIdx]);
 
   // Generate parallax sequence: reconstruct from 24 positions on a circle
   const generateParallax = useCallback(async () => {
