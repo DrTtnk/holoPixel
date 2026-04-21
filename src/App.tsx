@@ -779,27 +779,31 @@ export default function App() {
                 <button
                   onClick={generateParallax}
                   disabled={renderState !== 'done' || parallaxState === 'generating'}
+                  data-testid="parallax-generate-btn"
+                  data-parallax-state={parallaxState}
                   className="w-full py-2 rounded-lg font-medium text-xs bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
                   {parallaxState === 'generating' ? `Generating… ${(parallaxProgress * 100).toFixed(0)}%` : `Generate ${PARALLAX_FRAMES} frames`}
                 </button>
                 {parallaxState === 'generating' && (
                   <div className="w-full bg-neutral-800 h-1 rounded overflow-hidden">
-                    <div className="h-full bg-amber-500 transition-all" style={{ width: `${parallaxProgress * 100}%` }} />
+                    <div data-testid="parallax-progress-bar" className="h-full bg-amber-500 transition-all" style={{ width: `${parallaxProgress * 100}%` }} />
                   </div>
                 )}
                 {parallaxState === 'done' && parallaxFrames.length > 0 && (
                   <div className="space-y-2">
                     <div className="flex items-center gap-2">
                       <button onClick={() => setParallaxPlaying(p => !p)}
+                        data-testid="parallax-play-btn"
                         className="px-3 py-1.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-300 hover:bg-neutral-700 transition-colors text-xs">
                         {parallaxPlaying ? '⏸ Pause' : '▶ Play'}
                       </button>
-                      <span className="font-mono text-neutral-500">{parallaxFrameIdx + 1} / {parallaxFrames.length}</span>
+                      <span data-testid="parallax-frame-counter" className="font-mono text-neutral-500">{parallaxFrameIdx + 1} / {parallaxFrames.length}</span>
                     </div>
                     <input type="range" min={0} max={parallaxFrames.length - 1} step={1}
                       value={parallaxFrameIdx}
                       onChange={e => { setParallaxPlaying(false); setParallaxFrameIdx(Number(e.target.value)); }}
+                      data-testid="parallax-scrubber"
                       className="w-full accent-amber-500" />
                     <PreviewCanvas
                       data={parallaxFrames[parallaxFrameIdx]}

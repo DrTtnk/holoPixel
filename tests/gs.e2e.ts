@@ -238,4 +238,118 @@ test.describe('Phase-only Holography (Gerchberg-Saxton + panel model)', () => {
 
     await app.close();
   });
+
+  test('parallax generation + playback canvas changes', async () => {
+    test.setTimeout(300_000);
+
+    const app: ElectronApplication = await electron.launch({
+      args: [path.join(ROOT, 'dist-electron/main.js')],
+      env: {
+        ...process.env,
+        LD_LIBRARY_PATH: `/usr/local/cuda-12.9/lib64:${process.env.LD_LIBRARY_PATH || ''}`,
+        NODE_ENV: 'production',
+      },
+    });
+
+    const window = await app.firstWindow();
+    await window.waitForLoadState('domcontentloaded');
+    await window.waitForTimeout(3000);
+
+    // Configure a small grid so parallax generation is fast
+    expect(await setSliderByTestId(window, 'slider-spp', 1)).toBe(true);
+    expect(await setSliderByTestId(window, 'slider-grid-size', 16)).toBe(true);
+    expect(await setSliderByTestId(window, 'slider-hemi-res', 64)).toBe(true);
+    expect(await setCheckboxByTestId(window, 'gs-enabled', true)).toBe(true);
+    expect(await setSliderByTestId(window, 'gs-iterations', 5)).toBe(true);
+    expect(await setSliderByTestId(window, 'gs-phase-bits', 0)).toBe(true);
+    expect(await setSliderByTestId(window, 'gs-noise-sigma', 0)).toBe(true);
+
+    // Run hologram pipeline to completion
+    await window.locator('[data-testid="compute-btn"]').click();
+    const t0 = Date.now();
+    while (Date.now() - t0 < 120_000) {
+      if (await getRenderState(window) === 'done') break;
+      await window.waitForTimeout(200);
+    }
+    expect(await getRenderState(window), 'pipeline must reach done').toBe('done');
+
+    // The generate button should now be enabled
+    const genBtn = window.locator('[data-testid="parallax-generate-btn"]');
+    await expect(genBtn).toBeVisible();
+    await expect(genBtn).toBeEnabled();
+
+    // Generate parallax frames
+    await genBtn.click();
+
+    // Wait for parallax-state=done (poll the button attribute)
+    const t1 = Date.now();
+    while (Date.now() - t1 < 180_000) {
+      const state = await window.evaluate(() =>
+        document.querySelector('[data-testid="parallax-generate-btn"]')?.getAttribute('data-parallax-state')
+      );
+      if (state === 'done') break;
+      await window.waitForTimeout(500);
+    }
+    const finalState = await window.evaluate(() =>
+      document.querySelector('[data-testid="parallax-generate-btn"]')?.getAttribute('data-parallax-state')
+    );
+    expect(finalState, 'parallax must reach done').toBe('done');
+
+    await screenshotSafe(window, path.join(SHOTS, '07-parallax-done.png'));
+    // Give the rAF loop time to draw the first frame
+    await window.waitForTimeout(500);
+
+    // Verify frame counter shows 24 frames
+    const frameCounter = window.locator('[data-testid="parallax-frame-counter"]');
+    await expect(frameCounter).toBeVisible();
+    const counterText = await frameCounter.textContent();
+    expect(counterText).toMatch(/\/ 24$/);
+
+    // Viewport should show a parallax frame (non-black)
+    const nonBlackAfter = await window.evaluate(() => {
+      const c = document.querySelector('[data-testid="main-viewport"]') as HTMLCanvasElement;
+      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
+      let nb = 0;
+      for (let i = 0; i < d.length; i += 4) if (d[i] || d[i + 1] || d[i + 2]) nb++;
+      return nb;
+    });
+    console.log('parallax: nonBlackAfter=', nonBlackAfter);
+    expect(nonBlackAfter, 'viewport should have non-black pixels after parallax generation').toBeGreaterThan(0);
+
+    // Scrub to a different frame and verify viewport changes
+    const scrubber = window.locator('[data-testid="parallax-scrubber"]');
+    await expect(scrubber).toBeVisible();
+
+    // Pause playback first (it may be playing)
+    const playBtn = window.locator('[data-testid="parallax-play-btn"]');
+    const playText = await playBtn.textContent();
+    if (playText?.includes('Pause')) await playBtn.click();
+    await window.waitForTimeout(100);
+
+    const pixelsFrame0 = await window.evaluate(() => {
+      const c = document.querySelector('[data-testid="main-viewport"]') as HTMLCanvasElement;
+      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
+      const s: number[] = [];
+      for (let i = 0; i < 64; i++) s.push(d[Math.floor(i * d.length / 64)]);
+      return s;
+    });
+
+    // Move scrubber to frame 12 and verify canvas changed
+    expect(await setSliderByTestId(window, 'parallax-scrubber', 12)).toBe(true);
+    await window.waitForTimeout(300);
+
+    const pixelsFrame12 = await window.evaluate(() => {
+      const c = document.querySelector('[data-testid="main-viewport"]') as HTMLCanvasElement;
+      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
+      const s: number[] = [];
+      for (let i = 0; i < 64; i++) s.push(d[Math.floor(i * d.length / 64)]);
+      return s;
+    });
+
+    const scrubChanged = pixelsFrame0.some((v, i) => v !== pixelsFrame12[i]);
+    expect(scrubChanged, 'scrubbing to frame 12 should change viewport pixels').toBe(true);
+
+    await screenshotSafe(window, path.join(SHOTS, '08-parallax-frame12.png'));
+    await app.close();
+  });
 });
