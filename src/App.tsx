@@ -9,6 +9,9 @@ import { SimulationEngine } from "./simulator/Engine";
 
 import { DiagnosticsVisualizer } from "./components/DiagnosticsVisualizer";
 
+const PARALLAX_FRAMES = 24;
+const PARALLAX_EYE_CENTER = { x: 278, y: 273, z: -800 } as const;
+
 function PreviewCanvas({ data, width, height, label }: { data?: Uint8ClampedArray, width: number, height: number, label: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
@@ -79,8 +82,6 @@ export default function App() {
   const [parallaxOrbitRadius, setParallaxOrbitRadius] = useState(200); // mm
   const [parallaxOrbitAxis, setParallaxOrbitAxis] = useState<'horizontal' | 'vertical'>('horizontal');
   const parallaxPlayRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const PARALLAX_FRAMES = 24;
-  const PARALLAX_EYE_CENTER = { x: 278, y: 273, z: -800 };
 
   // Hover-on-hogel diagnostic preview
   const [hogelPreview, setHogelPreview] = useState<{
@@ -242,7 +243,7 @@ export default function App() {
     }
   }, []);
 
-  // Auto-play parallax frames
+  // Auto-play parallax frames + draw to main viewport
   useEffect(() => {
     if (parallaxPlaying && parallaxFrames.length > 0) {
       parallaxPlayRef.current = setInterval(() => {
@@ -252,8 +253,16 @@ export default function App() {
       clearInterval(parallaxPlayRef.current);
       parallaxPlayRef.current = null;
     }
-    return () => { if (parallaxPlayRef.current) clearInterval(parallaxPlayRef.current); };
+    return () => { if (parallaxPlayRef.current) { clearInterval(parallaxPlayRef.current); parallaxPlayRef.current = null; } };
   }, [parallaxPlaying, parallaxFrames.length]);
+
+  // Draw current parallax frame to main viewport canvas
+  useEffect(() => {
+    if (parallaxFrames.length === 0 || !canvasRef.current) return;
+    const frame = parallaxFrames[parallaxFrameIdx];
+    const OUT = holoState.fullWidth ?? 1024;
+    drawRecon(frame, OUT, OUT);
+  }, [parallaxFrames, parallaxFrameIdx, holoState.fullWidth, drawRecon]);
 
   // Generate parallax sequence: reconstruct from 24 positions on a circle
   const generateParallax = useCallback(async () => {

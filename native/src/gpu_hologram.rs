@@ -435,13 +435,13 @@ impl GpuHologramSession {
     /// Forward-project current phase (no panel model) → scatter to output_accum.
     /// For live convergence preview between iterations.
     pub fn gs_preview(&mut self) {
-        self.project_and_scatter(false, 0, 0.0, 0);
+        self.project_and_scatter(false, 0, 0.0, 0, 278.0, 273.0, -800.0);
     }
 
     /// Apply panel model to phase, forward-project → scatter to output_accum. Final step.
     pub fn gs_finalize(&mut self, phase_bits: u32, noise_sigma_rad: f32, noise_seed: u64) {
         let _t = std::time::Instant::now();
-        self.project_and_scatter(true, phase_bits, noise_sigma_rad, noise_seed);
+        self.project_and_scatter(true, phase_bits, noise_sigma_rad, noise_seed, 278.0, 273.0, -800.0);
         eprintln!("[holosim] gs_finalize -> {}ms", _t.elapsed().as_millis());
     }
 
@@ -451,6 +451,7 @@ impl GpuHologramSession {
         phase_bits: u32,
         noise_sigma_rad: f32,
         noise_seed: u64,
+        eye_x: f32, eye_y: f32, eye_z: f32,
     ) {
         let gs = self.gs.as_mut().expect("project_and_scatter called without gs_setup");
         let n = gs.pixels_per_hogel;
@@ -496,7 +497,6 @@ impl GpuHologramSession {
         let half_w      = self.half_w;
         let window_dim  = (2 * half_w + 1) as u32;
         let window_size = window_dim * window_dim;
-        let eye_x = 278.0f32; let eye_y = 273.0f32; let eye_z = -800.0f32;
 
         let scatter_cfg = |b_size: u32| LaunchConfig {
             // blockIdx.y = hogel_in_batch, blockIdx.x * blockDim.x + threadIdx.x = pixel_in_window
@@ -558,10 +558,13 @@ impl GpuHologramSession {
 
     pub fn gs_reset(&mut self) { self.gs = None; }
 
-    /// Normalize the scatter accumulators and apply filmic tonemapping → RGBA.
-    /// Returns the final reconstruction as a Vec<u8>.
-    pub fn reconstruct(&mut self, _eye_x: f32, _eye_y: f32, _eye_z: f32) -> Vec<u8> {
+    /// Reconstruct hologram from a given eye position.
+    /// Re-runs the scatter with the provided eye coordinates (supporting parallax).
+    pub fn reconstruct(&mut self, eye_x: f32, eye_y: f32, eye_z: f32) -> Vec<u8> {
         let _t = std::time::Instant::now();
+        if self.gs.is_some() {
+            self.project_and_scatter(false, 0, 0.0, 0, eye_x, eye_y, eye_z);
+        }
         let out_pixels = (self.out_w * self.out_h) as usize;
         let threads = 256u32;
         let exposure = 0.5f32;
