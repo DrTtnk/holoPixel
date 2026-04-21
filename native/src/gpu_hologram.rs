@@ -1,4 +1,4 @@
-use cudarc::driver::{CudaContext, CudaStream, CudaModule, CudaFunction, LaunchConfig, PushKernelArg, UnifiedSlice};
+use cudarc::driver::{CudaContext, CudaStream, CudaModule, CudaFunction, LaunchConfig, PushKernelArg, UnifiedSlice, ValidAsZeroBits};
 use cudarc::nvrtc::Ptx;
 use cudarc::cufft::{CudaFft, FftDirection, sys as cufft_sys};
 use std::sync::Arc;
@@ -114,6 +114,25 @@ use cudarc::driver::CudaSlice;
 const PREVIEW_RES: u32 = 64;  // hogel thumbnail resolution (rows × cols)
 const MAX_BATCH_HOGELS: usize = 1024;
 
+/// Evict a UnifiedSlice from VRAM back to CPU RAM (advisory prefetch).
+/// Call before operations that need VRAM budget (e.g. cuFFT plan creation).
+/// Caller must `stream.synchronize()` afterwards to wait for migration.
+fn prefetch_to_cpu<T: ValidAsZeroBits>(slice: &UnifiedSlice<T>) {
+    if let Ok(s) = slice.as_slice() {
+        let ptr = s.as_ptr() as *const ::std::ffi::c_void;
+        let bytes = slice.len() * std::mem::size_of::<T>();
+        // Use runtime API cudaMemPrefetchAsync(devPtr, count, dstDevice=-1 CPU, stream=0)
+        // cuMemPrefetchAsync_v2 (driver API) doesn't reliably evict on all platforms.
+        let result = unsafe {
+            cudarc::runtime::sys::cudaMemPrefetchAsync(ptr, bytes, -1i32, std::ptr::null_mut())
+        };
+        if result != cudarc::runtime::sys::cudaError::cudaSuccess {
+            // Prefetch is advisory; if it fails, CUDA will still handle migration via page faults
+            let _ = result;
+        }
+    }
+}
+
 /// Gerchberg-Saxton working state. Allocated once at `gs_setup`, reused per iteration.
 /// Does NOT own target_amp (lives in GpuHologramSession), only owns per-batch working buffers.
 pub struct GsState {
@@ -121,7 +140,7 @@ pub struct GsState {
     batch: usize,
     pixels_per_hogel: usize,
     num_hogels: usize,
-    phase: CudaSlice<f32>,          // [num_hogels × hemi_res²] – all phases, VRAM
+    phase: UnifiedSlice<f32>,          // [num_hogels × hemi_res²] – all phases, unified mem
     e_a: CudaSlice<cufft_sys::float2>,
     e_b: CudaSlice<cufft_sys::float2>,
     intensity_scratch: CudaSlice<f32>,  // [batch × hemi_res²]
@@ -146,6 +165,7 @@ pub struct GpuHologramSession {
     sigma_panel: f32,  // Gaussian σ in panel coords (mm)
     half_w: i32,       // scatter window half-size in output pixels
     stream: Arc<CudaStream>,
+    ctx: Arc<CudaContext>,
     module: Arc<CudaModule>,
     render_fn: CudaFunction,
     downsample_fn: CudaFunction,
@@ -157,9 +177,9 @@ pub struct GpuHologramSession {
     /// Small batch RGB buffer (batch × hemi_res² × 3). Overwritten each render batch.
     hemi_batch_dev: CudaSlice<f32>,
     /// Persistent preview thumbnails (num_hogels × PREVIEW_RES² × 3). Written during render.
-    preview_dev: CudaSlice<f32>,
+    preview_dev: UnifiedSlice<f32>,
     /// Per-hogel GS target amplitude (num_hogels × hemi_res²). Written during render.
-    target_amp_dev: CudaSlice<f32>,
+    target_amp_dev: UnifiedSlice<f32>,
     /// Float accumulator for scatter output (out_w × out_h).
     output_accum_dev: CudaSlice<f32>,
     /// Gaussian weight accumulator (out_w × out_h).
@@ -196,8 +216,11 @@ impl GpuHologramSession {
         // Streaming buffers
         let batch = MAX_BATCH_HOGELS.min(num_hogels);
         let hemi_batch_dev  = stream.alloc_zeros::<f32>(batch * pixels_per_hogel * 3).expect("alloc hemi_batch");
-        let preview_dev     = stream.alloc_zeros::<f32>(num_hogels * (PREVIEW_RES * PREVIEW_RES) as usize * 3).expect("alloc preview");
-        let target_amp_dev  = stream.alloc_zeros::<f32>(num_hogels * pixels_per_hogel).expect("alloc target_amp");
+        // Large buffers: use Unified Memory so they can overflow VRAM to system RAM
+        let mut preview_dev = unsafe { ctx.alloc_unified::<f32>(num_hogels * (PREVIEW_RES * PREVIEW_RES) as usize * 3, true) }.expect("alloc preview");
+        stream.memset_zeros(&mut preview_dev).expect("zero preview");
+        let mut target_amp_dev = unsafe { ctx.alloc_unified::<f32>(num_hogels * pixels_per_hogel, true) }.expect("alloc target_amp");
+        stream.memset_zeros(&mut target_amp_dev).expect("zero target_amp");
         let output_accum_dev = stream.alloc_zeros::<f32>(out_pixels).expect("alloc output_accum");
         let weight_accum_dev = stream.alloc_zeros::<f32>(out_pixels).expect("alloc weight_accum");
         let recon_dev       = stream.alloc_zeros::<u8>(out_pixels * 4).expect("alloc recon");
@@ -212,7 +235,7 @@ impl GpuHologramSession {
         Self {
             grid_w, grid_h, hemi_res, spp, out_w, out_h, max_bounces, ambient,
             sigma_panel, half_w,
-            stream, module,
+            stream, ctx, module,
             render_fn, downsample_fn, hemi_to_amp_fn, scatter_fn, normalize_fn, init_phase_fn,
             hemi_batch_dev, preview_dev, target_amp_dev,
             output_accum_dev, weight_accum_dev, recon_dev,
@@ -221,15 +244,32 @@ impl GpuHologramSession {
         }
     }
 
-    /// Render `num_rows` rows of hogels. Populates `preview_dev` thumbnails and
-    /// `target_amp_dev` for GS. Returns total rows rendered so far.
+    /// Render `num_rows` rows of hogels. Splits into sub-batches to fit `hemi_batch_dev`.
+    /// Populates `preview_dev` thumbnails and `target_amp_dev` for GS.
+    /// Returns total rows rendered so far.
     pub fn render_rows(&mut self, start_row: u32, num_rows: u32) -> u32 {
         let _t = std::time::Instant::now();
         let end_row = (start_row + num_rows).min(self.grid_h);
-        let actual_rows = end_row.saturating_sub(start_row);
-        if actual_rows == 0 { return self.rows_rendered; }
+        if end_row <= start_row { return self.rows_rendered; }
 
-        let row_hogels = (actual_rows * self.grid_w) as usize;
+        // hemi_batch_dev holds MAX_BATCH_HOGELS hogels; clamp rows per sub-batch
+        let max_rows_per_sub = ((MAX_BATCH_HOGELS as u32) / self.grid_w).max(1);
+        let mut row = start_row;
+        while row < end_row {
+            let sub_rows = (end_row - row).min(max_rows_per_sub);
+            self.render_sub_batch(row, sub_rows);
+            row += sub_rows;
+        }
+
+        let total_rows = end_row - start_row;
+        eprintln!("[holosim] render_rows rows={total_rows} grid={}x{} hemi={} spp={} -> {}ms",
+            self.grid_w, self.grid_h, self.hemi_res, self.spp, _t.elapsed().as_millis());
+        self.rows_rendered = end_row;
+        self.rows_rendered
+    }
+
+    fn render_sub_batch(&mut self, start_row: u32, num_rows: u32) {
+        let row_hogels = (num_rows * self.grid_w) as usize;
         let pixels_per_hogel = (self.hemi_res * self.hemi_res) as usize;
         let hogel_offset = (start_row * self.grid_w) as i32;
 
@@ -241,7 +281,6 @@ impl GpuHologramSession {
             shared_mem_bytes: 0,
         };
 
-        // 1. Render batch of hogels into hemi_batch_dev (local offset 0)
         let (grid_w, grid_h, hemi_res, spp, max_bounces, ambient) = (
             self.grid_w as i32, self.grid_h as i32, self.hemi_res as i32,
             self.spp as i32, self.max_bounces as i32, self.ambient,
@@ -257,7 +296,7 @@ impl GpuHologramSession {
                 .expect("Render launch failed");
         }
 
-        // 2. Downsample batch → preview thumbnails at correct offset
+        // Downsample batch → preview thumbnails at correct offset
         let batch_i32 = row_hogels as i32;
         let preview_res_i32 = PREVIEW_RES as i32;
         let total_preview = row_hogels * (PREVIEW_RES * PREVIEW_RES) as usize;
@@ -278,34 +317,26 @@ impl GpuHologramSession {
                 .expect("Downsample launch failed");
         }
 
-        // 3. Extract grayscale target_amp for this batch, write at correct offset in target_amp_dev
+        // Extract grayscale target_amp for this batch at correct offset
         let total_amp = (row_hogels * pixels_per_hogel) as i32;
         let amp_cfg = LaunchConfig {
             grid_dim: ((total_amp as u32 + threads - 1) / threads, 1, 1),
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        {
-            let amp_off = hogel_offset as usize * pixels_per_hogel;
-            let amp_end = amp_off + row_hogels * pixels_per_hogel;
-            let mut amp_slice = self.target_amp_dev.slice_mut(amp_off..amp_end);
-            unsafe {
-                self.stream.launch_builder(&self.hemi_to_amp_fn)
-                    .arg(&self.hemi_batch_dev)
-                    .arg(&mut amp_slice)
-                    .arg(&batch_i32)
-                    .arg(&hemi_res)
-                    .launch(amp_cfg)
-                    .expect("hemi_to_amp launch failed");
-            }
+        let amp_offset: i64 = hogel_offset as i64 * pixels_per_hogel as i64;
+        unsafe {
+            self.stream.launch_builder(&self.hemi_to_amp_fn)
+                .arg(&self.hemi_batch_dev)
+                .arg(&mut self.target_amp_dev)
+                .arg(&batch_i32)
+                .arg(&hemi_res)
+                .arg(&amp_offset)
+                .launch(amp_cfg)
+                .expect("hemi_to_amp launch failed");
         }
 
         self.stream.synchronize().expect("Sync failed");
-        eprintln!("[holosim] render_rows rows={actual_rows} grid={}x{} hemi={} spp={} -> {}ms",
-            self.grid_w, self.grid_h, self.hemi_res, self.spp, _t.elapsed().as_millis());
-
-        self.rows_rendered = end_row;
-        self.rows_rendered
     }
 
     /// Initialise GS: alloc phase + FFT plan, seed random phase. `target_amp_dev`
@@ -315,8 +346,20 @@ impl GpuHologramSession {
         let n = self.hemi_res as usize;
         let pixels_per_hogel = n * n;
         let num_hogels = (self.grid_w * self.grid_h) as usize;
+
+        // Evict large unified buffers from VRAM so cuFFT plan creation has enough room.
+        prefetch_to_cpu(&self.target_amp_dev);
+        prefetch_to_cpu(&self.preview_dev);
+        // Device-wide synchronize to ensure all prefetch migrations complete
+        unsafe { cudarc::runtime::sys::cudaDeviceSynchronize() };
+        self.stream.synchronize().expect("sync pre-gs_setup (prefetch)");
         let batch = {
             let mut b = MAX_BATCH_HOGELS.min(num_hogels);
+            // Cap batch to keep e_a + e_b ≤ 64 MB VRAM (leaves room for cuFFT workspace).
+            // With large unified buffers in VRAM, headroom is limited.
+            const MAX_EA_EB_BYTES: usize = 64 * 1024 * 1024;
+            let max_by_vram = (MAX_EA_EB_BYTES / (pixels_per_hogel * 16)).max(1);
+            b = b.min(max_by_vram);
             while num_hogels % b != 0 { b -= 1; }
             b
         };
@@ -327,7 +370,8 @@ impl GpuHologramSession {
         let apply_panel_fn   = self.module.load_function("apply_panel_model").expect("apply_panel_model missing");
         let intensity_fn     = self.module.load_function("intensity_from_complex").expect("intensity_from_complex missing");
 
-        let mut phase            = self.stream.alloc_zeros::<f32>(num_hogels * pixels_per_hogel).expect("alloc phase");
+        let mut phase            = unsafe { self.ctx.alloc_unified::<f32>(num_hogels * pixels_per_hogel, true) }.expect("alloc phase: unified mem");
+        self.stream.memset_zeros(&mut phase).expect("zero phase");
         let e_a                  = self.stream.alloc_zeros::<cufft_sys::float2>(batch * pixels_per_hogel).expect("alloc e_a");
         let e_b                  = self.stream.alloc_zeros::<cufft_sys::float2>(batch * pixels_per_hogel).expect("alloc e_b");
         let intensity_scratch    = self.stream.alloc_zeros::<f32>(batch * pixels_per_hogel).expect("alloc scratch");
@@ -341,11 +385,11 @@ impl GpuHologramSession {
             self.stream.clone(),
         ).expect("cufft plan");
 
-        // Seed random phase across all hogels
-        let total = (num_hogels * pixels_per_hogel) as i32;
+        // Seed random phase across all hogels (total may exceed i32 for large grids)
+        let total: i64 = (num_hogels * pixels_per_hogel) as i64;
         let threads = 256u32;
         let init_cfg = LaunchConfig {
-            grid_dim: ((total as u32 + threads - 1) / threads, 1, 1),
+            grid_dim: (((total as u64 + threads as u64 - 1) / threads as u64) as u32, 1, 1),
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -386,31 +430,24 @@ impl GpuHologramSession {
 
         for _iter in 0..n_iters {
             for b_idx in 0..num_batches {
-                let elem_off = b_idx * gs.batch * gs.pixels_per_hogel;
-                let elem_end = elem_off + gs.batch * gs.pixels_per_hogel;
-
-                let phase_slice = gs.phase.slice(elem_off..elem_end);
-                let amp_slice   = self.target_amp_dev.slice(elem_off..elem_end);
+                let elem_off_i64 = (b_idx * gs.batch * gs.pixels_per_hogel) as i64;
 
                 unsafe {
                     self.stream.launch_builder(&gs.build_complex_fn)
-                        .arg(&phase_slice).arg(&mut gs.e_a).arg(&batch_elems)
+                        .arg(&gs.phase).arg(&mut gs.e_a).arg(&batch_elems).arg(&elem_off_i64)
                         .launch(launch_cfg(batch_elems)).expect("build_complex");
                 }
                 gs.plan.exec_c2c(&mut gs.e_a, &mut gs.e_b, FftDirection::Forward).expect("FFT fwd");
                 unsafe {
                     self.stream.launch_builder(&gs.enforce_mag_fn)
-                        .arg(&mut gs.e_b).arg(&amp_slice).arg(&batch_elems)
+                        .arg(&mut gs.e_b).arg(&self.target_amp_dev).arg(&batch_elems).arg(&elem_off_i64)
                         .launch(launch_cfg(batch_elems)).expect("enforce_mag");
                 }
                 gs.plan.exec_c2c(&mut gs.e_b, &mut gs.e_a, FftDirection::Inverse).expect("FFT inv");
-                {
-                    let mut phase_mut = gs.phase.slice_mut(elem_off..elem_end);
-                    unsafe {
-                        self.stream.launch_builder(&gs.extract_phase_fn)
-                            .arg(&gs.e_a).arg(&mut phase_mut).arg(&batch_elems)
-                            .launch(launch_cfg(batch_elems)).expect("extract_phase");
-                    }
+                unsafe {
+                    self.stream.launch_builder(&gs.extract_phase_fn)
+                        .arg(&gs.e_a).arg(&mut gs.phase).arg(&batch_elems).arg(&elem_off_i64)
+                        .launch(launch_cfg(batch_elems)).expect("extract_phase");
                 }
             }
             gs.iters_done += 1;
@@ -455,9 +492,14 @@ impl GpuHologramSession {
         let batch_elems = (gs.batch * n) as i32;
         let hemi_res = (n as f32).sqrt() as i32;  // n = hemi_res²
 
-        // Panel model: single launch over all hogels
+        // Panel model: single launch over all hogels (total may exceed i32 for large grids)
         if apply_panel {
-            let total = (gs.num_hogels * n) as i32;
+            let total: i64 = (gs.num_hogels * n) as i64;
+            let panel_cfg = LaunchConfig {
+                grid_dim: (((total as u64 + threads as u64 - 1) / threads as u64) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
             unsafe {
                 self.stream.launch_builder(&gs.apply_panel_fn)
                     .arg(&mut gs.phase)
@@ -465,7 +507,7 @@ impl GpuHologramSession {
                     .arg(&(phase_bits as i32))
                     .arg(&noise_sigma_rad)
                     .arg(&noise_seed)
-                    .launch(launch_cfg(total))
+                    .launch(panel_cfg)
                     .expect("apply_panel");
             }
         }
@@ -491,15 +533,13 @@ impl GpuHologramSession {
         };
 
         for b_idx in 0..num_batches {
-            let hogel_off = (b_idx * gs.batch) as i32;
-            let elem_off  = b_idx * gs.batch * n;
-            let elem_end  = elem_off + gs.batch * n;
+            let hogel_off    = (b_idx * gs.batch) as i32;
+            let elem_off_i64 = (b_idx * gs.batch * n) as i64;
 
-            let phase_slice = gs.phase.slice(elem_off..elem_end);
             // forward project: E_A = exp(iφ)
             unsafe {
                 self.stream.launch_builder(&gs.build_complex_fn)
-                    .arg(&phase_slice).arg(&mut gs.e_a).arg(&batch_elems)
+                    .arg(&gs.phase).arg(&mut gs.e_a).arg(&batch_elems).arg(&elem_off_i64)
                     .launch(launch_cfg(batch_elems)).expect("build_complex scatter");
             }
             gs.plan.exec_c2c(&mut gs.e_a, &mut gs.e_b, FftDirection::Forward).expect("FFT scatter");

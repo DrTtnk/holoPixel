@@ -530,9 +530,10 @@ __global__ void normalize_and_tonemap(
 // Extract target amplitude from hemisphere: √luminance, stored as float [N²·B]
 __global__ void hemi_to_target_amp(
     const float* __restrict__ hemispheres,  // [B × N² × 3]
-    float* __restrict__ target_amp,         // [B × N²]
+    float* __restrict__ target_amp,         // [total hogels × N²], global array
     int num_hogels,
-    int res
+    int res,
+    long long amp_offset                    // element offset into target_amp
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     long long total = (long long)num_hogels * res * res;
@@ -541,16 +542,16 @@ __global__ void hemi_to_target_amp(
     const float* px = hemispheres + (long long)idx * 3;
     float r = px[0], g = px[1], b = px[2];
     float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;  // Rec.709 luminance
-    target_amp[idx] = sqrtf(fmaxf(lum, 0.0f));
+    target_amp[amp_offset + idx] = sqrtf(fmaxf(lum, 0.0f));
 }
 
 // Seed initial phase: random in [-π, π). Uses per-pixel hash of index + seed.
 __global__ void init_phase_random(
     float* __restrict__ phase,
-    int num_elems,
+    long long num_elems,
     unsigned long long seed
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_elems) return;
     unsigned long long s = seed ^ ((unsigned long long)idx * 6364136223846793005ULL + 1442695040888963407ULL);
     s ^= s << 13; s ^= s >> 7; s ^= s << 17;
@@ -560,14 +561,15 @@ __global__ void init_phase_random(
 
 // Build complex field E = exp(i·φ) from real phase array.
 __global__ void build_complex_from_phase(
-    const float* __restrict__ phase,  // [N]
+    const float* __restrict__ phase,  // global array, read from [phase_offset .. phase_offset+n]
     float2* __restrict__ out,         // [N] (complex)
-    int n
+    int n,
+    long long phase_offset
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float s, c;
-    sincosf(phase[idx], &s, &c);
+    sincosf(phase[phase_offset + idx], &s, &c);
     out[idx].x = c;
     out[idx].y = s;
 }
@@ -575,15 +577,16 @@ __global__ void build_complex_from_phase(
 // Far-field magnitude constraint: E = target_amp · E / |E|
 // Preserves phase of E, replaces magnitude with target_amp.
 __global__ void enforce_far_magnitude(
-    float2* __restrict__ e_far,         // [B × N²]
-    const float* __restrict__ target_amp, // [B × N²]
-    int n
+    float2* __restrict__ e_far,           // [B × N²]
+    const float* __restrict__ target_amp, // global array, read from [amp_offset .. amp_offset+n]
+    int n,
+    long long amp_offset
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float2 e = e_far[idx];
     float mag = sqrtf(e.x*e.x + e.y*e.y);
-    float scale = mag > 1e-12f ? target_amp[idx] / mag : 0.0f;
+    float scale = mag > 1e-12f ? target_amp[amp_offset + idx] / mag : 0.0f;
     e_far[idx].x = e.x * scale;
     e_far[idx].y = e.y * scale;
 }
@@ -593,13 +596,14 @@ __global__ void enforce_far_magnitude(
 // but since we only extract arg(·) the scale drops out.
 __global__ void extract_phase(
     const float2* __restrict__ e_slm,  // [N]
-    float* __restrict__ phase,         // [N]
-    int n
+    float* __restrict__ phase,         // global array, written at [phase_offset .. phase_offset+n]
+    int n,
+    long long phase_offset
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float2 e = e_slm[idx];
-    phase[idx] = atan2f(e.y, e.x);
+    phase[phase_offset + idx] = atan2f(e.y, e.x);
 }
 
 // Panel model: physical order = panel quantizes the commanded phase first,
@@ -607,12 +611,12 @@ __global__ void extract_phase(
 // phase_bits in [1..16]; 0 means "no quantization". noise_sigma in radians.
 __global__ void apply_panel_model(
     float* __restrict__ phase,  // [N] — modified in-place
-    int n,
+    long long n,
     int phase_bits,
     float noise_sigma,
     unsigned long long noise_seed
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float p = phase[idx];
 
