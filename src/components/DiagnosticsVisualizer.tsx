@@ -62,7 +62,7 @@ export function DiagnosticsVisualizer({ hoveredHogel, parallaxOrbit }: Props) {
     : cy;
 
   return (
-    <Canvas shadows camera={{ position: [cx + 6, H * 1.3, -D * 0.5], fov: 42 }}>
+    <Canvas shadows camera={{ position: [cx + 6, H * 1.3, -D * 0.5], fov: 42 }} frameloop="demand">
       <ambientLight intensity={0.3} />
       <pointLight position={[LCX, H - 0.15, LCZ]} intensity={80} castShadow shadow-mapSize={[512, 512]} />
 
