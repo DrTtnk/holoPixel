@@ -49,15 +49,55 @@ interface HoloSimBridge {
     fringeBase64: string;
   }>>;
   gpuSessionBegin(gridW: number, gridH: number, hemiRes: number, spp: number, outW: number, outH: number, maxBounces: number, ambient: number): Promise<NativeResult<{
-    gridW: number; gridH: number; hemiRes: number; spp: number; outW: number; outH: number; totalRows: number;
+    gridW: number; gridH: number; hemiRes: number; spp: number; outW: number; outH: number; totalRows: number; streaming: boolean;
   }>>;
   gpuSessionRenderRows(startRow: number, numRows: number): Promise<NativeResult<{ rowsDone: number }>>;
+  gpuSessionStreamBatch(startRow: number, numRows: number, gsIterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint): Promise<NativeResult<{ rowsDone: number }>>;
+  gpuSessionStreamBatchProfile(startRow: number, numRows: number, gsIterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint): Promise<NativeResult<{
+    rowsDone: number;
+    timings: Array<{ name: string; ms: number }>;
+  }>>;
+  gpuSessionPcaEigenspectrum(maxComponents: number): Promise<NativeResult<{
+    eigenvalues: number[]; cumVar: number[]; numHogels: number; pixelsPerHogel: number;
+  }>>;
+  gpuSessionPcaTargetAmp(maxComponents: number): Promise<NativeResult<{
+    eigenvalues: number[]; cumVar: number[]; numHogels: number; pixelsPerHogel: number;
+  }>>;
+  gpuSessionPcaHemisphere(maxComponents: number): Promise<NativeResult<{
+    eigenvalues: number[]; cumVar: number[]; numHogels: number; pixelsPerHogel: number;
+  }>>;
+  gpuSessionPcaCompressTargetAmp(k: number): Promise<NativeResult<{
+    kUsed: number; compressionRatio: number; rmse: number;
+  }>>;
+  gpuSessionSaveTargetAmp(): Promise<NativeResult<void>>;
+  gpuSessionRestoreTargetAmp(): Promise<NativeResult<void>>;
+  gpuSessionEnablePcaSampling(numSamples: number): Promise<NativeResult<void>>;
+  gpuSessionPcaStreamingEigenspectrum(maxComponents: number): Promise<NativeResult<{
+    eigenvalues: number[]; cumVar: number[]; numHogels: number; pixelsPerHogel: number;
+  }>>;
+  gpuSessionPcaTiledTargetAmp(tileSize: number, maxComponents: number): Promise<NativeResult<{
+    numTiles: number; tileSize: number; hogelsPerTile: number; pixelsPerHogel: number; totalHogels: number;
+    targets: number[];
+    tileMedianK: number[]; tileMaxK: number[]; tileMinK: number[]; tileMeanK: number[];
+    tiledTotalBytes: number[];
+    flatK: number[]; flatTotalBytes: number[];
+    originalBytes: number;
+    perTileK: number[];
+    flatEigenvalues: number[]; flatCumVar: number[];
+  }>>;
+  gpuSessionPcaCompressQuantized(k: number, bits: number): Promise<NativeResult<{
+    kUsed: number; compressionRatio: number; rmse: number; compressedBytes: number;
+  }>>;
+  gpuSessionPcaQuantizationSweep(kValues: number[], bitValues: number[]): Promise<NativeResult<Array<{
+    k: number; bits: number; compressionRatio: number; rmse: number; compressedBytes: number;
+  }>>>;
   gpuSessionRunGs(iterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint): Promise<NativeResult<void>>;
   gpuSessionGsSetup(noiseSeed: bigint): Promise<NativeResult<void>>;
   gpuSessionGsIterate(nIters: number): Promise<NativeResult<{ itersDone: number }>>;
   gpuSessionGsPreview(): Promise<NativeResult<void>>;
+  gpuSessionGsIterateAndReconstruct(nIters: number, eyeX: number, eyeY: number, eyeZ: number): Promise<NativeResult<{ itersDone: number; reconBuffer: Buffer }>>;
   gpuSessionGsFinalize(phaseBits: number, noiseSigma: number, noiseSeed: bigint): Promise<NativeResult<void>>;
-  gpuSessionReconstruct(eyeX: number, eyeY: number, eyeZ: number): Promise<NativeResult<{ reconBase64: string }>>;
+  gpuSessionReconstruct(eyeX: number, eyeY: number, eyeZ: number): Promise<NativeResult<{ reconBuffer: Buffer }>>;
   gpuSessionFinish(eyeX: number, eyeY: number, eyeZ: number): Promise<NativeResult<{
     gridW: number; gridH: number; hemiRes: number; fullWidth: number; fullHeight: number; reconBase64: string;
   }>>;

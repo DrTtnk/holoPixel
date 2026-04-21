@@ -4,14 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
 napi = { version = "2", features = ["default", "napi9"] }
 napi-derive = "2"
-cudarc = { version = "0.19", features = ["std", "driver", "nvrtc", "cufft", "cuda-12060"] }
+cudarc = { version = "0.19", features = ["std", "driver", "nvrtc", "cufft", "cublas", "cuda-12060"] }
 rayon = "1.10"
 rustfft = "6"
+nalgebra = "0.33"
 
 [build-dependencies]
 napi-build = "2"

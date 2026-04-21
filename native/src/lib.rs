@@ -226,6 +226,7 @@ pub struct GpuSessionInfo {
     pub out_w: u32,
     pub out_h: u32,
     pub total_rows: u32,
+    pub streaming: bool,
 }
 
 #[napi]
@@ -247,6 +248,7 @@ pub fn gpu_session_begin(
         out_w: session.out_w,
         out_h: session.out_h,
         total_rows: session.grid_h,
+        streaming: session.streaming,
     };
     *GPU_SESSION.lock().unwrap() = Some(session);
     Ok(info)
@@ -270,6 +272,54 @@ pub fn gpu_session_gs_setup(noise_seed: BigInt) -> Result<()> {
     Ok(())
 }
 
+/// Streaming: fused render + GS + scatter for a row range.
+/// Returns rows rendered so far.
+#[napi]
+pub fn gpu_session_stream_batch(
+    start_row: u32, num_rows: u32,
+    gs_iterations: u32, phase_bits: u32,
+    noise_sigma: f64, noise_seed: BigInt,
+) -> Result<u32> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let (_s, seed_u64, _l) = noise_seed.get_u64();
+    // Accumulators are zeroed at session creation; we accumulate across batches.
+    Ok(session.stream_batch(start_row, num_rows, gs_iterations, phase_bits, noise_sigma as f32, seed_u64))
+}
+
+/// Streaming profile: like stream_batch but with per-stage GPU sync + timing.
+/// Returns { rowsDone, timings: Array<{ name, ms }> }.
+#[napi(object)]
+pub struct StreamProfileEntry {
+    pub name: String,
+    pub ms: f64,
+}
+
+#[napi(object)]
+pub struct StreamProfileResult {
+    pub rows_done: u32,
+    pub timings: Vec<StreamProfileEntry>,
+}
+
+#[napi]
+pub fn gpu_session_stream_batch_profile(
+    start_row: u32, num_rows: u32,
+    gs_iterations: u32, phase_bits: u32,
+    noise_sigma: f64, noise_seed: BigInt,
+) -> Result<StreamProfileResult> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let (_s, seed_u64, _l) = noise_seed.get_u64();
+    let (rows_done, timings) = session.stream_batch_profile(
+        start_row, num_rows, gs_iterations, phase_bits,
+        noise_sigma as f32, seed_u64,
+    );
+    Ok(StreamProfileResult {
+        rows_done,
+        timings: timings.into_iter().map(|(name, ms)| StreamProfileEntry { name, ms }).collect(),
+    })
+}
+
 /// Step-wise GS: run `n_iters` more GS iterations. Returns total iters done so far.
 #[napi]
 pub fn gpu_session_gs_iterate(n_iters: u32) -> Result<u32> {
@@ -287,6 +337,26 @@ pub fn gpu_session_gs_preview() -> Result<()> {
     let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
     session.gs_preview();
     Ok(())
+}
+
+/// Combined: iterate + preview-scatter + tonemap + D2H in one call.
+/// Returns { itersDone: u32, reconBuffer: Buffer }.
+#[napi(object)]
+pub struct GsIterateReconResult {
+    pub iters_done: u32,
+    pub recon_buffer: Buffer,
+}
+
+#[napi]
+pub fn gpu_session_gs_iterate_and_reconstruct(
+    n_iters: u32, eye_x: f64, eye_y: f64, eye_z: f64,
+) -> Result<GsIterateReconResult> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let (iters_done, recon) = session.gs_iterate_preview_reconstruct(
+        n_iters, eye_x as f32, eye_y as f32, eye_z as f32,
+    );
+    Ok(GsIterateReconResult { iters_done, recon_buffer: recon.into() })
 }
 
 /// Step-wise GS: apply panel model + final forward projection. Writes reconstructed
@@ -345,6 +415,187 @@ pub fn gpu_session_close() -> Result<()> {
     let mut guard = GPU_SESSION.lock().unwrap();
     *guard = None;
     Ok(())
+}
+
+/// PCA eigenspectrum of hogel phase patterns. Returns { eigenvalues, cumVar }.
+/// Requires GS to have run (standard mode only).
+#[napi(object)]
+pub struct PcaResult {
+    pub eigenvalues: Vec<f64>,
+    pub cum_var: Vec<f64>,
+    pub num_hogels: u32,
+    pub pixels_per_hogel: u32,
+}
+
+#[napi]
+pub fn gpu_session_pca_eigenspectrum(max_components: u32) -> Result<PcaResult> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let gs = session.gs.as_ref().ok_or_else(|| Error::from_reason("PCA requires GS state"))?;
+    let n = (session.grid_w * session.grid_h) as u32;
+    let d = gs.pixels_per_hogel as u32;
+    let (eigenvalues, cum_var) = session.pca_eigenspectrum(max_components as usize);
+    Ok(PcaResult { eigenvalues, cum_var, num_hogels: n, pixels_per_hogel: d })
+}
+
+#[napi]
+pub fn gpu_session_pca_target_amp(max_components: u32) -> Result<PcaResult> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let n = (session.grid_w * session.grid_h) as u32;
+    let d = (session.hemi_res * session.hemi_res) as u32;
+    let (eigenvalues, cum_var) = session.pca_target_amp(max_components as usize);
+    Ok(PcaResult { eigenvalues, cum_var, num_hogels: n, pixels_per_hogel: d })
+}
+
+#[napi]
+pub fn gpu_session_pca_hemisphere(max_components: u32) -> Result<PcaResult> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let n = (session.grid_w * session.grid_h) as u32;
+    let d = (session.hemi_res * session.hemi_res) as u32;
+    let (eigenvalues, cum_var) = session.pca_hemisphere(max_components as usize);
+    Ok(PcaResult { eigenvalues, cum_var, num_hogels: n, pixels_per_hogel: d })
+}
+
+/// PCA compress/decompress target_amp in place. Returns { kUsed, compressionRatio, rmse }.
+#[napi(object)]
+pub struct PcaCompressResult {
+    pub k_used: u32,
+    pub compression_ratio: f64,
+    pub rmse: f64,
+}
+
+#[napi]
+pub fn gpu_session_pca_compress_target_amp(k: u32) -> Result<PcaCompressResult> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let (k_used, ratio, rmse) = session.pca_compress_target_amp(k as usize);
+    Ok(PcaCompressResult { k_used: k_used as u32, compression_ratio: ratio, rmse })
+}
+
+#[napi]
+pub fn gpu_session_save_target_amp() -> Result<()> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    session.save_target_amp();
+    Ok(())
+}
+
+#[napi]
+pub fn gpu_session_restore_target_amp() -> Result<()> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    session.restore_target_amp();
+    Ok(())
+}
+
+#[napi]
+pub fn gpu_session_enable_pca_sampling(num_samples: u32) -> Result<()> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    session.enable_pca_sampling(num_samples as usize);
+    Ok(())
+}
+
+#[napi]
+pub fn gpu_session_pca_streaming_eigenspectrum(max_components: u32) -> Result<PcaResult> {
+    let guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_ref().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let d = (session.hemi_res * session.hemi_res) as u32;
+    let (eigenvalues, cum_var) = session.pca_streaming_eigenspectrum(max_components as usize);
+    Ok(PcaResult { eigenvalues, cum_var, num_hogels: session.pca_num_samples() as u32, pixels_per_hogel: d })
+}
+
+/// Tiled PCA analysis on target_amp — partitions grid into spatial tiles.
+#[napi(object)]
+pub struct TiledPcaResult {
+    pub num_tiles: u32,
+    pub tile_size: u32,
+    pub hogels_per_tile: u32,
+    pub pixels_per_hogel: u32,
+    pub total_hogels: u32,
+    pub targets: Vec<f64>,
+    pub tile_median_k: Vec<u32>,
+    pub tile_max_k: Vec<u32>,
+    pub tile_min_k: Vec<u32>,
+    pub tile_mean_k: Vec<f64>,
+    pub tiled_total_bytes: Vec<f64>,
+    pub flat_k: Vec<u32>,
+    pub flat_total_bytes: Vec<f64>,
+    pub original_bytes: f64,
+    pub per_tile_k: Vec<u32>,
+    pub flat_eigenvalues: Vec<f64>,
+    pub flat_cum_var: Vec<f64>,
+}
+
+#[napi]
+pub fn gpu_session_pca_tiled_target_amp(tile_size: u32, max_components: u32) -> Result<TiledPcaResult> {
+    let guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_ref().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let info = session.pca_tiled_target_amp(tile_size as usize, max_components as usize);
+    Ok(TiledPcaResult {
+        num_tiles: info.num_tiles,
+        tile_size: info.tile_size,
+        hogels_per_tile: info.hogels_per_tile,
+        pixels_per_hogel: info.pixels_per_hogel,
+        total_hogels: info.total_hogels,
+        targets: info.targets,
+        tile_median_k: info.tile_median_k,
+        tile_max_k: info.tile_max_k,
+        tile_min_k: info.tile_min_k,
+        tile_mean_k: info.tile_mean_k,
+        tiled_total_bytes: info.tiled_total_bytes,
+        flat_k: info.flat_k,
+        flat_total_bytes: info.flat_total_bytes,
+        original_bytes: info.original_bytes,
+        per_tile_k: info.per_tile_k,
+        flat_eigenvalues: info.flat_eigenvalues,
+        flat_cum_var: info.flat_cum_var,
+    })
+}
+
+/// PCA compress with optional coefficient quantization.
+#[napi(object)]
+pub struct PcaCompressQuantizedResult {
+    pub k_used: u32,
+    pub compression_ratio: f64,
+    pub rmse: f64,
+    pub compressed_bytes: f64,
+}
+
+#[napi]
+pub fn gpu_session_pca_compress_quantized(k: u32, bits: u32) -> Result<PcaCompressQuantizedResult> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let (k_used, ratio, rmse, comp_bytes) = session.pca_compress_quantized_target_amp(k as usize, bits);
+    Ok(PcaCompressQuantizedResult {
+        k_used: k_used as u32,
+        compression_ratio: ratio,
+        rmse,
+        compressed_bytes: comp_bytes,
+    })
+}
+
+/// Batch quantization sweep: compute PCA once, test multiple (k, bits) combos.
+#[napi(object)]
+pub struct QuantSweepEntry {
+    pub k: u32,
+    pub bits: u32,
+    pub compression_ratio: f64,
+    pub rmse: f64,
+    pub compressed_bytes: f64,
+}
+
+#[napi]
+pub fn gpu_session_pca_quantization_sweep(k_values: Vec<u32>, bit_values: Vec<u32>) -> Result<Vec<QuantSweepEntry>> {
+    let guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_ref().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    let ks: Vec<usize> = k_values.iter().map(|&v| v as usize).collect();
+    let results = session.pca_quantization_sweep(&ks, &bit_values);
+    Ok(results.into_iter().map(|(k, bits, ratio, rmse, comp)| {
+        QuantSweepEntry { k: k as u32, bits, compression_ratio: ratio, rmse, compressed_bytes: comp }
+    }).collect())
 }
 
 #[napi(object)]

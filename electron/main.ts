@@ -44,6 +44,8 @@ function createWindow() {
     },
   });
 
+  mainWindow.maximize();
+
   // In dev mode, load from Vite dev server; in production, load the built index.html
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
@@ -191,6 +193,136 @@ ipcMain.handle('native:gpuSessionRenderRows', async (_event, startRow: number, n
   }
 });
 
+ipcMain.handle('native:gpuSessionStreamBatch', async (_event, startRow: number, numRows: number, gsIterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const rowsDone = nativeAddon.gpuSessionStreamBatch(startRow, numRows, gsIterations, phaseBits, noiseSigma, noiseSeed);
+    return { ok: true, data: { rowsDone } };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionStreamBatchProfile', async (_event, startRow: number, numRows: number, gsIterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionStreamBatchProfile(startRow, numRows, gsIterations, phaseBits, noiseSigma, noiseSeed);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaEigenspectrum', async (_event, maxComponents: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaEigenspectrum(maxComponents);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaTargetAmp', async (_event, maxComponents: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaTargetAmp(maxComponents);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaHemisphere', async (_event, maxComponents: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaHemisphere(maxComponents);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaCompressTargetAmp', async (_event, k: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaCompressTargetAmp(k);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionSaveTargetAmp', async () => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    nativeAddon.gpuSessionSaveTargetAmp();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionRestoreTargetAmp', async () => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    nativeAddon.gpuSessionRestoreTargetAmp();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionEnablePcaSampling', async (_event, numSamples: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    nativeAddon.gpuSessionEnablePcaSampling(numSamples);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaStreamingEigenspectrum', async (_event, maxComponents: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaStreamingEigenspectrum(maxComponents);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaTiledTargetAmp', async (_event, tileSize: number, maxComponents: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaTiledTargetAmp(tileSize, maxComponents);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaCompressQuantized', async (_event, k: number, bits: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaCompressQuantized(k, bits);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle('native:gpuSessionPcaQuantizationSweep', async (_event, kValues: number[], bitValues: number[]) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionPcaQuantizationSweep(kValues, bitValues);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
 ipcMain.handle('native:gpuSessionRunGs', async (_event, iterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint) => {
   if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
   try {
@@ -231,6 +363,16 @@ ipcMain.handle('native:gpuSessionGsPreview', async () => {
   }
 });
 
+ipcMain.handle('native:gpuSessionGsIterateAndReconstruct', async (_event, nIters: number, eyeX: number, eyeY: number, eyeZ: number) => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    const result = nativeAddon.gpuSessionGsIterateAndReconstruct(nIters, eyeX, eyeY, eyeZ);
+    return { ok: true, data: { itersDone: result.itersDone, reconBuffer: result.reconBuffer } };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
 ipcMain.handle('native:gpuSessionGsFinalize', async (_event, phaseBits: number, noiseSigma: number, noiseSeed: bigint) => {
   if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
   try {
@@ -245,7 +387,8 @@ ipcMain.handle('native:gpuSessionReconstruct', async (_event, eyeX: number, eyeY
   if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
   try {
     const buf = nativeAddon.gpuSessionReconstruct(eyeX, eyeY, eyeZ);
-    return { ok: true, data: { reconBase64: buf.toString('base64') } };
+    // Transfer raw Buffer via structured clone (avoids 33% base64 bloat)
+    return { ok: true, data: { reconBuffer: buf } };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }

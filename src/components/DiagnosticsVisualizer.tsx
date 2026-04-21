@@ -133,8 +133,8 @@ export function DiagnosticsVisualizer({ hoveredHogel, parallaxOrbit }: Props) {
         <meshBasicMaterial color="#10b981" />
       </mesh>
 
-      {/* ── Observer camera (in front of panel) ── */}
-      <group position={[cx, cy, -3.5]}>
+      {/* ── Observer camera (in front of panel, z=-800mm = -8.0 units) ── */}
+      <group position={[cx, cy, -8.0]}>
         <Box args={[0.7, 0.5, 0.9]}>
           <meshLambertMaterial color="#444" />
         </Box>
@@ -150,7 +150,7 @@ export function DiagnosticsVisualizer({ hoveredHogel, parallaxOrbit }: Props) {
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            args={[new Float32Array([cx, cy, -3.5, hogelX, hogelY, 0.0]), 3]}
+            args={[new Float32Array([cx, cy, -8.0, hogelX, hogelY, 0.0]), 3]}
           />
         </bufferGeometry>
         <lineBasicMaterial color="#10b981" transparent opacity={0.5} />

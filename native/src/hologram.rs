@@ -368,3 +368,85 @@ pub fn compute_hologram_full(
         last_hogel_fringe: result.last_hogel_fringe.into(),
     }
 }
+
+// ── Unit Tests ────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfft::num_complex::Complex64;
+
+    // --- IFFT2 roundtrip ---
+
+    #[test]
+    fn ifft2_dc_signal() {
+        // All-ones input → IFFT → DC at (0,0), zero elsewhere
+        let n = 4;
+        let mut data = vec![Complex64::new(1.0, 0.0); n * n];
+        ifft2(&mut data, n, n);
+        // After IFFT with normalization, DC term = 1.0, rest ≈ 0
+        assert!((data[0].re - 1.0).abs() < 1e-10);
+        for i in 1..n * n {
+            assert!(data[i].norm() < 1e-10, "Non-zero at index {}: {}", i, data[i].norm());
+        }
+    }
+
+    #[test]
+    fn ifft2_delta_input() {
+        // Delta at (0,0) → IFFT → uniform 1/(N*N)
+        let n = 8;
+        let mut data = vec![Complex64::new(0.0, 0.0); n * n];
+        data[0] = Complex64::new(1.0, 0.0);
+        ifft2(&mut data, n, n);
+        let expected = 1.0 / (n * n) as f64;
+        for i in 0..n * n {
+            assert!((data[i].re - expected).abs() < 1e-10,
+                "Pixel {} expected {} got {}", i, expected, data[i].re);
+        }
+    }
+
+    #[test]
+    fn ifft2_preserves_energy() {
+        // Parseval's theorem: sum |X|^2 = N * sum |x|^2
+        // For IFFT with our normalization: sum |ifft(X)|^2 = sum |X|^2 / N^2
+        let n = 16;
+        let mut data: Vec<Complex64> = (0..n * n)
+            .map(|i| Complex64::new((i as f64 * 0.1).sin(), (i as f64 * 0.07).cos()))
+            .collect();
+        let energy_freq: f64 = data.iter().map(|c| c.norm_sqr()).sum();
+        ifft2(&mut data, n, n);
+        let energy_spatial: f64 = data.iter().map(|c| c.norm_sqr()).sum();
+        let expected = energy_freq / (n * n) as f64;
+        assert!((energy_spatial - expected).abs() / expected < 1e-8,
+            "Energy mismatch: spatial={}, expected={}", energy_spatial, expected);
+    }
+
+    // --- phase_to_rgba ---
+
+    #[test]
+    fn phase_to_rgba_zero_phase() {
+        let n = 2;
+        let data = vec![Complex64::new(1.0, 0.0); n * n]; // phase = 0
+        let rgba = phase_to_rgba(&data);
+        assert_eq!(rgba.len(), n * n * 4);
+        // Phase 0 → (0 + π) / (2π) × 255 ≈ 128
+        for i in 0..n * n {
+            let v = rgba[i * 4];
+            assert!((v as i32 - 128).abs() <= 1, "Expected ~128, got {}", v);
+            assert_eq!(rgba[i * 4 + 3], 255); // alpha
+        }
+    }
+
+    #[test]
+    fn phase_to_rgba_negative_pi() {
+        let n = 2;
+        // Phase = −π → mapped to 0
+        let data = vec![Complex64::new(-1.0, 0.0); n * n]; // phase = π
+        let rgba = phase_to_rgba(&data);
+        for i in 0..n * n {
+            let v = rgba[i * 4];
+            // phase=π → (π + π)/(2π) × 255 = 255 or phase=−π → 0
+            assert!(v == 0 || v == 255, "Expected 0 or 255, got {}", v);
+        }
+    }
+}

@@ -127,7 +127,7 @@ __device__ bool trace_scene(Ray ray, Hit* hit) {
     float best_t = 1e30f;
     bool found = false;
 
-    #pragma unroll 1
+    #pragma unroll
     for (int i = 0; i < NUM_TRIS; i++) {
         const float* tp = c_tris + i * 12;
         Vec3 v0 = v3(tp[0], tp[1], tp[2]);
@@ -155,7 +155,7 @@ __device__ bool trace_scene(Ray ray, Hit* hit) {
 
 // Shadow ray: any-hit early-out
 __device__ bool shadow_ray(Ray ray, float max_dist) {
-    #pragma unroll 1
+    #pragma unroll
     for (int i = 0; i < NUM_TRIS; i++) {
         const float* tp = c_tris + i * 12;
         Vec3 v0 = v3(tp[0], tp[1], tp[2]);
@@ -256,7 +256,7 @@ __device__ Vec3 trace_path(Ray ray, unsigned long long* rng, int max_bounces, fl
 // Grid: (num_hogels, ceil(res*res/BLOCK_SIZE), 1)
 // Each thread computes one sample for one pixel of one hogel.
 
-__global__ void render_hemispheres(
+__global__ __launch_bounds__(256) void render_hemispheres(
     float* __restrict__ output,       // [num_hogels * res * res * 3] RGB float
     int grid_w, int grid_h,
     int res,  // hemisphere resolution
@@ -277,6 +277,23 @@ __global__ void render_hemispheres(
     int px = pixel_idx % res;
     int py = pixel_idx / res;
 
+    float fres = (float)res;
+
+    // Early exit for pixels outside the hemisphere circle (saves ~21% of threads
+    // from running the expensive SPP+ray-tracing loop).
+    // Use pixel center; add half-pixel diagonal as conservative margin for jitter.
+    float uc = (2.0f * ((float)px + 0.5f) / fres) - 1.0f;
+    float vc = 1.0f - (2.0f * ((float)py + 0.5f) / fres);
+    float rc2 = uc*uc + vc*vc;
+    float margin = 2.0f * 1.414f / fres;  // pixel diagonal in UV space
+    if (rc2 > (1.0f + margin) * (1.0f + margin)) {
+        long long out_idx = ((long long)blockIdx.x * total_pixels + pixel_idx) * 3;
+        output[out_idx + 0] = 0.0f;
+        output[out_idx + 1] = 0.0f;
+        output[out_idx + 2] = 0.0f;
+        return;
+    }
+
     // Hogel center position on the display panel
     float cell_w = box_w / (float)grid_w;
     float cell_h = box_h / (float)grid_h;
@@ -289,7 +306,6 @@ __global__ void render_hemispheres(
     Vec3 cam_up = v3(0, 1, 0);  // forward.cross(right) = (0,0,1)×(1,0,0) = (0,1,0)
 
     float half_pi = 1.5707963f;
-    float fres = (float)res;
 
     // RNG seed: unique per hogel + pixel
     unsigned long long rng_state = (unsigned long long)hogel_idx * 6364136223846793005ULL
@@ -465,12 +481,31 @@ __global__ void scatter_hogel_contributions(
     float phi_sin = sin_theta > 1e-6f ? d_up    / sin_theta : 0.0f;
 
     float hr = (float)hemi_res;
-    int hu = min((int)((phi_cos * r_fish * 0.5f + 0.5f) * hr), hemi_res - 1);
-    // Y-flip: hemisphere stored row 0 = top = +phi_sin, so invert V axis
-    int hv = min((int)((0.5f - phi_sin * r_fish * 0.5f) * hr), hemi_res - 1);
+    float fu = (phi_cos * r_fish * 0.5f + 0.5f) * hr - 0.5f;
+    float fv = (0.5f - phi_sin * r_fish * 0.5f) * hr - 0.5f;
 
-    long long hpx = (long long)hogel_in_batch * hemi_res * hemi_res + (long long)hv * hemi_res + hu;
-    float intensity = intensity_batch[hpx];
+    // Bilinear interpolation to avoid angular quantization artifacts
+    int u0 = (int)floorf(fu);
+    int v0 = (int)floorf(fv);
+    float su = fu - (float)u0;
+    float sv = fv - (float)v0;
+
+    // Clamp to valid hemisphere pixel range
+    int u0c = min(max(u0, 0), hemi_res - 1);
+    int u1c = min(max(u0 + 1, 0), hemi_res - 1);
+    int v0c = min(max(v0, 0), hemi_res - 1);
+    int v1c = min(max(v0 + 1, 0), hemi_res - 1);
+
+    long long base = (long long)hogel_in_batch * hemi_res * hemi_res;
+    float i00 = intensity_batch[base + (long long)v0c * hemi_res + u0c];
+    float i10 = intensity_batch[base + (long long)v0c * hemi_res + u1c];
+    float i01 = intensity_batch[base + (long long)v1c * hemi_res + u0c];
+    float i11 = intensity_batch[base + (long long)v1c * hemi_res + u1c];
+
+    float intensity = (1.0f - su) * (1.0f - sv) * i00
+                    +        su  * (1.0f - sv) * i10
+                    + (1.0f - su) *        sv  * i01
+                    +        su  *        sv  * i11;
 
     int out_idx = py * out_w + px;
     atomicAdd(&output_accum[out_idx], intensity);

@@ -20,7 +20,7 @@ test.beforeAll(async () => {
 test.describe('HoloSim Electron', () => {
   test('app launches and shows UI', async () => {
     const app = await electron.launch({
-      args: [path.join(ROOT, 'dist-electron/main.js')],
+      args: ['--start-maximized', path.join(ROOT, 'dist-electron/main.js')],
       env: {
         ...process.env,
         LD_LIBRARY_PATH: `/usr/local/cuda-12.9/lib64:${process.env.LD_LIBRARY_PATH || ''}`,
@@ -45,7 +45,7 @@ test.describe('HoloSim Electron', () => {
     window.on('pageerror', (err) => pageErrors.push(err.message));
 
     // Click the render button
-    const renderBtn = window.locator('button', { hasText: /Compute Hologram|Start Global Pipeline/ });
+    const renderBtn = window.locator('button', { hasText: /Compute Hologram/ });
     if (await renderBtn.isVisible()) {
       await renderBtn.click();
 

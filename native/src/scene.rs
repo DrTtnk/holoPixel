@@ -395,3 +395,205 @@ pub fn trace_test_ray() -> TraceResult {
         },
     }
 }
+
+// ── Unit Tests ────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Vec3 math ---
+
+    #[test]
+    fn vec3_dot_orthogonal() {
+        let a = Vec3::new(1.0, 0.0, 0.0);
+        let b = Vec3::new(0.0, 1.0, 0.0);
+        assert!((a.dot(b)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vec3_dot_parallel() {
+        let a = Vec3::new(3.0, 0.0, 0.0);
+        assert!((a.dot(a) - 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vec3_cross_product() {
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let y = Vec3::new(0.0, 1.0, 0.0);
+        let z = x.cross(y);
+        assert!((z.x).abs() < 1e-6);
+        assert!((z.y).abs() < 1e-6);
+        assert!((z.z - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vec3_normalize() {
+        let v = Vec3::new(3.0, 4.0, 0.0);
+        let n = v.normalize();
+        assert!((n.length() - 1.0).abs() < 1e-6);
+        assert!((n.x - 0.6).abs() < 1e-6);
+        assert!((n.y - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vec3_normalize_zero() {
+        let v = Vec3::new(0.0, 0.0, 0.0);
+        let n = v.normalize();
+        // Should not crash, returns zero vector
+        assert!(n.length() < 1e-6);
+    }
+
+    // --- Cornell Box scene ---
+
+    #[test]
+    fn cornell_box_triangle_count() {
+        let scene = build_cornell_box();
+        // 5 walls × 2 + 2 boxes × 5 faces × 2 + 1 light × 2 = 32
+        assert_eq!(scene.triangle_count(), 32);
+    }
+
+    #[test]
+    fn cornell_box_material_count() {
+        let scene = build_cornell_box();
+        assert_eq!(scene.material_count(), 4); // white, red, green, emissive
+    }
+
+    // --- Ray-triangle intersection ---
+
+    #[test]
+    fn intersect_simple_triangle() {
+        let tri = Triangle::new(
+            Vec3::new(-1.0, -1.0, 5.0),
+            Vec3::new(1.0, -1.0, 5.0),
+            Vec3::new(0.0, 1.0, 5.0),
+            0,
+        );
+        let ray = Ray {
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            dir: Vec3::new(0.0, 0.0, 1.0),
+        };
+        let t = intersect_triangle(&ray, &tri);
+        assert!(t.is_some());
+        assert!((t.unwrap() - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn intersect_miss_triangle() {
+        let tri = Triangle::new(
+            Vec3::new(-1.0, -1.0, 5.0),
+            Vec3::new(1.0, -1.0, 5.0),
+            Vec3::new(0.0, 1.0, 5.0),
+            0,
+        );
+        let ray = Ray {
+            origin: Vec3::new(5.0, 5.0, 0.0),
+            dir: Vec3::new(0.0, 0.0, 1.0),
+        };
+        assert!(intersect_triangle(&ray, &tri).is_none());
+    }
+
+    #[test]
+    fn intersect_behind_ray_origin() {
+        let tri = Triangle::new(
+            Vec3::new(-1.0, -1.0, -5.0),
+            Vec3::new(1.0, -1.0, -5.0),
+            Vec3::new(0.0, 1.0, -5.0),
+            0,
+        );
+        let ray = Ray {
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            dir: Vec3::new(0.0, 0.0, 1.0),
+        };
+        // Triangle is behind the ray, should not hit
+        assert!(intersect_triangle(&ray, &tri).is_none());
+    }
+
+    // --- Scene tracing ---
+
+    #[test]
+    fn trace_center_ray_hits_something() {
+        let scene = build_cornell_box();
+        let ray = Ray {
+            origin: Vec3::new(278.0, 273.0, -800.0),
+            dir: Vec3::new(0.0, 0.0, 1.0),
+        };
+        let hit = scene.trace(&ray);
+        assert!(hit.is_some());
+        let hit = hit.unwrap();
+        // Should hit back wall (z≈559.2, mat 0) or a box (mat 0, closer z).
+        // Key: it hits something white (material 0) at positive t.
+        assert!(hit.t > 0.0);
+        assert_eq!(hit.material_idx, 0); // white diffuse
+        // Hit z must be inside the box (0..559.2)
+        assert!(hit.point.z >= 0.0 && hit.point.z <= 560.0);
+    }
+
+    #[test]
+    fn trace_toward_left_wall_hits_red() {
+        let scene = build_cornell_box();
+        let ray = Ray {
+            origin: Vec3::new(278.0, 273.0, 280.0),
+            dir: Vec3::new(-1.0, 0.0, 0.0),
+        };
+        let hit = scene.trace(&ray);
+        assert!(hit.is_some());
+        let hit = hit.unwrap();
+        assert_eq!(hit.material_idx, 1); // red
+    }
+
+    #[test]
+    fn trace_toward_right_wall_hits_green() {
+        let scene = build_cornell_box();
+        let ray = Ray {
+            origin: Vec3::new(278.0, 273.0, 280.0),
+            dir: Vec3::new(1.0, 0.0, 0.0),
+        };
+        let hit = scene.trace(&ray);
+        assert!(hit.is_some());
+        let hit = hit.unwrap();
+        assert_eq!(hit.material_idx, 2); // green
+    }
+
+    #[test]
+    fn trace_upward_toward_light() {
+        let scene = build_cornell_box();
+        // From center of room, shoot straight up
+        let ray = Ray {
+            origin: Vec3::new(278.0, 100.0, 280.0),
+            dir: Vec3::new(0.0, 1.0, 0.0),
+        };
+        let hit = scene.trace(&ray);
+        assert!(hit.is_some());
+        let hit = hit.unwrap();
+        // Should hit the ceiling area light (material 3) at y ≈ 548.8
+        assert_eq!(hit.material_idx, 3);
+        assert!((hit.point.y - 548.8).abs() < 1.0);
+    }
+
+    #[test]
+    fn trace_escape_from_front() {
+        let scene = build_cornell_box();
+        // Shoot ray backward out of the open face (−z)
+        let ray = Ray {
+            origin: Vec3::new(278.0, 273.0, 10.0),
+            dir: Vec3::new(0.0, 0.0, -1.0),
+        };
+        // Box is open at z=0 — no geometry there
+        assert!(scene.trace(&ray).is_none());
+    }
+
+    // --- Triangle normal direction ---
+
+    #[test]
+    fn trace_normal_faces_ray() {
+        let scene = build_cornell_box();
+        let ray = Ray {
+            origin: Vec3::new(278.0, 273.0, -800.0),
+            dir: Vec3::new(0.0, 0.0, 1.0),
+        };
+        let hit = scene.trace(&ray).unwrap();
+        // Normal should face the ray origin (dot(normal, dir) < 0)
+        assert!(hit.normal.dot(ray.dir) < 0.0);
+    }
+}

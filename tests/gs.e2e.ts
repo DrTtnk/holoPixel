@@ -72,7 +72,7 @@ test.describe('Phase-only Holography (Gerchberg-Saxton + panel model)', () => {
     test.setTimeout(300_000);
 
     const app: ElectronApplication = await electron.launch({
-      args: [path.join(ROOT, 'dist-electron/main.js')],
+      args: ['--start-maximized', path.join(ROOT, 'dist-electron/main.js')],
       env: {
         ...process.env,
         LD_LIBRARY_PATH: `/usr/local/cuda-12.9/lib64:${process.env.LD_LIBRARY_PATH || ''}`,
@@ -243,7 +243,7 @@ test.describe('Phase-only Holography (Gerchberg-Saxton + panel model)', () => {
     test.setTimeout(300_000);
 
     const app: ElectronApplication = await electron.launch({
-      args: [path.join(ROOT, 'dist-electron/main.js')],
+      args: ['--start-maximized', path.join(ROOT, 'dist-electron/main.js')],
       env: {
         ...process.env,
         LD_LIBRARY_PATH: `/usr/local/cuda-12.9/lib64:${process.env.LD_LIBRARY_PATH || ''}`,
