@@ -261,14 +261,16 @@ export default function App() {
       if (now - lastTime >= MS_PER_FRAME) {
         lastTime = now;
         parallaxFrameIdxRef.current = (parallaxFrameIdxRef.current + 1) % total;
-        setParallaxFrameIdx(parallaxFrameIdxRef.current); // sync scrub slider (React batches this)
         const src = parallaxCanvasesRef.current[parallaxFrameIdxRef.current];
         ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
       }
       parallaxRafRef.current = requestAnimationFrame(tick);
     };
     parallaxRafRef.current = requestAnimationFrame(tick);
-    return () => { if (parallaxRafRef.current) { cancelAnimationFrame(parallaxRafRef.current); parallaxRafRef.current = null; } };
+    return () => {
+      if (parallaxRafRef.current) { cancelAnimationFrame(parallaxRafRef.current); parallaxRafRef.current = null; }
+      setParallaxFrameIdx(parallaxFrameIdxRef.current); // sync scrub slider once on stop
+    };
   }, [parallaxPlaying]);
 
   // Pre-render parallax frames to offscreen canvases for zero-cost playback
