@@ -1,0 +1,6 @@
+{
+  "name": "HoloSim: Holographic Display Simulator",
+  "description": "Simulates wave optics, ray tracing, and diffraction patterns for an 800x600 holographic display with phase and intensity data.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
