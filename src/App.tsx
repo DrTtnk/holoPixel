@@ -790,14 +790,14 @@ export default function App() {
           <div className="w-full h-full flex items-center justify-center dashboard-grid p-6">
             <div
               className="relative rounded-lg border border-neutral-800 bg-neutral-900 shadow-2xl overflow-hidden"
-              style={{ height: '100%', aspectRatio: '4/3', maxWidth: '100%' }}
+              style={{ height: '100%', aspectRatio: '1/1', maxWidth: '100%' }}
             >
               {/* Virtual Camera Sensor Accumulation View */}
               <canvas 
                 ref={canvasRef}
                 data-testid="main-viewport"
                 width={1024} 
-                height={768} 
+                height={1024} 
                 className="w-full h-full block" 
                 style={{ imageRendering: 'pixelated', cursor: renderState === 'done' ? 'crosshair' : 'default' }}
                 onMouseMove={handleReconMouseMove}
