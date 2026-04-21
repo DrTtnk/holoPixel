@@ -214,37 +214,6 @@ extern "C" __global__ void test_kernel(float *out, int n) {
     Ok(format!("nvrtc OK: sum={sum:.2} expected={expected:.2} match={}", (sum - expected).abs() < 1.0))
 }
 
-#[napi(object)]
-pub struct GpuHologramNapiResult {
-    pub grid_w: u32,
-    pub grid_h: u32,
-    pub hemi_res: u32,
-    pub full_width: u32,
-    pub full_height: u32,
-    pub recon_data: Buffer,
-}
-
-#[napi]
-pub fn compute_hologram_gpu(
-    grid_w: u32,
-    grid_h: u32,
-    hemi_res: u32,
-    spp: u32,
-    out_w: u32,
-    out_h: u32,
-    max_bounces: u32,
-    ambient: f64,
-) -> Result<GpuHologramNapiResult> {
-    let result = gpu_hologram::compute_hologram_gpu(grid_w, grid_h, hemi_res, spp, out_w, out_h, max_bounces, ambient as f32);
-    Ok(GpuHologramNapiResult {
-        grid_w: result.grid_w,
-        grid_h: result.grid_h,
-        hemi_res: result.hemi_res,
-        full_width: result.out_w,
-        full_height: result.out_h,
-        recon_data: result.recon_rgba.into(),
-    })
-}
 
 // ── Batched GPU session API for progress reporting ────────
 
@@ -289,27 +258,6 @@ pub fn gpu_session_render_rows(start_row: u32, num_rows: u32) -> Result<u32> {
     let mut guard = GPU_SESSION.lock().unwrap();
     let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
     Ok(session.render_rows(start_row, num_rows))
-}
-
-/// Run Gerchberg-Saxton phase-only holography + panel model + forward projection.
-/// Replaces the rendered hemispheres in-place with the reconstructed intensity.
-///
-/// - `iterations`: GS iterations (typical 10-50; 0 = skip GS, use random phase)
-/// - `phase_bits`: phase quantization levels = 2^phase_bits (0 = no quantization)
-/// - `noise_sigma_rad`: Gaussian phase noise std-dev (radians)
-/// - `noise_seed`: RNG seed (use 0 for deterministic default)
-#[napi]
-pub fn gpu_session_run_gs(
-    iterations: u32,
-    phase_bits: u32,
-    noise_sigma_rad: f64,
-    noise_seed: BigInt,
-) -> Result<()> {
-    let mut guard = GPU_SESSION.lock().unwrap();
-    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
-    let (_signed, seed_u64, _loss) = noise_seed.get_u64();
-    session.run_gs(iterations, phase_bits, noise_sigma_rad as f32, seed_u64);
-    Ok(())
 }
 
 /// Step-wise GS: setup (alloc buffers, extract target amp, seed random phase).

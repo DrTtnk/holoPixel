@@ -332,116 +332,180 @@ __global__ void render_hemispheres(
     }
 
     // Average and store (no tonemapping — store linear float)
+    // Write to LOCAL position within the batch buffer (blockIdx.x), not global hogel_idx,
+    // so that hemi_batch_dev only needs to be batch-sized rather than all-hogels-sized.
     float inv = valid_samples > 0 ? 1.0f / (float)valid_samples : 0.0f;
-    long long out_idx = ((long long)hogel_idx * total_pixels + pixel_idx) * 3;
+    long long out_idx = ((long long)blockIdx.x * total_pixels + pixel_idx) * 3;
     output[out_idx + 0] = r_sum * inv;
     output[out_idx + 1] = g_sum * inv;
     output[out_idx + 2] = b_sum * inv;
 }
 
-// ── Lightfield Reconstruction Kernel ──────────────────────
-// For each output pixel, find which hogel is hit, compute viewing
-// direction from observer through panel point, sample hogel hemisphere.
+// ── Streaming Scatter Architecture ──────────────────────────────
+// Instead of storing all hemisphere data and gathering at reconstruction
+// time, we process hogels in batches:
+//   render batch → extract preview thumbnails → extract target_amp
+//   GS iterations → finalize → scatter intensity to output accumulator
+//   normalize + tonemap accumulator → final RGBA image
+// Memory: O(batch) + O(hogels × preview_res²) instead of O(hogels × hemi_res² × 3)
 
-__global__ void reconstruct_lightfield(
-    unsigned char* __restrict__ output,  // [out_w * out_h * 4] RGBA
-    const float* __restrict__ hemispheres,  // [num_hogels * res * res * 3] RGB float
+// Downsample a batch of full-resolution RGB hemispheres to small preview thumbnails.
+// Output is stored at hogel_offset in the persistent preview buffer.
+__global__ void downsample_to_preview(
+    const float* __restrict__ hemi_batch,  // [batch × hemi_res × hemi_res × 3] RGB
+    float* __restrict__ preview,           // [num_hogels × preview_res × preview_res × 3] RGB
+    int batch,
+    int hemi_res,
+    int preview_res,
+    int hogel_offset
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * preview_res * preview_res;
+    if (idx >= total) return;
+
+    int hogel_in_batch = idx / (preview_res * preview_res);
+    int local = idx % (preview_res * preview_res);
+    int px = local % preview_res;
+    int py = local / preview_res;
+
+    float scale = (float)hemi_res / (float)preview_res;
+    int hx0 = (int)((float)px * scale);
+    int hy0 = (int)((float)py * scale);
+    int hx1 = min((int)((float)(px + 1) * scale), hemi_res);
+    int hy1 = min((int)((float)(py + 1) * scale), hemi_res);
+
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    int count = 0;
+    for (int hy = hy0; hy < hy1; hy++) {
+        for (int hx = hx0; hx < hx1; hx++) {
+            long long hidx = ((long long)hogel_in_batch * hemi_res * hemi_res + (long long)hy * hemi_res + hx) * 3;
+            r += hemi_batch[hidx];
+            g += hemi_batch[hidx + 1];
+            b += hemi_batch[hidx + 2];
+            count++;
+        }
+    }
+    if (count > 0) { r /= count; g /= count; b /= count; }
+
+    int hogel_global = hogel_offset + hogel_in_batch;
+    long long pidx = ((long long)hogel_global * preview_res * preview_res + (long long)py * preview_res + px) * 3;
+    preview[pidx]     = r;
+    preview[pidx + 1] = g;
+    preview[pidx + 2] = b;
+}
+
+// Scatter the GS-reconstructed intensity from one batch of hogels into the
+// output accumulator with Gaussian-aperture weighting.
+// Each hogel pushes its contribution to the ~(2*half_w+1)^2 output pixels
+// it covers. Uses atomicAdd.
+__global__ void scatter_hogel_contributions(
+    const float* __restrict__ intensity_batch, // [batch × hemi_res × hemi_res] float
+    float* __restrict__ output_accum,          // [out_w × out_h] float (atomic)
+    float* __restrict__ weight_accum,          // [out_w × out_h] float (atomic)
+    int hogel_offset,
+    int batch,
     int grid_w, int grid_h,
     int hemi_res,
     int out_w, int out_h,
     float box_w, float box_h,
     float eye_x, float eye_y, float eye_z,
+    float sigma_panel,   // Gaussian σ in panel coordinates (mm)
+    int half_w           // ceil(2.5 * sigma_panel/box_w * out_w) + 1
+) {
+    // blockIdx.y = hogel index within batch
+    // blockIdx.x * blockDim.x + threadIdx.x = index within scatter window
+    int hogel_in_batch = blockIdx.y;
+    if (hogel_in_batch >= batch) return;
+
+    int hogel_global = hogel_offset + hogel_in_batch;
+    int gx = hogel_global % grid_w;
+    int gy = hogel_global / grid_w;
+    float cell_w = box_w / (float)grid_w;
+    float cell_h = box_h / (float)grid_h;
+    float hcx = (gx + 0.5f) * cell_w;
+    float hcy = (gy + 0.5f) * cell_h;
+    float inv2s2 = 1.0f / (2.0f * sigma_panel * sigma_panel);
+
+    // Hogel centre in output-pixel space (Y-flipped: panel y=0 → output bottom)
+    float cx_out = hcx / box_w * (float)out_w;
+    float cy_out = (1.0f - hcy / box_h) * (float)out_h;
+    int cx_pix = (int)cx_out;
+    int cy_pix = (int)cy_out;
+
+    int window_dim = 2 * half_w + 1;
+    int window_size = window_dim * window_dim;
+    int pixel_in_window = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel_in_window >= window_size) return;
+
+    int wx = pixel_in_window % window_dim - half_w;
+    int wy = pixel_in_window / window_dim - half_w;
+    int px = cx_pix + wx;
+    int py = cy_pix + wy;
+    if (px < 0 || px >= out_w || py < 0 || py >= out_h) return;
+
+    // Panel position for this output pixel
+    float panel_x = ((float)px + 0.5f) / (float)out_w * box_w;
+    float panel_y = (1.0f - ((float)py + 0.5f) / (float)out_h) * box_h;
+
+    // Gaussian weight (panel-space distance from hogel centre)
+    float ddx = panel_x - hcx;
+    float ddy = panel_y - hcy;
+    float w = expf(-(ddx*ddx + ddy*ddy) * inv2s2);
+    if (w < 1e-4f) return;
+
+    // Direction from observer through panel point
+    float dx = panel_x - eye_x;
+    float dy = panel_y - eye_y;
+    float dz = -eye_z;  // eye_z is negative (observer is behind panel)
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+    float d_fwd   = dz / dist;
+    float d_right = dx / dist;
+    float d_up    = dy / dist;
+
+    // Fisheye lookup (equidistant)
+    float half_pi = 1.5707963f;
+    float theta = acosf(fminf(fmaxf(d_fwd, -1.0f), 1.0f));
+    if (theta >= half_pi) return;  // behind the hogel's hemisphere
+
+    float r_fish = theta / half_pi;
+    float sin_theta = sinf(theta);
+    float phi_cos = sin_theta > 1e-6f ? d_right / sin_theta : 0.0f;
+    float phi_sin = sin_theta > 1e-6f ? d_up    / sin_theta : 0.0f;
+
+    float hr = (float)hemi_res;
+    int hu = min((int)((phi_cos * r_fish * 0.5f + 0.5f) * hr), hemi_res - 1);
+    int hv = min((int)((phi_sin * r_fish * 0.5f + 0.5f) * hr), hemi_res - 1);
+
+    long long hpx = (long long)hogel_in_batch * hemi_res * hemi_res + (long long)hv * hemi_res + hu;
+    float intensity = intensity_batch[hpx];
+
+    int out_idx = py * out_w + px;
+    atomicAdd(&output_accum[out_idx], w * intensity);
+    atomicAdd(&weight_accum[out_idx], w);
+}
+
+// Normalize the scatter accumulators and apply filmic tonemapping → RGBA.
+__global__ void normalize_and_tonemap(
+    const float* __restrict__ output_accum,   // [out_w × out_h] float
+    const float* __restrict__ weight_accum,   // [out_w × out_h] float
+    unsigned char* __restrict__ output_rgba,  // [out_w × out_h × 4] u8
+    int out_w, int out_h,
     float exposure
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= out_w * out_h) return;
 
-    int px = idx % out_w;
-    int py = idx / out_w;
+    float wt = weight_accum[idx];
+    float v  = (wt > 1e-7f) ? output_accum[idx] / wt : 0.0f;
 
-    float cell_w = box_w / (float)grid_w;
-    float cell_h = box_h / (float)grid_h;
-    float half_pi = 1.5707963f;
-    float hr = (float)hemi_res;
+    // Filmic tonemap: sqrt(1 - exp(-v * exposure))
+    float tv = sqrtf(1.0f - expf(-v * exposure));
+    unsigned char c = (unsigned char)(fminf(tv, 1.0f) * 255.0f);
 
-    // Map output pixel to panel position
-    float panel_x = ((float)px + 0.5f) / (float)out_w * box_w;
-    float panel_y = (1.0f - ((float)py + 0.5f) / (float)out_h) * box_h;
-
-    // Gaussian-aperture hogel blending.
-    // Models Gaussian-windowed hogel apertures as used in real holographic stereogram printers.
-    // Each hogel's contribution is weighted by exp(-d²/(2σ²)) where d is the distance from the
-    // panel point to the hogel's centre. A 3×3 neighbourhood captures >99% of the energy.
-    float sigma = 0.7f * fminf(cell_w, cell_h);
-    float inv2s2 = 1.0f / (2.0f * sigma * sigma);
-    int gxc = min(max((int)(panel_x / cell_w), 0), grid_w - 1);
-    int gyc = min(max((int)(panel_y / cell_h), 0), grid_h - 1);
-
-    // Direction from observer through panel point into scene
-    float dx = panel_x - eye_x;
-    float dy = panel_y - eye_y;
-    float dz = 0.0f - eye_z;  // = 800 (positive)
-    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-
-    float d_fwd = dz / dist;
-    float d_right = dx / dist;
-    float d_up = dy / dist;
-
-    // Fisheye lookup
-    float theta = acosf(fminf(fmaxf(d_fwd, -1.0f), 1.0f));
-    float r_fish = theta / half_pi;
-
-    if (r_fish > 1.0f) {
-        output[idx * 4 + 0] = 0;
-        output[idx * 4 + 1] = 0;
-        output[idx * 4 + 2] = 0;
-        output[idx * 4 + 3] = 255;
-        return;
-    }
-
-    float sin_theta = sinf(theta);
-    float phi_cos = sin_theta > 1e-6f ? d_right / sin_theta : 0.0f;
-    float phi_sin = sin_theta > 1e-6f ? d_up / sin_theta : 0.0f;
-
-    float fu = (phi_cos * r_fish * 0.5f + 0.5f) * hr;
-    float fv = (phi_sin * r_fish * 0.5f + 0.5f) * hr;
-    int hu = min((int)fu, hemi_res - 1);
-    int hv = min((int)fv, hemi_res - 1);
-
-    // Sample 3×3 neighbourhood weighted by Gaussian aperture
-    long long base = (long long)hemi_res * hemi_res;
-    long long hoff = (long long)hv * hemi_res + hu;
-    float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f, sum_w = 0.0f;
-    for (int dgy = -1; dgy <= 1; dgy++) {
-        int gy = max(0, min(gyc + dgy, grid_h - 1));
-        float hcy = (gy + 0.5f) * cell_h;
-        float ddy = panel_y - hcy;
-        for (int dgx = -1; dgx <= 1; dgx++) {
-            int gx = max(0, min(gxc + dgx, grid_w - 1));
-            float hcx = (gx + 0.5f) * cell_w;
-            float ddx = panel_x - hcx;
-            float w = expf(-(ddx*ddx + ddy*ddy) * inv2s2);
-            long long hpx = ((long long)(gy * grid_w + gx) * base + hoff) * 3;
-            sum_r += w * hemispheres[hpx];
-            sum_g += w * hemispheres[hpx + 1];
-            sum_b += w * hemispheres[hpx + 2];
-            sum_w += w;
-        }
-    }
-    float r = sum_r / sum_w;
-    float g = sum_g / sum_w;
-    float b = sum_b / sum_w;
-
-    // Filmic tonemap: exposure ramp + sqrt gamma-approx.
-    // Much gentler than sqrt(r*e): emitters stay white, lit walls mid-gray, darks preserved.
-    r = sqrtf(1.0f - expf(-r * exposure));
-    g = sqrtf(1.0f - expf(-g * exposure));
-    b = sqrtf(1.0f - expf(-b * exposure));
-
-    output[idx * 4 + 0] = (unsigned char)(r * 255.0f);
-    output[idx * 4 + 1] = (unsigned char)(g * 255.0f);
-    output[idx * 4 + 2] = (unsigned char)(b * 255.0f);
-    output[idx * 4 + 3] = 255;
+    output_rgba[idx * 4 + 0] = c;
+    output_rgba[idx * 4 + 1] = c;
+    output_rgba[idx * 4 + 2] = c;
+    output_rgba[idx * 4 + 3] = 255;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -588,21 +652,6 @@ __global__ void intensity_from_complex(
     if (idx >= n) return;
     float2 z = e[idx];
     intensity[idx] = (z.x*z.x + z.y*z.y) * norm_factor;
-}
-
-// Broadcast a single-channel intensity back to RGB float3 hemisphere format,
-// so the existing reconstruct_lightfield kernel can consume it unchanged.
-__global__ void gray_to_rgb_hemi(
-    const float* __restrict__ intensity,  // [B × N²]
-    float* __restrict__ rgb_out,          // [B × N² × 3]
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    float v = intensity[idx];
-    rgb_out[(long long)idx * 3 + 0] = v;
-    rgb_out[(long long)idx * 3 + 1] = v;
-    rgb_out[(long long)idx * 3 + 2] = v;
 }
 
 } // extern "C"
