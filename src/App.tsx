@@ -81,8 +81,9 @@ export default function App() {
   const [parallaxPlaying, setParallaxPlaying] = useState(false);
   const [parallaxOrbitRadius, setParallaxOrbitRadius] = useState(200); // mm
   const [parallaxOrbitAxis, setParallaxOrbitAxis] = useState<'horizontal' | 'vertical'>('horizontal');
-  const parallaxPlayRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const parallaxRafRef = useRef<number | null>(null);
   const parallaxCanvasesRef = useRef<HTMLCanvasElement[]>([]);
+  const parallaxFrameIdxRef = useRef(0); // mutable, used by rAF loop
 
   // Hover-on-hogel diagnostic preview
   const [hogelPreview, setHogelPreview] = useState<{
@@ -244,22 +245,35 @@ export default function App() {
     }
   }, []);
 
-  // Auto-play parallax frames + draw to main viewport
+  // Auto-play parallax frames via rAF loop (bypasses React render cycle for smooth playback)
   useEffect(() => {
-    if (parallaxPlaying && parallaxFrames.length > 0) {
-      parallaxPlayRef.current = setInterval(() => {
-        setParallaxFrameIdx(i => (i + 1) % parallaxFrames.length);
-      }, 80);
-    } else if (parallaxPlayRef.current) {
-      clearInterval(parallaxPlayRef.current);
-      parallaxPlayRef.current = null;
+    if (!parallaxPlaying || parallaxCanvasesRef.current.length === 0 || !canvasRef.current) {
+      if (parallaxRafRef.current) { cancelAnimationFrame(parallaxRafRef.current); parallaxRafRef.current = null; }
+      return;
     }
-    return () => { if (parallaxPlayRef.current) { clearInterval(parallaxPlayRef.current); parallaxPlayRef.current = null; } };
-  }, [parallaxPlaying, parallaxFrames.length]);
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d')!;
+    const total = parallaxCanvasesRef.current.length;
+    let lastTime = 0;
+    const MS_PER_FRAME = 80;
+
+    const tick = (now: number) => {
+      if (now - lastTime >= MS_PER_FRAME) {
+        lastTime = now;
+        parallaxFrameIdxRef.current = (parallaxFrameIdxRef.current + 1) % total;
+        setParallaxFrameIdx(parallaxFrameIdxRef.current); // sync scrub slider (React batches this)
+        const src = parallaxCanvasesRef.current[parallaxFrameIdxRef.current];
+        ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
+      }
+      parallaxRafRef.current = requestAnimationFrame(tick);
+    };
+    parallaxRafRef.current = requestAnimationFrame(tick);
+    return () => { if (parallaxRafRef.current) { cancelAnimationFrame(parallaxRafRef.current); parallaxRafRef.current = null; } };
+  }, [parallaxPlaying]);
 
   // Pre-render parallax frames to offscreen canvases for zero-cost playback
   useEffect(() => {
-    if (parallaxFrames.length === 0) { parallaxCanvasesRef.current = []; return; }
+    if (parallaxFrames.length === 0) { parallaxCanvasesRef.current = []; parallaxFrameIdxRef.current = 0; return; }
     const OUT = holoState.fullWidth ?? 1024;
     parallaxCanvasesRef.current = parallaxFrames.map(frame => {
       const c = document.createElement('canvas');
@@ -269,16 +283,14 @@ export default function App() {
     });
   }, [parallaxFrames, holoState.fullWidth]);
 
-  // Draw current parallax frame to main viewport canvas
+  // Draw current parallax frame to main viewport canvas (manual scrub only)
   useEffect(() => {
+    if (parallaxPlaying) return; // rAF loop handles this during playback
     const prebuilt = parallaxCanvasesRef.current[parallaxFrameIdx];
     if (!prebuilt || !canvasRef.current) return;
     const ctx = canvasRef.current.getContext('2d')!;
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-    ctx.imageSmoothingEnabled = true;
     ctx.drawImage(prebuilt, 0, 0, canvasRef.current.width, canvasRef.current.height);
-  }, [parallaxFrameIdx]);
+  }, [parallaxFrameIdx, parallaxPlaying]);
 
   // Generate parallax sequence: reconstruct from 24 positions on a circle
   const generateParallax = useCallback(async () => {
