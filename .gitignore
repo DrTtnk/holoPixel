@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+# Node and Rust build trees
+node_modules/
+target/
+dist/
+out/
+release/
+# Solver output: light fields and phase maps run to gigabytes
+*.npz
+*.npy
+HOLOSIM-holographic-display-simulator/
