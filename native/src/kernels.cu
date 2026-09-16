@@ -245,7 +245,7 @@ __device__ Vec3 trace_path(Ray ray, unsigned long long* rng, int max_bounces, fl
         // Cosine-weighted bounce
         Vec3 new_dir = hemisphere_cosine(rng, hit.normal);
         current.origin = v3_add(hit.point, v3_scale(hit.normal, 1e-3f));
-        current.dir = v3_norm(new_dir);
+        current.dir = new_dir;  // already unit-length from hemisphere_cosine
     }
 
     return radiance;
@@ -299,12 +299,6 @@ __global__ __launch_bounds__(256) void render_hemispheres(
     float cell_h = box_h / (float)grid_h;
     Vec3 origin = v3(((float)gx + 0.5f) * cell_w, ((float)gy + 0.5f) * cell_h, 0.0f);
 
-    // Camera frame: forward=+z, up=+y → right = up×forward = +x
-    // (matches render_hemisphere in renderer.rs)
-    Vec3 forward = v3(0, 0, 1);
-    Vec3 right = v3(1, 0, 0);   // up.cross(forward) = (0,1,0)×(0,0,1) = (1,0,0)
-    Vec3 cam_up = v3(0, 1, 0);  // forward.cross(right) = (0,0,1)×(1,0,0) = (0,1,0)
-
     float half_pi = 1.5707963f;
 
     // RNG seed: unique per hogel + pixel
@@ -320,21 +314,20 @@ __global__ __launch_bounds__(256) void render_hemispheres(
         float r = sqrtf(u*u + v*v);
         if (r > 1.0f) continue;
 
-        // Equidistant fisheye
+        // Equidistant fisheye → direction.
+        // Camera frame is identity (forward=+z, right=+x, up=+y) so
+        // dir = (sin_t * phi_cos, sin_t * phi_sin, cos_t) which is already
+        // unit length — no normalization needed.
         float theta = r * half_pi;
         float sin_t, cos_t;
         sincosf(theta, &sin_t, &cos_t);
 
         Vec3 dir;
         if (r > 1e-6f) {
-            float phi_cos = u / r;
-            float phi_sin = v / r;
-            dir = v3_norm(v3_add(v3_add(
-                v3_scale(right, phi_cos * sin_t),
-                v3_scale(cam_up, phi_sin * sin_t)),
-                v3_scale(forward, cos_t)));
+            float inv_r = 1.0f / r;
+            dir = v3(u * inv_r * sin_t, v * inv_r * sin_t, cos_t);
         } else {
-            dir = forward;
+            dir = v3(0, 0, 1);
         }
 
         Ray ray;
@@ -424,7 +417,6 @@ __global__ void scatter_hogel_contributions(
     int out_w, int out_h,
     float box_w, float box_h,
     float eye_x, float eye_y, float eye_z,
-    float sigma_panel,   // unused (kept for API compat)
     int half_w           // half-width of the hogel tile in output pixels
 ) {
     // blockIdx.y = hogel index within batch
@@ -684,6 +676,36 @@ __global__ void intensity_from_complex(
     if (idx >= n) return;
     float2 z = e[idx];
     intensity[idx] = (z.x*z.x + z.y*z.y) * norm_factor;
+}
+
+// Add mean vector to each row of a batch matrix, then clamp to >= 0.
+// out[i * pph + j] += mean[j], then out = max(out, 0)
+// Launched with gridDim.x = ceil(pph/256), gridDim.y = batch
+__global__ void add_mean_and_clamp(
+    float* __restrict__ out,       // [batch × pph]
+    const float* __restrict__ mean, // [pph]
+    int pph
+) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= pph) return;
+    int i = blockIdx.y;
+    int idx = i * pph + j;
+    float v = out[idx] + mean[j];
+    out[idx] = v > 0.0f ? v : 0.0f;
+}
+
+// Subtract mean vector from each row of a batch matrix (for PCA projection).
+// out[i * pph + j] -= mean[j]
+// Launched with gridDim.x = ceil(pph/256), gridDim.y = batch
+__global__ void subtract_mean(
+    float* __restrict__ out,       // [batch × pph]
+    const float* __restrict__ mean, // [pph]
+    int pph
+) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= pph) return;
+    int i = blockIdx.y;
+    out[i * pph + j] -= mean[j];
 }
 
 } // extern "C"

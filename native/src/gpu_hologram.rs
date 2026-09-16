@@ -88,21 +88,36 @@ use cudarc::driver::CudaSlice;
 const PREVIEW_RES: u32 = 64;  // hogel thumbnail resolution (rows × cols)
 const MAX_BATCH_HOGELS: usize = 4096;
 
-/// Evict a UnifiedSlice from VRAM back to CPU RAM (advisory prefetch).
-/// Call before operations that need VRAM budget (e.g. cuFFT plan creation).
-/// Caller must `stream.synchronize()` afterwards to wait for migration.
+/// Evict a UnifiedSlice from VRAM back to CPU RAM.
+/// Uses cudaMemAdvise + cudaMemPrefetchAsync for more reliable eviction.
 fn prefetch_to_cpu<T: ValidAsZeroBits>(slice: &UnifiedSlice<T>) {
     if let Ok(s) = slice.as_slice() {
         let ptr = s.as_ptr() as *const ::std::ffi::c_void;
         let bytes = slice.len() * std::mem::size_of::<T>();
-        // Use runtime API cudaMemPrefetchAsync(devPtr, count, dstDevice=-1 CPU, stream=0)
-        // cuMemPrefetchAsync_v2 (driver API) doesn't reliably evict on all platforms.
-        let result = unsafe {
-            cudarc::runtime::sys::cudaMemPrefetchAsync(ptr, bytes, -1i32, std::ptr::null_mut())
-        };
-        if result != cudarc::runtime::sys::cudaError::cudaSuccess {
-            // Prefetch is advisory; if it fails, CUDA will still handle migration via page faults
-            let _ = result;
+        unsafe {
+            // Tell CUDA the preferred location is CPU — this makes the driver eager to evict
+            cudarc::runtime::sys::cudaMemAdvise(
+                ptr, bytes,
+                cudarc::runtime::sys::cudaMemoryAdvise::cudaMemAdviseSetPreferredLocation,
+                -1i32, // cudaCpuDeviceId
+            );
+            // Request async migration to CPU
+            cudarc::runtime::sys::cudaMemPrefetchAsync(ptr, bytes, -1i32, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Re-enable GPU access for a unified buffer (call before GPU kernels touch it).
+fn prefetch_to_gpu<T: ValidAsZeroBits>(slice: &UnifiedSlice<T>, device: i32) {
+    if let Ok(s) = slice.as_slice() {
+        let ptr = s.as_ptr() as *const ::std::ffi::c_void;
+        let bytes = slice.len() * std::mem::size_of::<T>();
+        unsafe {
+            cudarc::runtime::sys::cudaMemAdvise(
+                ptr, bytes,
+                cudarc::runtime::sys::cudaMemoryAdvise::cudaMemAdviseSetPreferredLocation,
+                device,
+            );
         }
     }
 }
@@ -130,8 +145,6 @@ pub struct GsState {
 pub struct StreamState {
     plan: CudaFft,
     gs_batch: usize,              // cuFFT batch size (e.g. 64)
-    max_render_hogels: usize,     // max hogels per render batch
-    pixels_per_hogel: usize,
     target_amp: CudaSlice<f32>,   // [max_render_hogels × pixels_per_hogel]
     phase: CudaSlice<f32>,        // [max_render_hogels × pixels_per_hogel]
     e_a: CudaSlice<cufft_sys::float2>,
@@ -142,6 +155,46 @@ pub struct StreamState {
     extract_phase_fn: CudaFunction,
     apply_panel_fn: CudaFunction,
     intensity_fn: CudaFunction,
+}
+
+/// PCA-compressed intensity for streaming-mode parallax.
+/// Stores mean + eigenvectors + per-hogel coefficients.
+pub struct PcaIntensity {
+    /// Mean intensity vector [pph], f32
+    mean: Vec<f32>,
+    /// Top-K eigenvectors [K × pph] row-major, f32 on host
+    eigenvectors: Vec<f32>,
+    /// GPU copy of eigenvectors [K × pph] (reserved for future cuBLAS GEMM)
+    #[allow(dead_code)]
+    eigenvectors_dev: CudaSlice<f32>,
+    /// GPU copy of mean [pph]
+    mean_dev: CudaSlice<f32>,
+    /// Per-hogel coefficients [num_hogels × K] row-major, f32
+    coefficients: Vec<f32>,
+    /// Number of components
+    k: usize,
+    /// Number of hogels
+    num_hogels: usize,
+    /// Pixels per hogel (hemi_res²)
+    pph: usize,
+}
+
+/// IPB-compressed intensity for streaming-mode parallax.
+/// Only keyframes stored at full precision; P-hogels reconstructed via bilinear interpolation.
+pub struct IpbIntensity {
+    /// Full-res keyframe intensities [n_key × pph] f32
+    keyframes: Vec<f32>,
+    /// Keyframe spacing in hogel grid
+    key_spacing: u32,
+    /// Number of keyframes in x direction
+    key_w: u32,
+    /// Number of keyframes in y direction
+    key_h: u32,
+    /// Grid dimensions
+    grid_w: u32,
+    grid_h: u32,
+    /// Pixels per hogel
+    pph: usize,
 }
 
 pub struct GpuHologramSession {
@@ -155,7 +208,6 @@ pub struct GpuHologramSession {
     pub ambient: f32,
     pub streaming: bool,
     // Derived geometry constants (computed once from grid / output dimensions)
-    sigma_panel: f32,  // Gaussian σ in panel coords (mm)
     half_w: i32,       // scatter window half-size in output pixels
     stream: Arc<CudaStream>,
     ctx: Arc<CudaContext>,
@@ -169,6 +221,7 @@ pub struct GpuHologramSession {
     // Streaming buffers:
     /// Small batch RGB buffer (batch × hemi_res² × 3). Overwritten each render batch.
     hemi_batch_dev: CudaSlice<f32>,
+    hemi_batch_len: usize, // expected length for full hemi_batch allocation
     /// Persistent preview thumbnails (num_hogels × PREVIEW_RES² × 3). Written during render.
     /// None in streaming mode (too large to hold all hogels).
     preview_dev: Option<UnifiedSlice<f32>>,
@@ -191,6 +244,35 @@ pub struct GpuHologramSession {
     pca_sample_indices: Option<Vec<usize>>,
     /// PCA sampling: accumulated target_amp data [num_samples × pixels_per_hogel].
     pca_sample_data: Option<Vec<f32>>,
+    /// Host-side intensity cache for streaming-mode parallax.
+    /// [num_hogels × pixels_per_hogel] floats, filled during stream_sub_batch.
+    saved_intensity: Option<Vec<f32>>,
+    /// PCA-compressed intensity for streaming-mode parallax (replaces saved_intensity after compression).
+    pca_intensity: Option<PcaIntensity>,
+    /// IPB-compressed intensity for streaming-mode parallax.
+    ipb_intensity: Option<IpbIntensity>,
+    /// IPB keyframe collection during streaming (keyframe intensities [n_key × pph]).
+    ipb_keyframes: Option<Vec<f32>>,
+    /// IPB keyframe spacing.
+    ipb_key_spacing: u32,
+    /// Incremental Gram matrix for PCA during streaming [n_sub × n_sub] f64.
+    pca_gram: Option<nalgebra::DMatrix<f64>>,
+    /// Subsampled intensity data for eigenvector computation [n_sub × pph] f32.
+    pca_subsample: Option<Vec<f32>>,
+    /// Subsample indices for incremental PCA.
+    pca_sub_indices: Option<Vec<usize>>,
+    /// Mean accumulator [pph] f64, summed over all hogels.
+    pca_mean_acc: Option<Vec<f64>>,
+    /// Count of hogels accumulated so far for mean.
+    pca_mean_count: usize,
+    /// Streaming pass parameters (for re-rendering in projection pass).
+    stream_gs_iters: u32,
+    stream_phase_bits: u32,
+    stream_noise_sigma: f32,
+    stream_noise_seed: u64,
+    /// True if output_accum was filled during streaming scatter pass.
+    /// First reconstruct() at the same eye can skip re-scattering.
+    streaming_accum_valid: bool,
 }
 
 impl GpuHologramSession {
@@ -204,12 +286,18 @@ impl GpuHologramSession {
         let pixels_per_hogel = (hemi_res * hemi_res) as usize;
         let out_pixels = (out_w * out_h) as usize;
 
-        // Auto-detect streaming mode: if global target_amp would exceed ~4 GB
+        // Auto-detect streaming mode: only if target_amp + phase would exceed system RAM.
+        // Unified memory pages between GPU and system RAM on demand, so large allocations
+        // are fine as long as total fits in system RAM.
+        // Threshold: 64 GB — covers up to 256×256 grid at hemi=256 comfortably.
         let target_amp_bytes = (num_hogels as u64) * (pixels_per_hogel as u64) * 4;
-        let streaming = target_amp_bytes > 4_000_000_000;
+        let streaming = target_amp_bytes > 64_000_000_000;
         if streaming {
             eprintln!("[holosim] STREAMING mode: {}×{} grid ({} hogels), target_amp would be {:.1} GB",
                 grid_w, grid_h, num_hogels, target_amp_bytes as f64 / 1e9);
+        } else if target_amp_bytes > 4_000_000_000 {
+            eprintln!("[holosim] STANDARD mode with unified memory: {}×{} grid, target_amp={:.1} GB (pages to system RAM)",
+                grid_w, grid_h, target_amp_bytes as f64 / 1e9);
         }
 
         let ctx = CudaContext::new(0).expect("CUDA init failed");
@@ -226,7 +314,8 @@ impl GpuHologramSession {
 
         // Streaming buffers
         let batch = MAX_BATCH_HOGELS.min(num_hogels);
-        let hemi_batch_dev  = stream.alloc_zeros::<f32>(batch * pixels_per_hogel * 3).expect("alloc hemi_batch");
+        let hemi_batch_len = batch * pixels_per_hogel * 3;
+        let hemi_batch_dev  = stream.alloc_zeros::<f32>(hemi_batch_len).expect("alloc hemi_batch");
 
         // Large global buffers: only allocate in standard (non-streaming) mode
         let (preview_dev, target_amp_dev) = if streaming {
@@ -245,17 +334,54 @@ impl GpuHologramSession {
 
         // Precompute scatter geometry (box fill: each hogel fills its tile, flat weight)
         let cell_w = BOX_W / grid_w as f32;
-        let cell_h = BOX_H / grid_h as f32;
-        let sigma_panel = 0.5f32 * cell_w.min(cell_h); // kept for API compat, not used
         let half_w = ((0.5f32 * cell_w / BOX_W * out_w as f32).ceil() as i32).max(1);
+
+        // Host-side intensity cache for streaming-mode parallax
+        // Use raw cache when system RAM is sufficient; fall back to incremental PCA for extreme configs
+        let saved_intensity = if streaming {
+            let total_bytes = (num_hogels as u64) * (pixels_per_hogel as u64) * 4;
+            if total_bytes <= 2_000_000_000 {
+                // Cache in RAM (≤2 GB) — lazy-allocated via mmap, pages materialize on write
+                eprintln!("[holosim] allocating {:.1} GB host intensity cache for parallax",
+                    total_bytes as f64 / 1e9);
+                Some(vec![0.0f32; num_hogels * pixels_per_hogel])
+            } else {
+                // Too large for raw cache — use IPB compression (keyframe + int8 residual)
+                eprintln!("[holosim] intensity would be {:.1} GB — using IPB compression pipeline",
+                    total_bytes as f64 / 1e9);
+                None
+            }
+        } else {
+            None
+        };
+
+        // Set up IPB keyframe compression for large streaming configs
+        // Only keyframes stored (~268 MB for 512×512); P-hogels reconstructed via bilinear interpolation
+        let ipb_key_spacing: u32 = 16;
+        let ipb_keyframes = if streaming && saved_intensity.is_none() {
+            let key_w = (grid_w + ipb_key_spacing - 1) / ipb_key_spacing;
+            let key_h = (grid_h + ipb_key_spacing - 1) / ipb_key_spacing;
+            let n_key = (key_w * key_h) as usize;
+            eprintln!("[holosim] IPB keyframe-only: {}×{} keyframes ({:.1} MB), spacing={}",
+                key_w, key_h,
+                (n_key * pixels_per_hogel * 4) as f64 / 1e6,
+                ipb_key_spacing);
+            Some(vec![0.0f32; n_key * pixels_per_hogel])
+        } else {
+            None
+        };
+
+        // Set up incremental PCA accumulators (kept as fallback, but IPB is preferred)
+        let (pca_gram, pca_subsample, pca_sub_indices, pca_mean_acc) =
+            (None::<nalgebra::DMatrix<f64>>, None::<Vec<f32>>, None::<Vec<usize>>, None::<Vec<f64>>);
 
         Self {
             grid_w, grid_h, hemi_res, spp, out_w, out_h, max_bounces, ambient,
             streaming,
-            sigma_panel, half_w,
+            half_w,
             stream, ctx, module,
             render_fn, downsample_fn, hemi_to_amp_fn, scatter_fn, normalize_fn, init_phase_fn,
-            hemi_batch_dev, preview_dev, target_amp_dev,
+            hemi_batch_dev, hemi_batch_len, preview_dev, target_amp_dev,
             output_accum_dev, weight_accum_dev, recon_dev,
             rows_rendered: 0,
             gs: None,
@@ -263,6 +389,36 @@ impl GpuHologramSession {
             ss: None,
             pca_sample_indices: None,
             pca_sample_data: None,
+            saved_intensity,
+            pca_intensity: None,
+            ipb_intensity: None,
+            ipb_keyframes,
+            ipb_key_spacing,
+            pca_gram,
+            pca_subsample,
+            pca_sub_indices,
+            pca_mean_acc,
+            pca_mean_count: 0,
+            stream_gs_iters: 0,
+            stream_phase_bits: 0,
+            stream_noise_sigma: 0.0,
+            stream_noise_seed: 0,
+            streaming_accum_valid: false,
+        }
+    }
+
+    /// Ensure hemi_batch_dev is at full size (lazy re-allocation after shrink).
+    fn ensure_hemi_batch(&mut self) {
+        if self.hemi_batch_dev.len() < self.hemi_batch_len {
+            self.hemi_batch_dev = self.stream.alloc_zeros::<f32>(self.hemi_batch_len)
+                .expect("realloc hemi_batch");
+        }
+    }
+
+    /// Shrink hemi_batch_dev to reclaim VRAM for other allocations (e.g., GS buffers).
+    fn free_hemi_batch(&mut self) {
+        if self.hemi_batch_dev.len() > 1 {
+            self.hemi_batch_dev = self.stream.alloc_zeros::<f32>(1).expect("shrink hemi_batch");
         }
     }
 
@@ -271,6 +427,7 @@ impl GpuHologramSession {
     /// Returns total rows rendered so far.
     pub fn render_rows(&mut self, start_row: u32, num_rows: u32) -> u32 {
         let _t = std::time::Instant::now();
+        self.ensure_hemi_batch();
         let end_row = (start_row + num_rows).min(self.grid_h);
         if end_row <= start_row { return self.rows_rendered; }
 
@@ -374,16 +531,28 @@ impl GpuHologramSession {
         let pixels_per_hogel = n * n;
         let num_hogels = (self.grid_w * self.grid_h) as usize;
 
-        // Evict large unified buffers from VRAM so cuFFT plan creation has enough room.
+        // Evict large unified buffers from VRAM so device allocations succeed.
         if let Some(ref t) = self.target_amp_dev { prefetch_to_cpu(t); }
         if let Some(ref p) = self.preview_dev { prefetch_to_cpu(p); }
-        // Device-wide synchronize to ensure all prefetch migrations complete
+        // Free hemi_batch to reclaim ~3 GB VRAM for GS buffers
+        self.free_hemi_batch();
         unsafe { cudarc::runtime::sys::cudaDeviceSynchronize() };
         self.stream.synchronize().expect("sync pre-gs_setup (prefetch)");
+
+        // Report VRAM state
+        {
+            let (free, total) = unsafe {
+                let mut f: usize = 0;
+                let mut t: usize = 0;
+                cudarc::runtime::sys::cudaMemGetInfo(&mut f as *mut usize, &mut t as *mut usize);
+                (f, t)
+            };
+            eprintln!("[holosim] gs_setup: VRAM {:.1}/{:.1} GB free after prefetch",
+                free as f64 / 1e9, total as f64 / 1e9);
+        }
         let batch = {
             let mut b = MAX_BATCH_HOGELS.min(num_hogels);
             // Cap batch to keep e_a + e_b ≤ 64 MB VRAM.
-            // Larger batches degrade cuFFT cache efficiency (batch=64 is optimal for hemi=256).
             const MAX_EA_EB_BYTES: usize = 64 * 1024 * 1024;
             let max_by_vram = (MAX_EA_EB_BYTES / (pixels_per_hogel * 16)).max(1);
             b = b.min(max_by_vram);
@@ -397,8 +566,8 @@ impl GpuHologramSession {
         let apply_panel_fn   = self.module.load_function("apply_panel_model").expect("apply_panel_model missing");
         let intensity_fn     = self.module.load_function("intensity_from_complex").expect("intensity_from_complex missing");
 
-        let mut phase            = unsafe { self.ctx.alloc_unified::<f32>(num_hogels * pixels_per_hogel, true) }.expect("alloc phase: unified mem");
-        self.stream.memset_zeros(&mut phase).expect("zero phase");
+        // Allocate device-only buffers FIRST (while VRAM is empty after prefetch).
+        // Phase is allocated last as unified memory — its pages start on CPU until touched.
         let e_a                  = self.stream.alloc_zeros::<cufft_sys::float2>(batch * pixels_per_hogel).expect("alloc e_a");
         let e_b                  = self.stream.alloc_zeros::<cufft_sys::float2>(batch * pixels_per_hogel).expect("alloc e_b");
         let intensity_scratch    = self.stream.alloc_zeros::<f32>(batch * pixels_per_hogel).expect("alloc scratch");
@@ -412,7 +581,12 @@ impl GpuHologramSession {
             self.stream.clone(),
         ).expect("cufft plan");
 
-        // Seed random phase across all hogels (total may exceed i32 for large grids)
+        // Now allocate phase as unified memory (virtual, no VRAM consumed yet).
+        // Skip memset_zeros — init_phase_random overwrites everything.
+        let mut phase = unsafe { self.ctx.alloc_unified::<f32>(num_hogels * pixels_per_hogel, true) }.expect("alloc phase: unified mem");
+
+        // Seed random phase across all hogels.
+        // Pages fault into VRAM on demand; CUDA driver evicts them as needed.
         let total: i64 = (num_hogels * pixels_per_hogel) as i64;
         let threads = 256u32;
         let init_cfg = LaunchConfig {
@@ -430,8 +604,8 @@ impl GpuHologramSession {
         }
 
         self.stream.synchronize().expect("sync gs_setup");
-        eprintln!("[holosim] gs_setup hogels={} hemi={} -> {}ms",
-            num_hogels, self.hemi_res, _t.elapsed().as_millis());
+        eprintln!("[holosim] gs_setup hogels={} hemi={} batch={} -> {}ms",
+            num_hogels, self.hemi_res, batch, _t.elapsed().as_millis());
 
         self.gs = Some(GsState {
             plan, batch, pixels_per_hogel, num_hogels,
@@ -558,7 +732,6 @@ impl GpuHologramSession {
         let (grid_w, grid_h, out_w, out_h) = (
             self.grid_w as i32, self.grid_h as i32, self.out_w as i32, self.out_h as i32,
         );
-        let sigma_panel = self.sigma_panel;
         let half_w      = self.half_w;
         let window_dim  = (2 * half_w + 1) as u32;
         let window_size = window_dim * window_dim;
@@ -607,7 +780,6 @@ impl GpuHologramSession {
                         .arg(&out_w).arg(&out_h)
                         .arg(&BOX_W).arg(&BOX_H)
                         .arg(&eye_x).arg(&eye_y).arg(&eye_z)
-                        .arg(&sigma_panel)
                         .arg(&half_w)
                         .launch(scatter_cfg(batch_u32))
                         .expect("scatter launch");
@@ -627,13 +799,911 @@ impl GpuHologramSession {
     /// Re-runs the scatter with the provided eye coordinates (supporting parallax).
     pub fn reconstruct(&mut self, eye_x: f32, eye_y: f32, eye_z: f32) -> Vec<u8> {
         let _t = std::time::Instant::now();
-        if self.gs.is_some() {
+        if self.streaming_accum_valid {
+            // First reconstruct after streaming: output_accum already has correct scatter
+            // at the default eye (278, 273, -800). Just tonemap.
+            self.streaming_accum_valid = false;
+        } else if self.gs.is_some() {
             self.project_and_scatter(false, 0, 0.0, 0, eye_x, eye_y, eye_z);
+        } else if self.ipb_intensity.is_some() {
+            self.scatter_from_ipb(eye_x, eye_y, eye_z);
+        } else if self.pca_intensity.is_some() {
+            self.scatter_from_pca(eye_x, eye_y, eye_z);
+        } else if self.saved_intensity.is_some() {
+            self.scatter_from_saved(eye_x, eye_y, eye_z);
         }
         let result = self.reconstruct_tonemap_only();
         eprintln!("[holosim] reconstruct {}x{} grid={}x{} hemi={} -> {}ms",
             self.out_w, self.out_h, self.grid_w, self.grid_h, self.hemi_res, _t.elapsed().as_millis());
         result
+    }
+
+    /// Replay scatter from host-cached intensity data (streaming mode parallax).
+    fn scatter_from_saved(&mut self, eye_x: f32, eye_y: f32, eye_z: f32) {
+        let saved = self.saved_intensity.as_ref().expect("scatter_from_saved without saved_intensity");
+        let num_hogels = (self.grid_w * self.grid_h) as usize;
+        let pph = (self.hemi_res * self.hemi_res) as usize;
+        let hemi_res = self.hemi_res as i32;
+        let threads = 256u32;
+
+
+        // Zero accumulators
+        self.stream.memset_zeros(&mut self.output_accum_dev).expect("zero output_accum");
+        self.stream.memset_zeros(&mut self.weight_accum_dev).expect("zero weight_accum");
+
+        let half_w = self.half_w;
+        let window_dim = (2 * half_w + 1) as u32;
+        let window_size = window_dim * window_dim;
+        let (grid_w, grid_h, out_w, out_h) = (
+            self.grid_w as i32, self.grid_h as i32, self.out_w as i32, self.out_h as i32,
+        );
+
+        // Use a GPU scratch buffer for the H2D intensity uploads.
+        // Reuse ss.intensity_scratch if available, otherwise allocate a temporary one.
+        let ss_gs_batch = self.ss.as_ref().map(|s| s.gs_batch).unwrap_or(MAX_BATCH_HOGELS.min(num_hogels));
+        let batch_size = ss_gs_batch.min(num_hogels);
+        let scratch_needed = batch_size * pph;
+
+        // We need a mutable GPU buffer. Borrow ss.intensity_scratch if possible.
+        let mut tmp_scratch = if self.ss.is_none() {
+            Some(self.stream.alloc_zeros::<f32>(scratch_needed).expect("alloc replay scratch"))
+        } else {
+            None
+        };
+        let scratch_dev = if let Some(ref mut ss) = self.ss {
+            &mut ss.intensity_scratch
+        } else {
+            tmp_scratch.as_mut().unwrap()
+        };
+
+        let scatter_cfg = |b_size: u32| LaunchConfig {
+            grid_dim: ((window_size + threads - 1) / threads, b_size, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut hogel = 0usize;
+        while hogel < num_hogels {
+            let batch = batch_size.min(num_hogels - hogel);
+            let count = batch * pph;
+            let host_off = hogel * pph;
+
+            // H2D copy this batch's intensity
+            let mut dst = scratch_dev.slice_mut(0..count);
+            self.stream.memcpy_htod(&saved[host_off..host_off + count], &mut dst)
+                .expect("H2D intensity replay");
+
+            // Scatter with the given eye position
+            let intensity_view = scratch_dev.slice(0..count);
+            let hogel_off = hogel as i32;
+            let batch_u32 = batch as u32;
+            unsafe {
+                self.stream.launch_builder(&self.scatter_fn)
+                    .arg(&intensity_view)
+                    .arg(&mut self.output_accum_dev)
+                    .arg(&mut self.weight_accum_dev)
+                    .arg(&hogel_off)
+                    .arg(&(batch_u32 as i32))
+                    .arg(&grid_w).arg(&grid_h)
+                    .arg(&hemi_res)
+                    .arg(&out_w).arg(&out_h)
+                    .arg(&BOX_W).arg(&BOX_H)
+                    .arg(&eye_x).arg(&eye_y).arg(&eye_z)
+                    .arg(&half_w)
+                    .launch(scatter_cfg(batch_u32))
+                    .expect("replay scatter");
+            }
+            hogel += batch;
+        }
+        self.stream.synchronize().expect("sync scatter_from_saved");
+    }
+
+    /// PCA-compress intensity for streaming-mode parallax.
+    /// Two modes:
+    /// - If saved_intensity exists: use all hogel data (original path)
+    /// - If pca_subsample exists: use subsampled data for eigenvectors,
+    ///   then re-stream to project all hogels (avoids 4+ GB allocation)
+    pub fn compress_intensity(&mut self) {
+        if self.ipb_keyframes.is_some() {
+            self.compress_intensity_ipb();
+        } else if self.saved_intensity.is_some() {
+            self.compress_intensity_from_saved();
+        } else if self.pca_subsample.is_some() {
+            self.compress_intensity_incremental();
+        } else {
+            eprintln!("[holosim] compress_intensity: no data available");
+        }
+    }
+
+    /// IPB compression: finalize keyframes from streaming collection into IpbIntensity.
+    /// P-hogels are reconstructed via bilinear interpolation at scatter time (no residuals stored).
+    fn compress_intensity_ipb(&mut self) {
+        let keyframes = self.ipb_keyframes.take().expect("compress_intensity_ipb: no keyframes");
+
+        let grid_w = self.grid_w;
+        let grid_h = self.grid_h;
+        let key_spacing = self.ipb_key_spacing;
+        let key_w = (grid_w + key_spacing - 1) / key_spacing;
+        let key_h = (grid_h + key_spacing - 1) / key_spacing;
+        let pph = (self.hemi_res * self.hemi_res) as usize;
+
+        eprintln!("[holosim] IPB finalized: {}×{} keyframes ({:.1} MB), key_spacing={}, bilinear interpolation for P-hogels",
+            key_w, key_h,
+            (keyframes.len() * 4) as f64 / 1e6,
+            key_spacing);
+
+        self.ipb_intensity = Some(IpbIntensity {
+            keyframes,
+            key_spacing,
+            key_w,
+            key_h,
+            grid_w,
+            grid_h,
+            pph,
+        });
+    }
+
+    /// PCA compression from full saved_intensity buffer (≤2 GB configs).
+    fn compress_intensity_from_saved(&mut self) {
+        use rayon::prelude::*;
+        use nalgebra::{DMatrix, SymmetricEigen};
+
+        let data = self.saved_intensity.take().expect("compress_intensity: no saved_intensity");
+        let n = (self.grid_w * self.grid_h) as usize;
+        let pph = (self.hemi_res * self.hemi_res) as usize;
+        assert_eq!(data.len(), n * pph);
+        let _t = std::time::Instant::now();
+
+        // 1. Compute mean intensity vector (per-pixel across all hogels)
+        //    Blocked for cache: process MEAN_BLOCK pixels at a time
+        let mean: Vec<f32> = (0..pph).into_par_iter().map(|j| {
+            let mut s = 0.0f64;
+            for i in 0..n { s += data[i * pph + j] as f64; }
+            (s / n as f64) as f32
+        }).collect();
+        eprintln!("[holosim] PCA-compress-intensity: mean computed -> {}ms", _t.elapsed().as_millis());
+
+        // 2. Subsample hogels for Gram matrix (cap at 1024 for faster eigendecomp)
+        let max_gram = 1024usize.min(n);
+        let stride = if n > max_gram { n / max_gram } else { 1 };
+        let n_sub: usize = (0..n).step_by(stride).count();
+
+        // 3. Build centered Gram matrix G = X_c X_c^T / n_sub
+        let mut gram = DMatrix::<f64>::zeros(n_sub, n_sub);
+        const BLOCK: usize = 512;
+        for col_start in (0..pph).step_by(BLOCK) {
+            let col_end = (col_start + BLOCK).min(pph);
+            let bcols = col_end - col_start;
+            let mut block = DMatrix::<f64>::zeros(n_sub, bcols);
+            for (si, i) in (0..n).step_by(stride).enumerate() {
+                for (bc, c) in (col_start..col_end).enumerate() {
+                    block[(si, bc)] = (data[i * pph + c] - mean[c]) as f64;
+                }
+            }
+            gram += &block * block.transpose();
+        }
+        gram /= n_sub as f64;
+        eprintln!("[holosim] PCA-compress-intensity: Gram {}×{} -> {}ms", n_sub, n_sub, _t.elapsed().as_millis());
+
+        // 4. Eigendecompose
+        let eig = SymmetricEigen::new(gram);
+        let mut indices: Vec<usize> = (0..n_sub).collect();
+        indices.sort_by(|&a, &b| eig.eigenvalues[b].partial_cmp(&eig.eigenvalues[a]).unwrap());
+        eprintln!("[holosim] PCA-compress-intensity: eigendecomp -> {}ms", _t.elapsed().as_millis());
+
+        // 5. Determine K: 99% energy, hard cap 512
+        let total_energy: f64 = indices.iter().map(|&idx| eig.eigenvalues[idx].max(0.0)).sum();
+        let max_k: usize = 512;
+        let mut k = 0usize;
+        let mut cumulative = 0.0f64;
+        for &idx in &indices {
+            let ev = eig.eigenvalues[idx];
+            if ev <= 0.0 { break; }
+            cumulative += ev;
+            k += 1;
+            if cumulative / total_energy >= 0.99 { break; }
+            if k >= max_k { break; }
+        }
+        k = k.max(1).min(n_sub);
+        eprintln!("[holosim] PCA-compress-intensity: K={} (energy={:.4}, max={})",
+            k, cumulative / total_energy, max_k);
+
+        // 6. Extract subsampled eigenvectors Q [n_sub × k]
+        let mut q = DMatrix::<f64>::zeros(n_sub, k);
+        for (ki, &idx) in indices.iter().take(k).enumerate() {
+            for si in 0..n_sub {
+                q[(si, ki)] = eig.eigenvectors[(si, idx)];
+            }
+        }
+
+        // Λ^{-1/2} scaling
+        let inv_sqrt_lam: Vec<f64> = indices.iter().take(k).map(|&idx| {
+            let lam = eig.eigenvalues[idx];
+            if lam > 1e-10 { 1.0 / (n_sub as f64 * lam).sqrt() } else { 0.0 }
+        }).collect();
+
+        // 7. Compute full-resolution eigenvectors: V = X_c^T Q Λ^{-1/2}  [k × pph]
+        //    v_flat layout: row-major [component][pixel] = v_flat[ki * pph + j]
+        let mut v_flat = vec![0.0f32; k * pph];
+        v_flat.par_chunks_mut(pph).enumerate().for_each(|(ki, row)| {
+            let scale = inv_sqrt_lam[ki];
+            for j in 0..pph {
+                let mut sum = 0.0f64;
+                let mean_j = mean[j] as f64;
+                for (si, i) in (0..n).step_by(stride).enumerate() {
+                    sum += (data[i * pph + j] as f64 - mean_j) * q[(si, ki)];
+                }
+                row[j] = (sum * scale) as f32;
+            }
+        });
+        eprintln!("[holosim] PCA-compress-intensity: eigenvectors -> {}ms", _t.elapsed().as_millis());
+
+        // 8. Project ALL hogels: coefficients = (X - mean) × V^T  [n × k]
+        let mut coefficients = vec![0.0f32; n * k];
+        coefficients.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+            let x_row = &data[i * pph..(i + 1) * pph];
+            for ki in 0..k {
+                let v_row = &v_flat[ki * pph..(ki + 1) * pph];
+                let mut sum = 0.0f64;
+                for j in 0..pph {
+                    sum += (x_row[j] - mean[j]) as f64 * v_row[j] as f64;
+                }
+                row[ki] = sum as f32;
+            }
+        });
+        eprintln!("[holosim] PCA-compress-intensity: projection -> {}ms", _t.elapsed().as_millis());
+
+        // 9. Upload eigenvectors and mean to GPU (kept resident for fast decompress)
+        let mut eigenvectors_dev = self.stream.alloc_zeros::<f32>(k * pph).expect("alloc eigenvectors GPU");
+        self.stream.memcpy_htod(&v_flat, &mut eigenvectors_dev).expect("H2D eigenvectors");
+        // Also upload mean
+        let mut mean_dev = self.stream.alloc_zeros::<f32>(pph).expect("alloc mean GPU");
+        self.stream.memcpy_htod(&mean, &mut mean_dev).expect("H2D mean");
+        self.stream.synchronize().expect("sync PCA upload");
+
+        let compressed_mb = (k * pph + n * k + pph) as f64 * 4.0 / 1e6;
+        let original_mb = (n * pph) as f64 * 4.0 / 1e6;
+        eprintln!("[holosim] PCA-compress-intensity: done K={} ratio={:.0}x ({:.1}MB → {:.1}MB) -> {}ms",
+            k, original_mb / compressed_mb, original_mb, compressed_mb, _t.elapsed().as_millis());
+
+        self.pca_intensity = Some(PcaIntensity {
+            mean,
+            eigenvectors: v_flat,
+            eigenvectors_dev,
+            mean_dev,
+            coefficients,
+            k,
+            num_hogels: n,
+            pph,
+        });
+    }
+
+    /// PCA compression from subsampled data (large configs, avoids 4+ GB allocation).
+    /// Uses incremental subsample + mean accumulated during streaming.
+    /// Then does a second streaming pass to project all hogels onto eigenvectors.
+    fn compress_intensity_incremental(&mut self) {
+        use nalgebra::{DMatrix, SymmetricEigen};
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as cublas_sys};
+        use std::os::raw::c_int;
+
+        let n = (self.grid_w * self.grid_h) as usize;
+        let pph = (self.hemi_res * self.hemi_res) as usize;
+        let _t = std::time::Instant::now();
+
+        // 1. Compute mean from accumulator
+        let mean_acc = self.pca_mean_acc.take().expect("no mean accumulator");
+        let mean_count = self.pca_mean_count;
+        let mean: Vec<f32> = mean_acc.iter().map(|&s| (s / mean_count as f64) as f32).collect();
+        eprintln!("[holosim] PCA-incremental: mean from {} hogels -> {}ms", mean_count, _t.elapsed().as_millis());
+
+        let subsample = self.pca_subsample.take().expect("no subsample");
+        let sub_indices = self.pca_sub_indices.take().expect("no sub_indices");
+        let n_sub = sub_indices.len();
+
+        // 2. Upload subsample + mean to GPU, compute Gram via cuBLAS
+        let blas = CudaBlas::new(self.stream.clone()).expect("cuBLAS init");
+        let subtract_mean_fn = self.module.load_function("subtract_mean").expect("subtract_mean missing");
+
+        let mut sub_dev = self.stream.alloc_zeros::<f32>(n_sub * pph).expect("alloc subsample GPU");
+        self.stream.memcpy_htod(&subsample, &mut sub_dev).expect("H2D subsample");
+        let mut mean_dev = self.stream.alloc_zeros::<f32>(pph).expect("alloc mean GPU");
+        self.stream.memcpy_htod(&mean, &mut mean_dev).expect("H2D mean");
+
+        // Subtract mean on GPU: sub_dev[i,j] -= mean[j]
+        let threads = 256u32;
+        {
+            let mean_cfg = LaunchConfig {
+                grid_dim: (((pph as u32) + threads - 1) / threads, n_sub as u32, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let pph_i = pph as i32;
+            unsafe {
+                self.stream.launch_builder(&subtract_mean_fn)
+                    .arg(&sub_dev).arg(&mean_dev).arg(&pph_i)
+                    .launch(mean_cfg).expect("GPU subtract mean for Gram");
+            }
+        }
+
+        // Gram = (1/n_sub) * X_centered × X_centered^T  [n_sub × n_sub]
+        // In col-major: X_cm = [pph × n_sub], want G = A^T × A
+        let mut gram_dev = self.stream.alloc_zeros::<f32>(n_sub * n_sub).expect("alloc Gram GPU");
+        {
+            let alpha = 1.0f32 / n_sub as f32;
+            let cfg = GemmConfig {
+                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                m: n_sub as c_int,
+                n: n_sub as c_int,
+                k: pph as c_int,
+                alpha,
+                lda: pph as c_int,
+                ldb: pph as c_int,
+                beta: 0.0f32,
+                ldc: n_sub as c_int,
+            };
+            unsafe {
+                blas.gemm(cfg, &sub_dev, &sub_dev, &mut gram_dev).expect("cuBLAS Gram SGEMM");
+            }
+        }
+
+        // D2H Gram → f64 for eigendecomp
+        self.stream.synchronize().expect("sync Gram");
+        let gram_f32 = self.stream.clone_dtoh(&gram_dev).expect("D2H Gram");
+        drop(gram_dev);
+        let mut gram = DMatrix::<f64>::zeros(n_sub, n_sub);
+        for i in 0..n_sub {
+            for j in 0..n_sub {
+                // gram_f32 is col-major [n_sub × n_sub]
+                gram[(i, j)] = gram_f32[j * n_sub + i] as f64;
+            }
+        }
+        eprintln!("[holosim] PCA-incremental: GPU Gram {}×{} -> {}ms", n_sub, n_sub, _t.elapsed().as_millis());
+
+        // 3. Eigendecompose
+        let eig = SymmetricEigen::new(gram);
+        let mut indices: Vec<usize> = (0..n_sub).collect();
+        indices.sort_by(|&a, &b| eig.eigenvalues[b].partial_cmp(&eig.eigenvalues[a]).unwrap());
+        eprintln!("[holosim] PCA-incremental: eigendecomp -> {}ms", _t.elapsed().as_millis());
+
+        // 4. Determine K: 99% energy, cap at 256
+        let total_energy: f64 = indices.iter().map(|&idx| eig.eigenvalues[idx].max(0.0)).sum();
+        let max_k: usize = 512;
+        let mut k = 0usize;
+        let mut cumulative = 0.0f64;
+        for &idx in &indices {
+            let ev = eig.eigenvalues[idx];
+            if ev <= 0.0 { break; }
+            cumulative += ev;
+            k += 1;
+            if cumulative / total_energy >= 0.99 { break; }
+            if k >= max_k { break; }
+        }
+        k = k.max(1).min(n_sub);
+        eprintln!("[holosim] PCA-incremental: K={} (energy={:.4})", k, cumulative / total_energy);
+
+        // 5. Build Q_scaled [n_sub × k] f32 = Q × diag(Λ^{-1/2}), upload to GPU
+        let inv_sqrt_lam: Vec<f64> = indices.iter().take(k).map(|&idx| {
+            let lam = eig.eigenvalues[idx];
+            if lam > 1e-10 { 1.0 / (n_sub as f64 * lam).sqrt() } else { 0.0 }
+        }).collect();
+
+        // q_scaled row-major [n_sub × k]: element (si, ki) at si*k + ki
+        let mut q_scaled = vec![0.0f32; n_sub * k];
+        for ki in 0..k {
+            let idx = indices[ki];
+            let scale = inv_sqrt_lam[ki] as f32;
+            for si in 0..n_sub {
+                q_scaled[si * k + ki] = (eig.eigenvectors[(si, idx)] * scale as f64) as f32;
+            }
+        }
+        let mut q_dev = self.stream.alloc_zeros::<f32>(n_sub * k).expect("alloc Q GPU");
+        self.stream.memcpy_htod(&q_scaled, &mut q_dev).expect("H2D Q_scaled");
+
+        // 6. GPU eigenvectors: V = X_centered^T × Q_scaled → [pph × k]
+        //    Row-major [k × pph] = col-major [pph × k]
+        //    sub_dev is X_centered [pph × n_sub] col-major
+        //    q_dev is Q_scaled [n_sub × k] row-major = [k × n_sub] col-major
+        //    C = A × B^T where A = sub_dev [pph × n_sub], B = q_dev [k × n_sub]
+        //    transa=N, transb=T → [pph × n_sub] × [n_sub × k] = [pph × k]
+        let mut eigenvectors_dev = self.stream.alloc_zeros::<f32>(k * pph).expect("alloc eigvec GPU");
+        {
+            let cfg = GemmConfig {
+                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                m: pph as c_int,
+                n: k as c_int,
+                k: n_sub as c_int,
+                alpha: 1.0f32,
+                lda: pph as c_int,
+                ldb: k as c_int,
+                beta: 0.0f32,
+                ldc: pph as c_int,
+            };
+            unsafe {
+                blas.gemm(cfg, &sub_dev, &q_dev, &mut eigenvectors_dev).expect("cuBLAS eigvec SGEMM");
+            }
+        }
+        drop(sub_dev); // Free 256 MB GPU
+        drop(q_dev);
+
+        // D2H eigenvectors for coefficient storage + hogel preview
+        self.stream.synchronize().expect("sync eigvec");
+        let v_flat = self.stream.clone_dtoh(&eigenvectors_dev).expect("D2H eigenvectors");
+        eprintln!("[holosim] PCA-incremental: GPU eigenvectors -> {}ms", _t.elapsed().as_millis());
+
+        // 7. Second streaming pass: re-render + GS each batch, project onto eigenvectors.
+        //    Uses GPU subtract_mean + cuBLAS GEMM for fast on-device projection.
+        //    Avoids storing 4+ GB of raw intensity.
+        let mut coefficients = vec![0.0f32; n * k];
+
+        eprintln!("[holosim] PCA-incremental: starting projection pass (re-streaming)...");
+        let _t2 = std::time::Instant::now();
+
+        // Re-allocate hemi_batch for re-rendering (may have been freed by gs_setup)
+        self.ensure_hemi_batch();
+
+        {
+            // Alloc coefficient batch buffer on GPU
+            let ss_gs_batch = self.ss.as_ref().map(|s| s.gs_batch).unwrap_or(64);
+            let mut coeff_dev = self.stream.alloc_zeros::<f32>(ss_gs_batch * k).expect("alloc coeff GPU");
+
+            let launch_cfg = |count: i32| LaunchConfig {
+                grid_dim: ((count as u32 + threads - 1) / threads, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            // Re-render all rows in the same order as the first streaming pass
+            let max_rows_per_sub = ((MAX_BATCH_HOGELS as u32) / self.grid_w).max(1);
+            let gs_iterations = self.stream_gs_iters;
+            let phase_bits = self.stream_phase_bits;
+            let noise_sigma = self.stream_noise_sigma;
+            let noise_seed = self.stream_noise_seed;
+            let (grid_w_i, grid_h_i, hemi_res_i, spp_i, max_bounces_i, ambient_f) = (
+                self.grid_w as i32, self.grid_h as i32, self.hemi_res as i32,
+                self.spp as i32, self.max_bounces as i32, self.ambient,
+            );
+            let pph_i = pph as i32;
+
+            let mut start_row = 0u32;
+            while start_row < self.grid_h {
+                let end_row = (start_row + max_rows_per_sub).min(self.grid_h);
+                let num_rows = end_row - start_row;
+                let row_hogels = (num_rows * self.grid_w) as usize;
+                let hogel_offset = (start_row * self.grid_w) as i32;
+
+                // ── Render hemispheres ──
+                let pixel_blocks = (pph as u32 + threads - 1) / threads;
+                let render_cfg = LaunchConfig {
+                    grid_dim: (row_hogels as u32, pixel_blocks, 1),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.stream.launch_builder(&self.render_fn)
+                        .arg(&mut self.hemi_batch_dev)
+                        .arg(&grid_w_i).arg(&grid_h_i).arg(&hemi_res_i).arg(&spp_i)
+                        .arg(&BOX_W).arg(&BOX_H)
+                        .arg(&hogel_offset)
+                        .arg(&max_bounces_i).arg(&ambient_f)
+                        .launch(render_cfg)
+                        .expect("projection render failed");
+                }
+
+                // ── Extract target_amp ──
+                let batch_i32 = row_hogels as i32;
+                let total_amp = (row_hogels * pph) as i32;
+                let amp_offset: i64 = 0;
+                {
+                    let ss = self.ss.as_mut().unwrap();
+                    unsafe {
+                        self.stream.launch_builder(&self.hemi_to_amp_fn)
+                            .arg(&self.hemi_batch_dev)
+                            .arg(&mut ss.target_amp)
+                            .arg(&batch_i32).arg(&hemi_res_i).arg(&amp_offset)
+                            .launch(launch_cfg(total_amp))
+                            .expect("projection hemi_to_amp");
+                    }
+                }
+
+                // ── Init random phase (same seed → deterministic) ──
+                let ss = self.ss.as_mut().unwrap();
+                let total_phase: i64 = (row_hogels * pph) as i64;
+                let row_seed = noise_seed.wrapping_add(start_row as u64 * 0x9E3779B97F4A7C15);
+                {
+                    let init_cfg = LaunchConfig {
+                        grid_dim: (((total_phase as u64 + threads as u64 - 1) / threads as u64) as u32, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.stream.launch_builder(&self.init_phase_fn)
+                            .arg(&mut ss.phase)
+                            .arg(&total_phase)
+                            .arg(&row_seed)
+                            .launch(init_cfg)
+                            .expect("projection init_phase");
+                    }
+                }
+
+                // ── GS iterations ──
+                let num_gs_batches = row_hogels / ss.gs_batch;
+                let gs_batch_elems = (ss.gs_batch * pph) as i32;
+
+                for _iter in 0..gs_iterations {
+                    for b in 0..num_gs_batches {
+                        let off = (b * ss.gs_batch * pph) as i64;
+                        unsafe {
+                            self.stream.launch_builder(&ss.build_complex_fn)
+                                .arg(&ss.phase).arg(&mut ss.e_a).arg(&gs_batch_elems).arg(&off)
+                                .launch(launch_cfg(gs_batch_elems)).expect("proj build_complex");
+                        }
+                        ss.plan.exec_c2c(&mut ss.e_a, &mut ss.e_b, FftDirection::Forward).expect("proj FFT fwd");
+                        unsafe {
+                            self.stream.launch_builder(&ss.enforce_mag_fn)
+                                .arg(&mut ss.e_b).arg(&ss.target_amp).arg(&gs_batch_elems).arg(&off)
+                                .launch(launch_cfg(gs_batch_elems)).expect("proj enforce_mag");
+                        }
+                        ss.plan.exec_c2c(&mut ss.e_b, &mut ss.e_a, FftDirection::Inverse).expect("proj FFT inv");
+                        unsafe {
+                            self.stream.launch_builder(&ss.extract_phase_fn)
+                                .arg(&ss.e_a).arg(&mut ss.phase).arg(&gs_batch_elems).arg(&off)
+                                .launch(launch_cfg(gs_batch_elems)).expect("proj extract_phase");
+                        }
+                    }
+                }
+
+                // ── Apply panel model ──
+                if phase_bits > 0 || noise_sigma > 0.0 {
+                    let panel_cfg = LaunchConfig {
+                        grid_dim: (((total_phase as u64 + threads as u64 - 1) / threads as u64) as u32, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.stream.launch_builder(&ss.apply_panel_fn)
+                            .arg(&mut ss.phase)
+                            .arg(&total_phase)
+                            .arg(&(phase_bits as i32))
+                            .arg(&noise_sigma)
+                            .arg(&noise_seed)
+                            .launch(panel_cfg)
+                            .expect("proj apply_panel");
+                    }
+                }
+
+                // ── Forward project + intensity + project onto eigenvectors ──
+                let norm_factor = 1.0f32 / (pph as f32);
+
+                for b in 0..num_gs_batches {
+                    let off = (b * ss.gs_batch * pph) as i64;
+                    let hogel_off = hogel_offset + (b * ss.gs_batch) as i32;
+
+                    unsafe {
+                        self.stream.launch_builder(&ss.build_complex_fn)
+                            .arg(&ss.phase).arg(&mut ss.e_a).arg(&gs_batch_elems).arg(&off)
+                            .launch(launch_cfg(gs_batch_elems)).expect("proj build_complex2");
+                    }
+                    ss.plan.exec_c2c(&mut ss.e_a, &mut ss.e_b, FftDirection::Forward).expect("proj FFT fwd2");
+                    {
+                        let scratch = ss.intensity_scratch.slice(0..ss.gs_batch * pph);
+                        unsafe {
+                            self.stream.launch_builder(&ss.intensity_fn)
+                                .arg(&ss.e_b).arg(&scratch)
+                                .arg(&gs_batch_elems).arg(&norm_factor)
+                                .launch(launch_cfg(gs_batch_elems)).expect("proj intensity");
+                        }
+                    }
+
+                    // Subtract mean on GPU
+                    let mean_cfg = LaunchConfig {
+                        grid_dim: (((pph as u32) + threads - 1) / threads, ss.gs_batch as u32, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    {
+                        let scratch = ss.intensity_scratch.slice(0..ss.gs_batch * pph);
+                        unsafe {
+                            self.stream.launch_builder(&subtract_mean_fn)
+                                .arg(&scratch).arg(&mean_dev).arg(&pph_i)
+                                .launch(mean_cfg).expect("proj subtract_mean");
+                        }
+                    }
+
+                    // GEMM: coefficients = intensity_centered × eigenvectors^T
+                    // In col-major: C[k × batch] = eigvec^T[k × pph] × intensity[pph × batch]
+                    let batch_size = ss.gs_batch;
+                    {
+                        let intensity_view = ss.intensity_scratch.slice(0..batch_size * pph);
+                        let mut coeff_slice = coeff_dev.slice_mut(0..batch_size * k);
+                        let cfg = GemmConfig {
+                            transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                            transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                            m: k as c_int,
+                            n: batch_size as c_int,
+                            k: pph as c_int,
+                            alpha: 1.0f32,
+                            lda: pph as c_int,
+                            ldb: pph as c_int,
+                            beta: 0.0f32,
+                            ldc: k as c_int,
+                        };
+                        unsafe {
+                            blas.gemm(cfg, &eigenvectors_dev, &intensity_view, &mut coeff_slice)
+                                .expect("cuBLAS proj GEMM");
+                        }
+                    }
+
+                    // D2H small coefficient batch [batch × k]
+                    {
+                        let coeff_slice = coeff_dev.slice(0..batch_size * k);
+                        let hogel_global = hogel_off as usize;
+                        let host_off = hogel_global * k;
+                        self.stream.synchronize().expect("sync before coeff D2H");
+                        self.stream.memcpy_dtoh(&coeff_slice, &mut coefficients[host_off..host_off + batch_size * k])
+                            .expect("D2H coefficients");
+                    }
+                }
+
+                start_row = end_row;
+            }
+        }
+        eprintln!("[holosim] PCA-incremental: projection pass -> {}ms", _t2.elapsed().as_millis());
+
+        let compressed_mb = (k * pph + n * k + pph) as f64 * 4.0 / 1e6;
+        let original_mb = (n * pph) as f64 * 4.0 / 1e6;
+        eprintln!("[holosim] PCA-incremental: done K={} ratio={:.0}x ({:.1}MB → {:.1}MB) -> {}ms",
+            k, original_mb / compressed_mb, original_mb, compressed_mb, _t.elapsed().as_millis());
+
+        self.pca_intensity = Some(PcaIntensity {
+            mean,
+            eigenvectors: v_flat,
+            eigenvectors_dev,
+            mean_dev,
+            coefficients,
+            k,
+            num_hogels: n,
+            pph,
+        });
+    }
+
+    /// Replay scatter from PCA-compressed intensity (streaming mode parallax).
+    /// Decompresses via cuBLAS SGEMM on GPU, then adds mean + scatters.
+    /// Reconstruct from IPB keyframes via bilinear interpolation (no residuals needed).
+    fn scatter_from_ipb(&mut self, eye_x: f32, eye_y: f32, eye_z: f32) {
+        use rayon::prelude::*;
+
+        let ipb = self.ipb_intensity.as_ref().expect("scatter_from_ipb without ipb_intensity");
+        let n = (ipb.grid_w * ipb.grid_h) as usize;
+        let pph = ipb.pph;
+        let key_spacing = ipb.key_spacing;
+        let key_w = ipb.key_w;
+        let key_h = ipb.key_h;
+        let grid_w = ipb.grid_w;
+        let hemi_res = self.hemi_res as i32;
+        let threads = 256u32;
+
+        // Zero accumulators
+        self.stream.memset_zeros(&mut self.output_accum_dev).expect("zero output_accum");
+        self.stream.memset_zeros(&mut self.weight_accum_dev).expect("zero weight_accum");
+
+        let half_w = self.half_w;
+        let window_dim = (2 * half_w + 1) as u32;
+        let window_size = window_dim * window_dim;
+        let (gw, gh, out_w, out_h) = (
+            self.grid_w as i32, self.grid_h as i32, self.out_w as i32, self.out_h as i32,
+        );
+
+        // Chunk size: keep decompressed intensity ≤ 256 MB on GPU
+        let max_chunk_bytes = 256 * 1024 * 1024usize;
+        let chunk_size = (max_chunk_bytes / (pph * 4)).max(1).min(n);
+
+        let mut intensity_dev = self.stream.alloc_zeros::<f32>(chunk_size * pph)
+            .expect("alloc ipb intensity chunk");
+
+        let scatter_cfg = |b_size: u32| LaunchConfig {
+            grid_dim: ((window_size + threads - 1) / threads, b_size, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Host buffer for interpolated intensity chunk
+        let mut host_buf = vec![0.0f32; chunk_size * pph];
+
+        let mut hogel = 0usize;
+        while hogel < n {
+            let batch = chunk_size.min(n - hogel);
+
+            // Bilinear interpolation on CPU (parallel over hogels in batch)
+            let ipb = self.ipb_intensity.as_ref().unwrap();
+            host_buf[..batch * pph].par_chunks_mut(pph).enumerate().for_each(|(bi, dst)| {
+                let global_idx = hogel + bi;
+                let hx = (global_idx as u32) % grid_w;
+                let hy = (global_idx as u32) / grid_w;
+
+                // Find the 4 surrounding keyframes and bilinear weights
+                let fx = (hx as f32) / (key_spacing as f32);
+                let fy = (hy as f32) / (key_spacing as f32);
+                let kx0 = (fx as u32).min(key_w - 1);
+                let ky0 = (fy as u32).min(key_h - 1);
+                let kx1 = (kx0 + 1).min(key_w - 1);
+                let ky1 = (ky0 + 1).min(key_h - 1);
+                let tx = fx - kx0 as f32;
+                let ty = fy - ky0 as f32;
+
+                let w00 = (1.0 - tx) * (1.0 - ty);
+                let w10 = tx * (1.0 - ty);
+                let w01 = (1.0 - tx) * ty;
+                let w11 = tx * ty;
+
+                let i00 = (ky0 * key_w + kx0) as usize * pph;
+                let i10 = (ky0 * key_w + kx1) as usize * pph;
+                let i01 = (ky1 * key_w + kx0) as usize * pph;
+                let i11 = (ky1 * key_w + kx1) as usize * pph;
+
+                let kf = &ipb.keyframes;
+                for j in 0..pph {
+                    let v = w00 * kf[i00 + j] + w10 * kf[i10 + j]
+                          + w01 * kf[i01 + j] + w11 * kf[i11 + j];
+                    dst[j] = v.max(0.0);
+                }
+            });
+
+            // Upload to GPU
+            let mut intensity_view = intensity_dev.slice_mut(0..batch * pph);
+            self.stream.memcpy_htod(&host_buf[..batch * pph], &mut intensity_view)
+                .expect("H2D ipb intensity");
+
+            // Scatter
+            let intensity_view = intensity_dev.slice(0..batch * pph);
+            let hogel_off = hogel as i32;
+            let batch_u32 = batch as u32;
+            unsafe {
+                self.stream.launch_builder(&self.scatter_fn)
+                    .arg(&intensity_view)
+                    .arg(&mut self.output_accum_dev)
+                    .arg(&mut self.weight_accum_dev)
+                    .arg(&hogel_off)
+                    .arg(&(batch_u32 as i32))
+                    .arg(&gw).arg(&gh)
+                    .arg(&hemi_res)
+                    .arg(&out_w).arg(&out_h)
+                    .arg(&BOX_W).arg(&BOX_H)
+                    .arg(&eye_x).arg(&eye_y).arg(&eye_z)
+                    .arg(&half_w)
+                    .launch(scatter_cfg(batch_u32))
+                    .expect("ipb scatter");
+            }
+
+            hogel += batch;
+        }
+        self.stream.synchronize().expect("sync scatter_from_ipb");
+    }
+
+    fn scatter_from_pca(&mut self, eye_x: f32, eye_y: f32, eye_z: f32) {
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as cublas_sys};
+        use std::os::raw::c_int;
+
+        let pca = self.pca_intensity.as_ref().expect("scatter_from_pca without pca_intensity");
+        let n = pca.num_hogels;
+        let pph = pca.pph;
+        let k = pca.k;
+        let hemi_res = self.hemi_res as i32;
+        let threads = 256u32;
+
+        // Zero accumulators
+        self.stream.memset_zeros(&mut self.output_accum_dev).expect("zero output_accum");
+        self.stream.memset_zeros(&mut self.weight_accum_dev).expect("zero weight_accum");
+
+        let half_w = self.half_w;
+        let window_dim = (2 * half_w + 1) as u32;
+        let window_size = window_dim * window_dim;
+        let (grid_w, grid_h, out_w, out_h) = (
+            self.grid_w as i32, self.grid_h as i32, self.out_w as i32, self.out_h as i32,
+        );
+
+        // Chunk size: keep decompressed intensity + coeff ≤ 256 MB on GPU
+        let max_chunk_bytes = 256 * 1024 * 1024usize;
+        let chunk_size = (max_chunk_bytes / ((pph + k) * 4)).max(1).min(n);
+
+        let mut coeff_dev = self.stream.alloc_zeros::<f32>(chunk_size * k).expect("alloc coeff chunk");
+        let mut intensity_dev = self.stream.alloc_zeros::<f32>(chunk_size * pph).expect("alloc intensity chunk");
+
+        // cuBLAS handle (reused across chunks)
+        let blas = CudaBlas::new(self.stream.clone()).expect("cuBLAS init");
+
+        // Load add_mean_and_clamp kernel
+        let add_mean_fn = self.module.load_function("add_mean_and_clamp").expect("add_mean_and_clamp missing");
+
+        let scatter_cfg = |b_size: u32| LaunchConfig {
+            grid_dim: ((window_size + threads - 1) / threads, b_size, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut hogel = 0usize;
+        while hogel < n {
+            let batch = chunk_size.min(n - hogel);
+
+            // Upload coefficients for this chunk [batch × k]
+            let pca = self.pca_intensity.as_ref().unwrap();
+            let coeff_slice = &pca.coefficients[hogel * k..(hogel + batch) * k];
+            let mut coeff_dst = coeff_dev.slice_mut(0..batch * k);
+            self.stream.memcpy_htod(coeff_slice, &mut coeff_dst).expect("H2D coefficients");
+
+            // cuBLAS SGEMM: intensity = eigenvectors^T × coeff^T (in col-major terms)
+            // Row-major [k × pph] = col-major [pph × k] → A, no transpose
+            // Row-major [batch × k] = col-major [k × batch] → B, no transpose
+            // Result: col-major [pph × batch] = row-major [batch × pph] → C
+            {
+                let coeff_view = coeff_dev.slice(0..batch * k);
+                let eigvec = &pca.eigenvectors_dev;
+                let mut intensity_view = intensity_dev.slice_mut(0..batch * pph);
+
+                let cfg = GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: pph as c_int,
+                    n: batch as c_int,
+                    k: k as c_int,
+                    alpha: 1.0f32,
+                    lda: pph as c_int,
+                    ldb: k as c_int,
+                    beta: 0.0f32,
+                    ldc: pph as c_int,
+                };
+                unsafe {
+                    blas.gemm(cfg, eigvec, &coeff_view, &mut intensity_view)
+                        .expect("cuBLAS SGEMM");
+                }
+            }
+
+            // Add mean and clamp: intensity[i,j] += mean[j], then max(0)
+            {
+                let pca = self.pca_intensity.as_ref().unwrap();
+                let pph_u32 = pph as u32;
+                let add_mean_cfg = LaunchConfig {
+                    grid_dim: ((pph_u32 + threads - 1) / threads, batch as u32, 1),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut intensity_view = intensity_dev.slice_mut(0..batch * pph);
+                let pph_i32 = pph as i32;
+                unsafe {
+                    self.stream.launch_builder(&add_mean_fn)
+                        .arg(&mut intensity_view)
+                        .arg(&pca.mean_dev)
+                        .arg(&pph_i32)
+                        .launch(add_mean_cfg)
+                        .expect("add_mean_and_clamp");
+                }
+            }
+
+            // Scatter
+            let intensity_view = intensity_dev.slice(0..batch * pph);
+            let hogel_off = hogel as i32;
+            let batch_u32 = batch as u32;
+            unsafe {
+                self.stream.launch_builder(&self.scatter_fn)
+                    .arg(&intensity_view)
+                    .arg(&mut self.output_accum_dev)
+                    .arg(&mut self.weight_accum_dev)
+                    .arg(&hogel_off)
+                    .arg(&(batch_u32 as i32))
+                    .arg(&grid_w).arg(&grid_h)
+                    .arg(&hemi_res)
+                    .arg(&out_w).arg(&out_h)
+                    .arg(&BOX_W).arg(&BOX_H)
+                    .arg(&eye_x).arg(&eye_y).arg(&eye_z)
+                    .arg(&half_w)
+                    .launch(scatter_cfg(batch_u32))
+                    .expect("pca scatter");
+            }
+
+            hogel += batch;
+        }
+        self.stream.synchronize().expect("sync scatter_from_pca");
     }
 
     /// Tonemap the current output_accum → recon_dev and D2H copy.
@@ -663,38 +1733,79 @@ impl GpuHologramSession {
     /// Return RGB thumbnail + phase for the hogel at (hx, hy) from stored preview_dev.
     pub fn get_hogel_preview(&mut self, hx: u32, hy: u32) -> Option<(Vec<u8>, Option<Vec<u8>>, u32)> {
         if hx >= self.grid_w || hy >= self.grid_h { return None; }
-        let preview_dev = self.preview_dev.as_ref()?;  // None in streaming mode
-        let res = PREVIEW_RES;
-        let pixels = (res * res) as usize;
-        let hogel_idx = (hy * self.grid_w + hx) as usize;
 
-        // Read thumbnail from preview_dev
-        let start = hogel_idx * pixels * 3;
-        let end   = start + pixels * 3;
-        let rgb_f32: Vec<f32> = self.stream.clone_dtoh(&preview_dev.slice(start..end)).ok()?;
-        let exposure = 0.5f32;
-        let mut hemi_u8 = Vec::with_capacity(pixels * 3);
-        for v in rgb_f32 {
-            let tm = (1.0f32 - (-(v * exposure)).exp()).sqrt().clamp(0.0, 1.0);
-            hemi_u8.push((tm * 255.0) as u8);
+        // Standard mode: read from preview_dev
+        if let Some(preview_dev) = self.preview_dev.as_ref() {
+            let res = PREVIEW_RES;
+            let pixels = (res * res) as usize;
+            let hogel_idx = (hy * self.grid_w + hx) as usize;
+
+            let start = hogel_idx * pixels * 3;
+            let end   = start + pixels * 3;
+            let rgb_f32: Vec<f32> = self.stream.clone_dtoh(&preview_dev.slice(start..end)).ok()?;
+            let exposure = 0.5f32;
+            let mut hemi_u8 = Vec::with_capacity(pixels * 3);
+            for v in rgb_f32 {
+                let tm = (1.0f32 - (-(v * exposure)).exp()).sqrt().clamp(0.0, 1.0);
+                hemi_u8.push((tm * 255.0) as u8);
+            }
+
+            let phase_u8 = if let Some(gs) = &self.gs {
+                let pstart = hogel_idx * gs.pixels_per_hogel;
+                let pend   = pstart + gs.pixels_per_hogel;
+                let pf32: Vec<f32> = self.stream.clone_dtoh(&gs.phase.slice(pstart..pend)).ok()?;
+                let pi = std::f32::consts::PI;
+                let tau = std::f32::consts::TAU;
+                let out: Vec<u8> = pf32.iter().map(|&p| {
+                    let w = ((p + pi).rem_euclid(tau)) - pi;
+                    let n = ((w + pi) / tau).clamp(0.0, 1.0);
+                    (n * 255.0) as u8
+                }).collect();
+                Some(out)
+            } else { None };
+
+            return Some((hemi_u8, phase_u8, res));
         }
 
-        // Phase from GsState (if GS ran)
-        let phase_u8 = if let Some(gs) = &self.gs {
-            let pstart = hogel_idx * gs.pixels_per_hogel;
-            let pend   = pstart + gs.pixels_per_hogel;
-            let pf32: Vec<f32> = self.stream.clone_dtoh(&gs.phase.slice(pstart..pend)).ok()?;
-            let pi = std::f32::consts::PI;
-            let tau = std::f32::consts::TAU;
-            let out: Vec<u8> = pf32.iter().map(|&p| {
-                let w = ((p + pi).rem_euclid(tau)) - pi;
-                let n = ((w + pi) / tau).clamp(0.0, 1.0);
-                (n * 255.0) as u8
-            }).collect();
-            Some(out)
-        } else { None };
+        // Streaming (PCA) mode: decompress single hogel's intensity as grayscale preview
+        if let Some(pca) = &self.pca_intensity {
+            let hogel_idx = (hy * self.grid_w + hx) as usize;
+            let pph = pca.pph;
+            let k = pca.k;
+            let hemi_res = (pph as f64).sqrt() as usize;
 
-        Some((hemi_u8, phase_u8, res))
+            // Decompress intensity for this hogel
+            let coeff = &pca.coefficients[hogel_idx * k..(hogel_idx + 1) * k];
+            let mut intensity = vec![0.0f32; pph];
+            for j in 0..pph {
+                let mut val = pca.mean[j] as f64;
+                for ki in 0..k {
+                    val += coeff[ki] as f64 * pca.eigenvectors[ki * pph + j] as f64;
+                }
+                intensity[j] = val.max(0.0) as f32;
+            }
+
+            // Downsample to PREVIEW_RES and convert to RGB u8
+            let res = PREVIEW_RES as usize;
+            let pixels = res * res;
+            let mut hemi_u8 = Vec::with_capacity(pixels * 3);
+            let exposure = 0.5f32;
+            for py in 0..res {
+                for px in 0..res {
+                    let sy = py * hemi_res / res;
+                    let sx = px * hemi_res / res;
+                    let val = intensity[sy * hemi_res + sx];
+                    let tm = (1.0f32 - (-(val * exposure)).exp()).sqrt().clamp(0.0, 1.0);
+                    let byte = (tm * 255.0) as u8;
+                    hemi_u8.push(byte);
+                    hemi_u8.push(byte);
+                    hemi_u8.push(byte);
+                }
+            }
+            return Some((hemi_u8, None, PREVIEW_RES));
+        }
+
+        None
     }
 
     // ── Streaming pipeline: fused render + GS + scatter per row batch ──
@@ -748,7 +1859,7 @@ impl GpuHologramSession {
             gs_batch, max_render_hogels, _t.elapsed().as_millis());
 
         self.ss = Some(StreamState {
-            plan, gs_batch, max_render_hogels, pixels_per_hogel,
+            plan, gs_batch,
             target_amp, phase, e_a, e_b, intensity_scratch,
             build_complex_fn, enforce_mag_fn, extract_phase_fn, apply_panel_fn, intensity_fn,
         });
@@ -766,7 +1877,13 @@ impl GpuHologramSession {
         noise_seed: u64,
     ) -> u32 {
         let _t = std::time::Instant::now();
+        self.ensure_hemi_batch();
         self.ensure_stream_state();
+        // Store streaming params for potential projection pass
+        self.stream_gs_iters = gs_iterations;
+        self.stream_phase_bits = phase_bits;
+        self.stream_noise_sigma = noise_sigma;
+        self.stream_noise_seed = noise_seed;
         let end_row = (start_row + num_rows).min(self.grid_h);
         if end_row <= start_row { return self.rows_rendered; }
 
@@ -783,6 +1900,9 @@ impl GpuHologramSession {
             total_rows, self.grid_w, self.grid_h, self.hemi_res, self.spp, gs_iterations,
             _t.elapsed().as_millis());
         self.rows_rendered = end_row;
+        if end_row >= self.grid_h {
+            self.streaming_accum_valid = true;
+        }
         self.rows_rendered
     }
 
@@ -937,7 +2057,6 @@ impl GpuHologramSession {
         // ── 6. Forward project + scatter ──
         let norm_factor = 1.0f32 / (pixels_per_hogel as f32);
         let (out_w, out_h) = (self.out_w as i32, self.out_h as i32);
-        let sigma_panel = self.sigma_panel;
         let half_w = self.half_w;
         let window_dim = (2 * half_w + 1) as u32;
         let window_size = window_dim * window_dim;
@@ -968,6 +2087,93 @@ impl GpuHologramSession {
                         .launch(launch_cfg(gs_batch_elems)).expect("stream intensity");
                 }
             }
+            // Save intensity to host for streaming-mode parallax
+            if let Some(ref mut saved) = self.saved_intensity {
+                let hogel_global = hogel_off as usize;
+                let host_off = hogel_global * pixels_per_hogel;
+                let count = ss.gs_batch * pixels_per_hogel;
+                let src = ss.intensity_scratch.slice(0..count);
+                self.stream.synchronize().expect("sync before intensity D2H");
+                self.stream.memcpy_dtoh(&src, &mut saved[host_off..host_off + count])
+                    .expect("D2H intensity save");
+            }
+            // IPB keyframe collection: only store keyframe hogels (every key_spacing-th in x and y)
+            if self.ipb_keyframes.is_some() {
+                let hogel_global = hogel_off as usize;
+                let grid_w = self.grid_w;
+                let key_spacing = self.ipb_key_spacing;
+                let key_w = (grid_w + key_spacing - 1) / key_spacing;
+
+                // Check if any hogel in this batch is a keyframe
+                let mut has_keyframe = false;
+                for bi in 0..ss.gs_batch {
+                    let global_idx = hogel_global + bi;
+                    let hx = (global_idx as u32) % grid_w;
+                    let hy = (global_idx as u32) / grid_w;
+                    if (hx % key_spacing == 0) && (hy % key_spacing == 0) {
+                        has_keyframe = true;
+                        break;
+                    }
+                }
+
+                if has_keyframe {
+                    let count = ss.gs_batch * pixels_per_hogel;
+                    let src = ss.intensity_scratch.slice(0..count);
+                    if self.saved_intensity.is_none() {
+                        self.stream.synchronize().expect("sync before IPB D2H");
+                    }
+                    let mut tmp = vec![0.0f32; count];
+                    self.stream.memcpy_dtoh(&src, &mut tmp).expect("D2H intensity for IPB");
+
+                    let keyframes = self.ipb_keyframes.as_mut().unwrap();
+                    for bi in 0..ss.gs_batch {
+                        let global_idx = hogel_global + bi;
+                        let hx = (global_idx as u32) % grid_w;
+                        let hy = (global_idx as u32) / grid_w;
+                        if (hx % key_spacing == 0) && (hy % key_spacing == 0) {
+                            let kx = hx / key_spacing;
+                            let ky = hy / key_spacing;
+                            let key_idx = (ky * key_w + kx) as usize;
+                            let src_off = bi * pixels_per_hogel;
+                            let dst_off = key_idx * pixels_per_hogel;
+                            keyframes[dst_off..dst_off + pixels_per_hogel]
+                                .copy_from_slice(&tmp[src_off..src_off + pixels_per_hogel]);
+                        }
+                    }
+                }
+            }
+            // Incremental PCA: accumulate Gram matrix + subsample data + mean
+            if self.pca_gram.is_some() {
+                let count = ss.gs_batch * pixels_per_hogel;
+                let src = ss.intensity_scratch.slice(0..count);
+                self.stream.synchronize().expect("sync before PCA accumulate D2H");
+                let mut tmp = vec![0.0f32; count];
+                self.stream.memcpy_dtoh(&src, &mut tmp).expect("D2H intensity for PCA");
+
+                // Accumulate mean
+                if let Some(ref mut mean_acc) = self.pca_mean_acc {
+                    for bi in 0..ss.gs_batch {
+                        for j in 0..pixels_per_hogel {
+                            mean_acc[j] += tmp[bi * pixels_per_hogel + j] as f64;
+                        }
+                    }
+                    self.pca_mean_count += ss.gs_batch;
+                }
+
+                // Copy subsampled hogels
+                let hogel_global = hogel_off as usize;
+                if let (Some(ref sub_indices), Some(ref mut subsample)) = (&self.pca_sub_indices, &mut self.pca_subsample) {
+                    for bi in 0..ss.gs_batch {
+                        let global_idx = hogel_global + bi;
+                        if let Ok(si) = sub_indices.binary_search(&global_idx) {
+                            let src_off = bi * pixels_per_hogel;
+                            let dst_off = si * pixels_per_hogel;
+                            subsample[dst_off..dst_off + pixels_per_hogel]
+                                .copy_from_slice(&tmp[src_off..src_off + pixels_per_hogel]);
+                        }
+                    }
+                }
+            }
             {
                 let intensity_view = ss.intensity_scratch.slice(0..ss.gs_batch * pixels_per_hogel);
                 let batch_u32 = ss.gs_batch as u32;
@@ -983,7 +2189,6 @@ impl GpuHologramSession {
                         .arg(&out_w).arg(&out_h)
                         .arg(&BOX_W).arg(&BOX_H)
                         .arg(&eye_x).arg(&eye_y).arg(&eye_z)
-                        .arg(&sigma_panel)
                         .arg(&half_w)
                         .launch(scatter_cfg(batch_u32))
                         .expect("stream scatter");
@@ -1124,7 +2329,6 @@ impl GpuHologramSession {
         }
         self.stream.synchronize().expect("sync after init_phase");
         timings.push(("init_phase".into(), t.elapsed().as_secs_f64() * 1000.0));
-        t = std::time::Instant::now();
 
         // ── 4. GS iterations ──
         let num_gs_batches = row_hogels / ss.gs_batch;
@@ -1186,7 +2390,6 @@ impl GpuHologramSession {
         // ── 6. Forward project + scatter ──
         let norm_factor = 1.0f32 / (pixels_per_hogel as f32);
         let (out_w, out_h) = (self.out_w as i32, self.out_h as i32);
-        let sigma_panel = self.sigma_panel;
         let half_w = self.half_w;
         let window_dim = (2 * half_w + 1) as u32;
         let window_size = window_dim * window_dim;
@@ -1231,7 +2434,6 @@ impl GpuHologramSession {
                         .arg(&out_w).arg(&out_h)
                         .arg(&BOX_W).arg(&BOX_H)
                         .arg(&eye_x).arg(&eye_y).arg(&eye_z)
-                        .arg(&sigma_panel)
                         .arg(&half_w)
                         .launch(scatter_cfg(batch_u32))
                         .expect("stream scatter");
@@ -1579,40 +2781,6 @@ impl GpuHologramSession {
 
         self.pca_sample_indices = Some(indices);
         self.pca_sample_data = Some(data);
-    }
-
-    /// Called during stream_sub_batch after target_amp is computed.
-    /// Copies sampled hogels' target_amp from GPU to CPU buffer.
-    fn collect_pca_samples(&mut self, hogel_offset: usize, num_hogels: usize) {
-        let indices = match &self.pca_sample_indices {
-            Some(v) => v,
-            None => return,
-        };
-        let pixels_per_hogel = (self.hemi_res * self.hemi_res) as usize;
-        let hogel_end = hogel_offset + num_hogels;
-
-        // Find which sample indices fall in [hogel_offset, hogel_end)
-        let start_idx = indices.partition_point(|&i| i < hogel_offset);
-        let end_idx = indices.partition_point(|&i| i < hogel_end);
-
-        if start_idx >= end_idx { return; }
-
-        let ss = self.ss.as_ref().unwrap();
-
-        // D2H the target_amp for these hogels
-        for sample_pos in start_idx..end_idx {
-            let global_hogel = indices[sample_pos];
-            let local_hogel = global_hogel - hogel_offset;
-            // Read from ss.target_amp at local offset
-            let src_offset = local_hogel * pixels_per_hogel;
-            let src_slice = ss.target_amp.slice(src_offset..src_offset + pixels_per_hogel);
-            let mut tmp = vec![0.0f32; pixels_per_hogel];
-            self.stream.memcpy_dtoh(&src_slice, &mut tmp[..]).expect("D2H PCA sample");
-            // Store in pca_sample_data
-            let data = self.pca_sample_data.as_mut().unwrap();
-            let dst_offset = sample_pos * pixels_per_hogel;
-            data[dst_offset..dst_offset + pixels_per_hogel].copy_from_slice(&tmp);
-        }
     }
 
     /// Run PCA on the accumulated streaming samples.

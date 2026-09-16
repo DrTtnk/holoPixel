@@ -111,68 +111,6 @@ ipcMain.handle('native:traceTestRay', async () => {
   }
 });
 
-ipcMain.handle('native:renderScene', async (_event, width: number, height: number, spp: number) => {
-  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
-  try {
-    const result = nativeAddon.renderScene(width, height, spp);
-    // Convert Buffer to base64 for IPC transfer (ArrayBuffer serialization is unreliable)
-    return {
-      ok: true,
-      data: {
-        width: result.width,
-        height: result.height,
-        samplesPerPixel: result.samplesPerPixel,
-        dataBase64: result.data.toString('base64'),
-      },
-    };
-  } catch (e) {
-    return { ok: false, error: (e as Error).message };
-  }
-});
-
-ipcMain.handle('native:computeHologram', async (_event, gridW: number, gridH: number, hemiRes: number, spp: number) => {
-  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
-  try {
-    const result = nativeAddon.computeHologramFull(gridW, gridH, hemiRes, spp);
-    return {
-      ok: true,
-      data: {
-        gridW: result.gridW,
-        gridH: result.gridH,
-        hemiRes: result.hemiRes,
-        fullWidth: result.fullWidth,
-        fullHeight: result.fullHeight,
-        hologramBase64: result.hologramData.toString('base64'),
-        reconBase64: result.reconData.toString('base64'),
-        lastHogelHemiBase64: result.lastHogelHemi.toString('base64'),
-        lastHogelFringeBase64: result.lastHogelFringe.toString('base64'),
-      },
-    };
-  } catch (e) {
-    return { ok: false, error: (e as Error).message };
-  }
-});
-
-ipcMain.handle('native:computeHologramGpu', async (_event, gridW: number, gridH: number, hemiRes: number, spp: number, outW: number, outH: number, maxBounces: number, ambient: number) => {
-  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
-  try {
-    const result = nativeAddon.computeHologramGpu(gridW, gridH, hemiRes, spp, outW, outH, maxBounces, ambient);
-    return {
-      ok: true,
-      data: {
-        gridW: result.gridW,
-        gridH: result.gridH,
-        hemiRes: result.hemiRes,
-        fullWidth: result.fullWidth,
-        fullHeight: result.fullHeight,
-        reconBase64: result.reconData.toString('base64'),
-      },
-    };
-  } catch (e) {
-    return { ok: false, error: (e as Error).message };
-  }
-});
-
 ipcMain.handle('native:gpuSessionBegin', async (_event, gridW: number, gridH: number, hemiRes: number, spp: number, outW: number, outH: number, maxBounces: number, ambient: number) => {
   if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
   try {
@@ -273,6 +211,16 @@ ipcMain.handle('native:gpuSessionRestoreTargetAmp', async () => {
   }
 });
 
+ipcMain.handle('native:gpuSessionCompressIntensity', async () => {
+  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
+  try {
+    nativeAddon.gpuSessionCompressIntensity();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
 ipcMain.handle('native:gpuSessionEnablePcaSampling', async (_event, numSamples: number) => {
   if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
   try {
@@ -318,16 +266,6 @@ ipcMain.handle('native:gpuSessionPcaQuantizationSweep', async (_event, kValues: 
   try {
     const result = nativeAddon.gpuSessionPcaQuantizationSweep(kValues, bitValues);
     return { ok: true, data: result };
-  } catch (e) {
-    return { ok: false, error: (e as Error).message };
-  }
-});
-
-ipcMain.handle('native:gpuSessionRunGs', async (_event, iterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint) => {
-  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
-  try {
-    nativeAddon.gpuSessionRunGs(iterations, phaseBits, noiseSigma, noiseSeed);
-    return { ok: true };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
@@ -436,23 +374,6 @@ ipcMain.handle('native:gpuSessionGetHogelPreview', async (_event, hx: number, hy
         res: result.res,
         hemisphereBase64: result.hemisphere.toString('base64'),
         phaseBase64: result.phase ? result.phase.toString('base64') : null,
-      },
-    };
-  } catch (e) {
-    return { ok: false, error: (e as Error).message };
-  }
-});
-
-ipcMain.handle('native:computeSingleHogel', async (_event, hogelX: number, hogelY: number, gridW: number, gridH: number, hemiRes: number, spp: number) => {
-  if (!nativeAddon) return { ok: false, error: 'Native addon not loaded' };
-  try {
-    const result = nativeAddon.computeSingleHogel(hogelX, hogelY, gridW, gridH, hemiRes, spp);
-    return {
-      ok: true,
-      data: {
-        hemiRes: result.hemiRes,
-        hemisphereBase64: result.hemisphereData.toString('base64'),
-        fringeBase64: result.fringeData.toString('base64'),
       },
     };
   } catch (e) {

@@ -18,36 +18,6 @@ interface HoloSimBridge {
     materialAlbedo: number[];
     isEmissive: boolean;
   }>>;
-  renderScene(width: number, height: number, spp: number): Promise<NativeResult<{
-    width: number;
-    height: number;
-    samplesPerPixel: number;
-    dataBase64: string;
-  }>>;
-  computeHologram(gridW: number, gridH: number, hemiRes: number, spp: number): Promise<NativeResult<{
-    gridW: number;
-    gridH: number;
-    hemiRes: number;
-    fullWidth: number;
-    fullHeight: number;
-    hologramBase64: string;
-    reconBase64: string;
-    lastHogelHemiBase64: string;
-    lastHogelFringeBase64: string;
-  }>>;
-  computeHologramGpu(gridW: number, gridH: number, hemiRes: number, spp: number, outW: number, outH: number, maxBounces: number, ambient: number): Promise<NativeResult<{
-    gridW: number;
-    gridH: number;
-    hemiRes: number;
-    fullWidth: number;
-    fullHeight: number;
-    reconBase64: string;
-  }>>;
-  computeSingleHogel(hogelX: number, hogelY: number, gridW: number, gridH: number, hemiRes: number, spp: number): Promise<NativeResult<{
-    hemiRes: number;
-    hemisphereBase64: string;
-    fringeBase64: string;
-  }>>;
   gpuSessionBegin(gridW: number, gridH: number, hemiRes: number, spp: number, outW: number, outH: number, maxBounces: number, ambient: number): Promise<NativeResult<{
     gridW: number; gridH: number; hemiRes: number; spp: number; outW: number; outH: number; totalRows: number; streaming: boolean;
   }>>;
@@ -71,6 +41,7 @@ interface HoloSimBridge {
   }>>;
   gpuSessionSaveTargetAmp(): Promise<NativeResult<void>>;
   gpuSessionRestoreTargetAmp(): Promise<NativeResult<void>>;
+  gpuSessionCompressIntensity(): Promise<NativeResult<void>>;
   gpuSessionEnablePcaSampling(numSamples: number): Promise<NativeResult<void>>;
   gpuSessionPcaStreamingEigenspectrum(maxComponents: number): Promise<NativeResult<{
     eigenvalues: number[]; cumVar: number[]; numHogels: number; pixelsPerHogel: number;
@@ -91,7 +62,6 @@ interface HoloSimBridge {
   gpuSessionPcaQuantizationSweep(kValues: number[], bitValues: number[]): Promise<NativeResult<Array<{
     k: number; bits: number; compressionRatio: number; rmse: number; compressedBytes: number;
   }>>>;
-  gpuSessionRunGs(iterations: number, phaseBits: number, noiseSigma: number, noiseSeed: bigint): Promise<NativeResult<void>>;
   gpuSessionGsSetup(noiseSeed: bigint): Promise<NativeResult<void>>;
   gpuSessionGsIterate(nIters: number): Promise<NativeResult<{ itersDone: number }>>;
   gpuSessionGsPreview(): Promise<NativeResult<void>>;

@@ -5,8 +5,6 @@ use cudarc::nvrtc::Ptx;
 use std::sync::Mutex;
 
 pub mod scene;
-pub mod renderer;
-pub mod hologram;
 pub mod gpu_hologram;
 
 // Global GPU session (one at a time)
@@ -487,6 +485,14 @@ pub fn gpu_session_restore_target_amp() -> Result<()> {
     let mut guard = GPU_SESSION.lock().unwrap();
     let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
     session.restore_target_amp();
+    Ok(())
+}
+
+#[napi]
+pub fn gpu_session_compress_intensity() -> Result<()> {
+    let mut guard = GPU_SESSION.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| Error::from_reason("No active GPU session"))?;
+    session.compress_intensity();
     Ok(())
 }
 

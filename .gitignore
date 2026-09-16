@@ -19,3 +19,4 @@ native/*.node
 *.ptx
 test_nvrtc.js
 benchmark.js
+native/target/

@@ -651,6 +651,19 @@ export default function App() {
     }
   }, []);
 
+  // Pre-render parallax frames to offscreen canvases
+  // (must be declared BEFORE playback effect so React commits canvasesRef first)
+  useEffect(() => {
+    if (parallaxFrames.length === 0) { parallaxCanvasesRef.current = []; parallaxFrameIdxRef.current = 0; return; }
+    const out = holoState.fullWidth ?? OUTPUT_SIZE;
+    parallaxCanvasesRef.current = parallaxFrames.map(frame => {
+      const c = document.createElement('canvas');
+      c.width = out; c.height = out;
+      c.getContext('2d')!.putImageData(new ImageData(frame as unknown as Uint8ClampedArray<ArrayBuffer>, out, out), 0, 0);
+      return c;
+    });
+  }, [parallaxFrames, holoState.fullWidth]);
+
   // ── Parallax playback (rAF loop, bypasses React) ─────────
 
   useEffect(() => {
@@ -678,19 +691,7 @@ export default function App() {
       if (parallaxRafRef.current) { cancelAnimationFrame(parallaxRafRef.current); parallaxRafRef.current = null; }
       setParallaxFrameIdx(parallaxFrameIdxRef.current);
     };
-  }, [parallaxPlaying]);
-
-  // Pre-render parallax frames to offscreen canvases
-  useEffect(() => {
-    if (parallaxFrames.length === 0) { parallaxCanvasesRef.current = []; parallaxFrameIdxRef.current = 0; return; }
-    const out = holoState.fullWidth ?? OUTPUT_SIZE;
-    parallaxCanvasesRef.current = parallaxFrames.map(frame => {
-      const c = document.createElement('canvas');
-      c.width = out; c.height = out;
-      c.getContext('2d')!.putImageData(new ImageData(frame as unknown as Uint8ClampedArray<ArrayBuffer>, out, out), 0, 0);
-      return c;
-    });
-  }, [parallaxFrames, holoState.fullWidth]);
+  }, [parallaxPlaying, parallaxFrames]);
 
   // Draw current parallax frame (manual scrub only)
   useEffect(() => {
@@ -808,6 +809,8 @@ export default function App() {
             setRenderEta(Math.round((totalRows - rowsDone) * (elapsed / rowsDone)));
           }
         }
+        // PCA-compress the raw intensity cache for efficient parallax
+        await window.holosim!.gpuSessionCompressIntensity();
       } else {
         // ── Standard mode: separate render → GS → reconstruct ──
         for (let row = 0; row < totalRows; row += BATCH_ROWS) {
