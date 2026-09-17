@@ -40,7 +40,19 @@ def quantize_phase(phase, max_phase, n_levels=0):
     """
     Restrict phase to [0, max_phase] range.
     If n_levels > 0, also quantize to discrete levels.
+
+    Level placement depends on whether the range wraps:
+      max_phase >= 2π — 0 and max_phase are the same physical phase, so the
+                        levels are the n_levels points of arange(n)·Δ with
+                        Δ = max_phase/n_levels. Using both endpoints here
+                        would collapse two levels onto one and silently
+                        deliver n_levels-1 distinct phases.
+      max_phase <  2π — the range does not wrap, so both endpoints are usable
+                        and the spacing is max_phase/(n_levels-1).
     """
+    if max_phase > 2 * np.pi:
+        raise ValueError(f"max_phase must not exceed 2π, got {max_phase}")
+
     # Wrap phase to [0, 2π]
     phase_wrapped = phase % (2 * np.pi)
     # Scale to [0, max_phase]
@@ -50,10 +62,15 @@ def quantize_phase(phase, max_phase, n_levels=0):
         phase_clipped = phase_wrapped
 
     if n_levels > 0:
-        levels = np.linspace(0, max_phase, n_levels)
-        # Nearest level
-        idx = np.argmin(np.abs(phase_clipped[:, None] - levels[None, :]), axis=1)
-        phase_clipped = levels[idx]
+        if max_phase == 2 * np.pi:
+            step = max_phase / n_levels
+            # Nearest level on the circle: 2π-ε belongs to level 0, not to n-1.
+            idx = (np.round(phase_clipped / step).astype(int)) % n_levels
+            phase_clipped = idx * step
+        else:
+            levels = np.linspace(0, max_phase, n_levels)
+            idx = np.argmin(np.abs(phase_clipped[:, None] - levels[None, :]), axis=1)
+            phase_clipped = levels[idx]
 
     return phase_clipped
 

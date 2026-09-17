@@ -107,3 +107,55 @@
 - This means points FARTHER from display (closer to observer) show MORE parallax — they appear more "3D".
 - Verified: 256×144 hogels, 32×32 sub-pixels. NEAR 7%, MID 7%, FAR 1% error vs theory.
 
+
+## Session 2026-09-17 — Environment Revival and First Test Suite
+
+### Wrong assumptions found by writing tests
+
+- **`quantize_phase` produced one level fewer than requested at a full 2π range.**
+  `np.linspace(0, max_phase, n_levels)` places a sample at both 0 and 2π, which are
+  the same physical phase, so `n_levels=8` delivered 7 distinct phases. The fix
+  branches on whether the range wraps: at 2π the levels are `arange(n)·(2π/n)` and
+  the nearest level must be found on the circle, not on the line, so that 2π−ε maps
+  to level 0. Below 2π the range does not wrap and `linspace` with both endpoints is
+  correct. `rcwa_optimization.design_phase_lut` never had this bug — it already used
+  `linspace(0, usable·(1−1/n_levels), n_levels)`.
+  Only the last sample of the partial-phase sweep moved; the 1.84π conclusions stand.
+
+- **A sweep that starts on a resonance gives a misleading transition width.**
+  This file already warned about `np.unwrap`, but the trap is wider than unwrapping:
+  with d=355nm, λ=532nm the natural starting point n=1.5 sits at δ/2π = 2.002, i.e.
+  on resonance. The 2π drop then straddles both ends of the sweep and a 10%–90%
+  width measurement reports the whole FSR regardless of finesse. Start every sweep
+  at the anti-resonance (half-integer δ/2π) so the resonance lands in the middle.
+
+- **`effective_index_slab` uses n_core = 2.0 for Si₃N₄, not the textbook 2.05.**
+  The DRAFT's quoted n_eff = 1.750 only reproduces with the value in `PLATFORMS`.
+  Import the constant, never retype it.
+
+### Newly proven results (in tests/, derived with sympy, not asserted)
+
+- dφ/dδ = (r²−1)/(r²−2r·cos δ+1) for the GTE, and on resonance this is exactly −F
+  with F = (1+r)/(1−r). "F is the small-signal phase sensitivity multiplier" is now
+  a theorem in the repository, not a note.
+- The 10%–90% transition width obeys `width · F / FSR → 2·tan(2π/5)/π = 1.95932`.
+  Near resonance φ = −(1+r)/√r · arctan(√r·u/(1−r)), so the constant is closed form.
+  The old note "width ~ λ/(2dF)" is right to within that factor of 1.96.
+- N-level blazed grating efficiency η = (sin(π/N)/(π/N))². N=8 gives 0.9505, which is
+  where DRAFT §6.4's "95%" comes from. N=4 gives 0.8106 — note that
+  useful_knowledge's earlier line "8 levels give 81% diffraction efficiency" quotes
+  the 4-level number. Treat 81% as a typo unless a source says otherwise.
+- An FFT of a staircase sampled with M points per level gives
+  η = [sin(π/N)/(M·sin(π/(N·M)))]², not the sinc form. At M=8 the difference is 0.08%,
+  which is enough to break a 1e-6 tolerance. Test against the discrete form.
+- The parallax slope pz/(oz+pz) survives symbolic re-derivation and matches a real
+  96×4 hogel render to within 25%.
+
+### Toolchain
+
+- Python 3.14 has no numba wheel. The project pins 3.12 via `uv venv --python 3.12`.
+- RTX 5090 Laptop is sm_120 (Blackwell). torch 2.14.0+cu130 detects it; a default
+  CPU-index wheel will not. Pass the cu128 extra index with
+  `--index-strategy unsafe-best-match`.
+- `uv pip install` defaults to a 30s HTTP timeout, which is not enough for the
+  ~500MB cuDNN wheel. Set `UV_HTTP_TIMEOUT=300`.

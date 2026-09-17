@@ -1,0 +1,21 @@
+# Core numerics
+numpy
+scipy
+matplotlib
+tqdm
+
+# Thin-film / RCWA electromagnetics
+tmm
+grcwa
+
+# JIT path tracer
+numba
+
+# Hologram optimisation (CUDA)
+# RTX 5090 is Blackwell (sm_120): needs a cu128 or newer wheel.
+torch
+lion-pytorch
+
+# Tests
+pytest
+sympy

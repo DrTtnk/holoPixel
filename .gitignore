@@ -12,4 +12,5 @@ release/
 # Solver output: light fields and phase maps run to gigabytes
 *.npz
 *.npy
-HOLOSIM-holographic-display-simulator/
+# Research PDFs pulled by the literature agents
+docs/papers/
