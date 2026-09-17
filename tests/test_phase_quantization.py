@@ -7,7 +7,7 @@ quantised blazed grating is
 
     eta_1 = ( sin(pi/N) / (pi/N) )^2
 
-which gives 0.9505 at N=8. This module derives that closed form symbolically
+which gives 0.9496 at N=8. This module derives that closed form symbolically
 with sympy, confirms it numerically with an FFT of a real staircase grating,
 and then checks the two quantisers in the codebase against it.
 """
