@@ -222,23 +222,51 @@ def test_hogel_and_direct_angle_conventions_agree_in_paraxial_limit():
 # docs/notes_hogel_ablation.md)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def test_per_hogel_energy_correction_rescales_each_hogel_independently():
+def test_per_hogel_energy_correction_sets_each_hogel_sum_to_the_target():
+    """The whole point of the correction: regardless of what total energy the
+    optimiser's raw output happens to carry, the corrected output's sum over
+    viewing angles must equal the true (pre-normalization) target sum for
+    every hogel independently."""
     rng = np.random.default_rng(5)
     nv, nu, B = 3, 3, 4
-    raw_views = rng.random((nv, nu, B))
+    raw_views = rng.random((nv, nu, B)) + 0.1  # keep strictly positive
     pre_norm_sum = np.array([1.0, 2.0, 0.5, 10.0])
 
     corrected = ablation.apply_per_hogel_energy_correction(raw_views, pre_norm_sum)
 
     for b in range(B):
-        assert np.allclose(corrected[:, :, b], raw_views[:, :, b] * pre_norm_sum[b])
+        assert corrected[:, :, b].sum() == pytest.approx(pre_norm_sum[b], rel=1e-9)
 
 
-def test_per_hogel_energy_correction_is_identity_at_unit_scale():
+def test_per_hogel_energy_correction_is_invariant_to_the_raw_output_scale():
+    """This is the property the earlier (multiply-only) version of the
+    correction lacked: it must not matter what overall scale the optimiser's
+    raw output happens to have converged to (achieved_sum), only its
+    relative shape across viewing angles — since the earlier version
+    implicitly assumed that scale was always close to n_samples, which
+    docs/notes_hogel_ablation.md's convergence-ratio table shows is false
+    precisely at the N_SUB values this correction matters most for."""
     rng = np.random.default_rng(6)
-    raw_views = rng.random((2, 2, 5))
-    ones = np.ones(5)
-    assert np.array_equal(ablation.apply_per_hogel_energy_correction(raw_views, ones), raw_views)
+    nv, nu, B = 4, 4, 3
+    raw_views = rng.random((nv, nu, B)) + 0.1
+    pre_norm_sum = np.array([3.0, 7.0, 0.2])
+    arbitrary_per_hogel_scale = np.array([0.001, 1000.0, 5.0])
+
+    corrected_a = ablation.apply_per_hogel_energy_correction(raw_views, pre_norm_sum)
+    corrected_b = ablation.apply_per_hogel_energy_correction(
+        raw_views * arbitrary_per_hogel_scale[None, None, :], pre_norm_sum)
+
+    assert np.allclose(corrected_a, corrected_b, rtol=1e-9)
+
+
+def test_per_hogel_energy_correction_handles_an_all_zero_hogel():
+    """A hogel whose raw output is all zero (achieved_sum=0) must not
+    produce NaN/inf — the minimal clamp exists for this, not to hide a real
+    error elsewhere."""
+    raw_views = np.zeros((2, 2, 1))
+    pre_norm_sum = np.array([5.0])
+    corrected = ablation.apply_per_hogel_energy_correction(raw_views, pre_norm_sum)
+    assert np.all(np.isfinite(corrected))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -264,3 +292,42 @@ def test_grid_size_times_n_sub_is_approximately_conserved():
     baseline = ablation.GRID_BASE * ablation.BASELINE_N_SUB
     for p in products:
         assert p == pytest.approx(baseline, rel=0.15)
+
+
+def test_grid_size_is_capped_at_max_grid():
+    """
+    Found by running the angular-matched sweep: at N_SUB=9 the uncapped
+    formula wants grid=444 against a 160px light field, which is not a finer
+    grid, it is >1 hogel silently sharing each source pixel through
+    hogel_anchor_indices. max_grid must cap this.
+    """
+    uncapped = ablation.grid_size_for(9)
+    assert uncapped > 160  # the actual failure this guards against
+
+    capped = ablation.grid_size_for(9, max_grid=160)
+    assert capped == 160
+
+
+def test_grid_size_cap_is_a_noop_when_not_binding():
+    for n in ablation.N_SUB_SWEEP:
+        assert ablation.grid_size_for(n, max_grid=1_000_000) == ablation.grid_size_for(n)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# representative_view_indices(): the eval-cost fix for the angular-matched
+# sweep (found necessary when a full 64x64=4096-view evaluation measured
+# 747s for one configuration)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def test_representative_view_indices_includes_both_extremes_and_centre():
+    idx = ablation.representative_view_indices(64, k=5)
+    assert idx[0] == 0
+    assert idx[-1] == 63
+    assert len(idx) == 5
+    assert len(set(idx.tolist())) == 5  # distinct
+
+
+def test_representative_view_indices_caps_at_n_angular():
+    idx = ablation.representative_view_indices(3, k=5)
+    assert len(idx) == 3
+    assert list(idx) == [0, 1, 2]

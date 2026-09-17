@@ -1,274 +1,389 @@
 # Hogel decomposition vs. direct SLFH — ablation
 
 Script: `tier2_slfh/ablation_hogel_vs_slfh.py`. Tests: `tests/test_ablation_hogel.py`
-(26 tests, machinery only, ~2s, all passing). Imports `tier2_slfh/hogel_grid.py`,
+(31 tests, machinery only, ~2s, all passing). Imports `tier2_slfh/hogel_grid.py`,
 `tier2_slfh/hogel_optimizer.py` and `tier2_slfh/slfh.py` unmodified.
+
+**This revision responds to review feedback that found two real bugs in the
+previous version of this document and one genuine mechanism flaw in the
+experiment design.** All three are described below, with what was wrong, what
+was fixed, and how the fix was checked. The verdict changed in the direction of
+more confidence, not less — see "What changed" at the end.
 
 ## Verdict
 
-At the scale this ablation could afford, **keep the hogel step ahead of SLFH-style
-optimisation; do not replace it with a direct SLFH pass using the current
-`slfh.py` optimiser.** The direct path is 2.8x slower (33.8s vs. 12-13s) and its
-aggregate image-quality numbers are comparable to or worse than a well-configured
-hogel pipeline — but the numbers understate the real problem: **the direct path's
-off-axis (parallax) reconstructions are visually incoherent — plain noise, not a
-degraded image — even at `slfh.py`'s own full production settings (1000
-iterations, 8 frames), independently re-verified below, not an artifact of this
-ablation's reduced iteration budget.** Only the on-axis/centre view converges to
-something recognisable. The hogel path, because each hogel is directly supervised
-per viewing angle, does not have this failure mode — its degradation (blockiness,
-salt-and-pepper noise) is present at every viewing angle, not concentrated at the
-edges of the eyebox. Replacing hogels with the current direct optimiser would
-trade a *known, bounded* spatial-resolution loss for an *unresolved* eyebox-coverage
-defect, at higher cost. This is a statement about our current pipeline's
-implementations, not a refutation of the SLFH or Hogel-Free Holography papers,
-which make their case at much larger scale/compute than this ablation used (see
-Resolution honesty below).
+At the scale this ablation could afford: **keep the hogel step ahead of
+SLFH-style optimisation.** On our actual current pipeline's light field (9x9
+views), the hogel path beats the direct path on both PSNR and SSIM at every
+hogel size tested, and is 2.3-2.8x faster. Separately, and now confirmed by a
+methodologically sound experiment rather than a confounded one: **our current
+operating point (N_SUB=250) is not the best point on the hogel-size curve**,
+and — the new, stronger result — **larger hogels do not win even when the input
+light field is re-rendered to supply the angular content a larger hogel can
+actually use.** Section "Second review point" below shows this decisively:
+image quality falls off a cliff from a 9-sub-pixel hogel to a 32-sub-pixel one,
+even though the 32-view light field genuinely gives the 32-sub-pixel hogel
+angular data it did not have before. Direct SLFH's on-axis (centre-view)
+reconstruction is a real, legitimate one, recognisable and not noise — this
+document previously misreported it as noise, addressed below — but its
+off-axis (parallax) reconstructions remain incoherent noise even at full
+production settings, an unresolved defect in the current optimiser that the
+hogel path does not share.
 
-Separately, and with more confidence: **our current operating point (N_SUB=250)
-is not the best point on the hogel-size curve we measured.** The smallest hogel
-tested (N_SUB=64) gave +5.9 dB PSNR and +0.11 SSIM over N_SUB=250 at
-statistically identical wall-clock (12.2s vs. 12.2s). That is a separate, lower-risk
-finding worth acting on regardless of the hogel-vs-SLFH question, discussed below.
+## Response to review, in order
 
-## Two things this ablation found before it could answer the question asked
+### 1. The per-hogel energy correction: previously claimed fixed, actually not — now fixed and checked non-tautologically
 
-Both mattered more than expected and are reported prominently rather than buried,
-per usual practice of writing down a wrong assumption as soon as it is found.
+**What was wrong.** The previous version of this document claimed
+`apply_per_hogel_energy_correction()` recovered spatial structure, citing a
+correlation improving from -0.11 to 0.40. That correlation was computed on the
+*mean over viewing angles per hogel* — and the correction
+(`raw_views * pre_norm_sum`) implicitly assumed the optimiser's raw output
+already summed to a fixed constant (`n_samples`) for every hogel, which is
+only true if `batch_optimize` converges well. It does not, precisely at the
+larger N_SUB values this correction mattered most for (see the loss-ratio
+table below). The correction did not fix the image, and
+`plots/ablation_hogel_normalization_diagnostic.png` showed it plainly: the
+"corrected" panel was still uncorrelated noise next to a ground truth panel
+with obvious Cornell structure. Reporting that as a fix was wrong.
 
-### 1. `hogel_grid.batch_optimize` erases spatial brightness between hogels
+**The actual fix.** `apply_per_hogel_energy_correction()` now divides the raw
+output by its OWN achieved sum (per hogel) before rescaling to the true target
+sum:
 
-`batch_optimize` normalizes every hogel's target to the *same* total energy before
-fitting (`target_t = target_t / sums * n_samples`). This throws away genuine
-brightness differences between hogels — the reconstructed image's per-hogel
-brightness ends up uncorrelated with the true scene (measured correlation
-between reconstructed and true per-hogel mean: **0.05**, i.e. noise). This is not
-specific to this ablation: **the repository's own pre-existing
-`plots/hogel_grid.png`** (produced by `hogel_grid.py`'s unmodified `main()` at full
-1024x1024 resolution) already shows this — every one of its 9 reconstructed
-viewing angles is colour noise with no resemblance to the Cornell box, at its
-own default settings. See that file for the pre-existing evidence; it predates
-this ablation.
+```python
+achieved_sum = raw_views.sum(axis=(0, 1))
+return raw_views / achieved_sum[None, None, :] * pre_norm_sum[None, None, :]
+```
 
-The ablation script corrects for this in `run_hogel_path()` using
-`apply_per_hogel_energy_correction()`: it rescales each hogel's raw output by the
-target's own pre-normalization sum, computed *before* calling `batch_optimize`
-(data the pipeline already has, not an oracle — see
-`plots/ablation_hogel_normalization_diagnostic.png`, correlation with true
-brightness improves from **-0.11 (raw) to 0.40 (corrected)**). A real phase-only
-hogel display needs an equivalent per-hogel amplitude/exposure stage regardless,
-since a phase-only pattern cannot represent absolute magnitude — so this
-correction is what any real implementation would need, not a favour done to make
-the numbers look better. Every number below is measured *with* this correction
-applied; the module docstring and inline comments explain it in full. This should
-be raised with whoever owns `hogel_grid.py`/`hogel_optimizer.py` next, since it
-affects any use of `batch_optimize`, not just this ablation.
+This forces the corrected mean-over-viewing-angle to equal the true value *by
+construction* — which makes that particular statistic tautological and no
+longer usable as evidence. The check that matters is on a single FIXED
+viewing angle, never divided by its own achieved sum, which is not
+guaranteed to improve by this algebra alone:
 
-### 2. Direct SLFH fails off-axis regardless of iteration budget
+| Version | Single-view correlation with true GT (green channel, N_SUB=250) |
+|---|---|
+| Raw optimiser output | 0.08 |
+| Multiply-only (previous, incorrect) | 0.43 |
+| Achieved-sum-corrected (current) | 0.71 |
 
-Confirmed by re-running `slfh.optimize_hologram` at its own unmodified production
-defaults (`n_iters=1000, n_frames=8`, double this ablation's 500/4) on the same
-160x160 light field: the centre view converges to a recognisable, if blurred,
-Cornell box; the left and right views (`angular_positions[0]` and `[8]`, ±10mm,
-well inside the ±10mm eyebox the optimiser was trained on) are indistinguishable
-from random noise **at every pupil diameter tried (0.002, 0.005, 0.01, 0.02m)**.
-See `plots/ablation_slfh_offaxis_diagnostic.png`. Because `optimize_hologram`
-samples pupils uniformly at random across the whole eyebox every iteration with
-no importance weighting, and near-DC (on-axis) content is inherently less
-phase-sensitive than the higher spatial frequencies a large lateral pupil shift
-maps to, the single shared phase pattern preferentially fits the easy, central
-region of the eyebox. This is a property of `slfh.py` as implemented, not of this
-ablation's reduced settings — flagged for whoever works on `slfh.py` next.
-Whether it also appears at full 1024x1024 panel resolution was not tested (see
-Resolution honesty).
+See `plots/ablation_hogel_normalization_diagnostic.png` (regenerated): the
+achieved-sum-corrected panel now visibly shows the true image's dark-left /
+bright-right gradient; the multiply-only panel does not. This is a real,
+substantive, non-tautological improvement, not a repeat of the earlier
+mistake — but it is also not a full recovery: 0.71 correlation at a single
+view is "recognisable structure under heavy noise," which is exactly what the
+corrected sweep images show (see below), not a clean reconstruction. The
+correction is described accurately now, including its limits — see
+`apply_per_hogel_energy_correction()`'s docstring in the script.
 
-## The sweep: PSNR / SSIM / wall-clock vs. hogel size
+This fix changed the sweep's numbers substantially, particularly at N_SUB=250
+and 512 where convergence is worst (13.60→18.35 dB and 15.61→16.32 dB
+respectively) — see "What changed" at the end.
 
-160x160 light field, 9x9 views, 256 spp (rendered once, cached to
-`plots/ablation_lightfield.npz`, reused for every configuration). Hogel path:
-500 iterations (50% of `hogel_grid.py`'s production default). Direct path: 500
-iterations x 4 frames (50% of `slfh.py`'s production defaults of 1000/8).
-Both reduced by the same 50% factor for ablation speed. PSNR/SSIM computed
-per-view against the full-resolution path-traced ground truth, after a
-per-image least-squares brightness calibration (holographic reconstructions
-carry an arbitrary overall exposure), averaged over all 81 view pairs.
+### 2. Second review point: the sweep was angularly rigged against large hogels — now re-run matched
+
+**The critique, confirmed.** `tests/test_holographic_transport.py::test_hogel_angular_sample_count_equals_subpixel_count`
+proves a hogel of D sub-pixels resolves exactly D angular samples across its
+full grating-limited range (space-bandwidth conservation). Our light field
+supplies only 9x9=81 views. Every N_SUB in the original sweep (64-512) was
+therefore angularly over-determined by 7x-57x: a larger hogel could only ever
+lose, because it was never given angular content it could use, only a
+spatial cost to pay for capacity that went to waste.
+
+**The re-run.** `main()` now also runs an angular-matched sweep
+(`MATCHED_N_SUBS = [9, 32, 64]`): one light field rendered per hogel size, at
+exactly that many views (9x9, 32x32, 64x64 — reusing the existing 9x9 cache,
+rendering the other two once at 160x160 with reduced spp — 128 and 64
+respectively — to bound render time; see Resolution honesty). Each N_SUB is
+run against the light field that actually supplies its angular capacity.
+
+**Result: large hogels still lose.** Decisively, not marginally:
+
+| n_angular = N_SUB | grid (hogels/side) | PSNR (dB) | SSIM | wall (s) |
+|---:|---:|---:|---:|---:|
+| 9  | 160 | **25.96** | **0.6677** | 2.2 |
+| 32 | 125 | 18.45 | 0.3723 | 22.4 |
+| 64 | 62  | 18.76 | 0.3423 | 22.4 |
+
+`plots/ablation_matched_sidebyside.png` (centre view, GT vs. reconstruction at
+each configuration): at N_SUB=9 the reconstruction is close to the ground
+truth — sharp box silhouettes, visible ceiling light, walls — with only a
+speckle-like noise texture over it. At N_SUB=32 it has collapsed into
+dominant colour-confetti noise, wall colours and box silhouette barely
+surviving underneath. At N_SUB=64 it is worse again, though only slightly —
+PSNR is flat within noise (18.45→18.76) and SSIM keeps falling (0.372→0.342).
+See `plots/ablation_matched_tradeoff_curve.png` for the same story as a curve:
+a cliff from 9 to 32, then a plateau/slight further decline to 64.
+
+**This is the answer the review asked for, and it strengthens rather than
+inverts the verdict.** Given angular content it can actually use, a hogel
+that is bigger than strictly necessary still loses, because the spatial-count
+cost of a bigger hogel (`GRID_SIZE * N_SUB` held ~constant, so a 4x bigger
+N_SUB means roughly 4x fewer hogels per side) is not repaid by the angular
+fidelity it buys, at least for this scene's spatial-frequency content. Note
+one honesty caveat specific to this sweep: going from N_SUB=9 to 32 changes
+two things at once (more angular capacity AND fewer, bigger hogels) by
+design — that bundling *is* the physical trade-off being tested, not a
+confound to remove, but it means this experiment cannot separately attribute
+the loss to "wasted angular capacity" vs. "coarser spatial grid"; it only
+shows that, bundled as any real hogel-size choice bundles them, bigger loses
+here. Also not tested: our real operating point, N_SUB=250, would need a
+250x250=62,500-view light field — completely impractical at this ablation's
+budget, so this result covers 9-64, not the operating point itself.
+
+### 3. Metric vs. eye disagreement
+
+**Before the fix in point 1**, the original (angularly-mismatched) sweep's
+PSNR/SSIM showed a V-shape (worst at N_SUB=250) that visibly contradicted the
+side-by-side images, which degrade monotonically by eye from N_SUB=64 (best)
+to 512 (worst, solid colour blocks).
+
+**After the fix**, PSNR now agrees with the eye — it decreases monotonically
+with N_SUB (20.14 → 19.01 → 18.35 → 16.32 dB for 64/128/250/512). This is
+itself evidence the corrected correction is doing real work: fixing a
+genuine bug made the metric converge toward the visual ordering rather than
+away from it.
+
+**SSIM still disagrees**, and does so consistently in both the mismatched and
+matched sweeps: it *increases* with N_SUB in the original sweep
+(0.3877 → 0.4121 → 0.4577 → 0.4799) even as the images visibly get worse, and
+it favours N_SUB=9 correctly but does not clearly separate 32 from 64 in the
+matched sweep either. Trust the eye for ordering: N_SUB=64 is the best hogel
+reconstruction in the original sweep and N_SUB=9 is the best in the matched
+sweep, full stop, regardless of what SSIM alone says at the coarse end. The
+most likely explanation, offered alongside the convergence-difficulty
+explanation below rather than instead of it: PSNR against a full-resolution
+raster nearest-neighbour-upsampled from a coarse hogel grid is computed
+pixel-by-pixel and directly penalises the loss of fine detail; SSIM's
+luminance/contrast/structure decomposition rewards getting large flat
+regions (which dominate this scene — the red and green walls) approximately
+right, which a very coarse, smooth block grid can do even while destroying
+all object-level detail. Both this smoothness-reward effect and the
+convergence-difficulty confound (below) are live explanations for parts of
+the remaining shape; neither is asserted as the sole cause.
+
+**Convergence difficulty across N_SUB, still relevant.** `batch_optimize`
+uses a fixed learning rate (0.1) and fixed iteration budget (500) regardless
+of N_SUB, but both the search space (N_SUB² phase values) and the scale
+mismatch between the per-hogel target (normalised to sum ≈ 81) and the
+natural FFT output scale (≈N_SUB², by Parseval) grow sharply with N_SUB.
+Loss-reduction ratio (iteration 1 → 400, averaged over channels), original
+sweep:
+
+| N_SUB | loss reduction ratio |
+|------:|----------------------:|
+|    64 |         ~7.5 million x |
+|   128 |         ~7.4 million x |
+|   250 |            ~30,000 x |
+|   512 |               ~460 x |
+
+N_SUB=64 and 128 converge equally well; above that, convergence collapses by
+orders of magnitude. This remains a real, separate factor in why quality
+degrades faster than a pure spatial-resolution argument alone would predict,
+independent of the SSIM-vs-PSNR disagreement.
+
+### 4. Direct SLFH centre view: normalisation bug, not noise — separated from the real off-axis defect
+
+**What was wrong.** `run_direct_slfh_path()` computed a single percentile
+(p99) over the ENTIRE `(nv, nu, H, H, 3)` array of all 81 reconstructed views
+combined, then clipped every view to that one global scale. A bright outlier
+anywhere in that array — in practice, an incoherent noise spike in one of the
+already-failing off-axis views — dominates that global percentile and can
+crush or saturate every other view, including the centre view, before any
+downstream code (plotting or metrics) sees the data. This is exactly what
+happened: the centre view was reported as "a blown-out yellow and white
+blob," when in fact its own field, on its own terms, was a legitimate,
+recognisable (if blurred) reconstruction the whole time.
+
+**The fix.** `run_direct_slfh_path()` and `run_hogel_path()` no longer
+clip/normalize their returned arrays at all (metrics use `calibrate_scale()`'s
+own per-view least-squares fit against ground truth, which does not need a
+prior percentile clip and is not corrupted by one taken over unrelated
+images). A new `display_normalize()` helper normalizes per-view, at plot time
+only — matching `slfh.py`'s own `tonemap_recon()`, which already normalizes
+per-image for the same reason.
+
+**Result, now separated correctly:**
+- **Centre/on-axis view: a real, legitimate reconstruction.**
+  `plots/ablation_sidebyside.png`'s centre-view Direct SLFH panel now clearly
+  shows the red and green walls, the box silhouette, and the ceiling light —
+  blurred and low in spatial detail compared to the hogel path at N_SUB≤128,
+  but recognisably correct, not noise. This was a display bug in this
+  ablation's own script, not a defect in `slfh.py`.
+- **Off-axis (parallax) views: still genuinely noise.** The left and right
+  columns of the same figure are still incoherent blue-tinted noise, and this
+  was already independently confirmed (in the previous revision) at
+  `slfh.py`'s own full production settings (1000 iterations, 8 frames — double
+  this ablation's budget), at four different pupil diameters, ruling out both
+  a reduced-iteration-budget explanation and a display-normalisation
+  explanation. See `plots/ablation_slfh_offaxis_diagnostic.png` — that
+  diagnostic script already normalized per-view (`np.percentile` on a single
+  image), so it was not affected by this bug and its conclusion stands
+  unchanged: `slfh.optimize_hologram`'s stochastic, unweighted pupil sampling
+  fits the easy, near-DC (on-axis) region of the eyebox and does not converge
+  for lateral pupil shifts even well inside the trained range, regardless of
+  iteration budget.
+
+This changes the characterisation of direct SLFH from "the whole
+reconstruction is unreliable" to the more precise and more actionable "the
+method works on-axis and fails specifically off-axis" — a narrower, more
+fixable-sounding defect (e.g. importance-weighted pupil sampling, or a loss
+term that explicitly balances eyebox coverage), but still an open, unresolved
+one as far as this ablation goes, and still enough on its own to prefer the
+hogel path's uniform-if-lower quality across the full parallax range over the
+direct path's on-axis-only reliability.
+
+## The original (angularly-mismatched) sweep — reflects our actual current pipeline
+
+160x160 light field, 9x9 views (our pipeline's real angular resolution), 256
+spp, rendered once and cached (`plots/ablation_lightfield.npz`, 21.6s).
+Both paths at 50% of their respective production iteration/frame budgets
+(hogel: 500 vs. 1000 default; SLFH: 500 iters x 4 frames vs. 1000 x 8).
+PSNR/SSIM per-view against full-resolution ground truth after a per-view
+least-squares brightness calibration, averaged over all 81 view pairs.
 
 | Path                    | N_SUB | grid    | hogel size | PSNR (dB) | SSIM   | wall (s) |
 |--------------------------|------:|---------|-----------:|----------:|-------:|---------:|
-| Hogel                    |    64 | 62x62   |   45.2 µm  |     19.50 | 0.3497 |     12.2 |
-| Hogel                    |   128 | 31x31   |   90.4 µm  |     17.78 | 0.3492 |     11.0 |
-| **Hogel (current op. pt.)** | **250** | **16x16** | **176.5 µm** | **13.60** | **0.2394** | **12.2** |
-| Hogel                    |   512 | 8x8     |  361.5 µm  |     15.61 | 0.4456 |     12.8 |
-| Direct SLFH (no hogels)  |     - | -       |          - |     13.39 | 0.3059 |     33.8 |
+| Hogel                    |    64 | 62x62   |   45.2 µm  |     20.14 | 0.3877 |     12.2 |
+| Hogel                    |   128 | 31x31   |   90.4 µm  |     19.01 | 0.4121 |     11.0 |
+| **Hogel (current op. pt.)** | **250** | **16x16** | **176.5 µm** | **18.35** | **0.4577** | **13.6** |
+| Hogel                    |   512 | 8x8     |  361.5 µm  |     16.32 | 0.4799 |     12.8 |
+| Direct SLFH (no hogels)  |     - | -       |          - |     13.48 | 0.3046 |     30.9 |
 
-GRID_SIZE (hogels per side) is tied to N_SUB by
-`GRID_SIZE = round(GRID_BASE * BASELINE_N_SUB / N_SUB)`, i.e. `GRID_SIZE * N_SUB`
-held approximately constant, matching the physical relation
-`GRID_SIZE * HOGEL_SIZE = panel width = const` at fixed sub-pixel pitch
-(0.706 µm). This is our own modelling choice for this ablation, needed because
-`hogel_grid.py` hardcodes `GRID_SIZE=32` independent of `N_SUB` — flagged in the
-script's docstring; it is not a number read out of the existing code.
+On this sweep — the one that reflects what our pipeline can actually render
+today — **the hogel path beats direct SLFH on both metrics at every hogel size
+tested, and 2.3-2.8x faster.** This is a stronger result in favour of hogels
+than the (buggy) previous revision reported.
 
-### Why the curve is not a clean monotonic decrease — and what is
-
-The expected shape ("bigger hogel buys angular resolution, loses spatial
-resolution") predicts a monotonic PSNR/SSIM decrease with N_SUB. What we measured
-is a V-shape: quality drops sharply from N_SUB=64 to 250, then rises again at
-512. This is **refuted as a clean curve, for a diagnosed reason**, not
-because the underlying trade-off is wrong.
-
-`batch_optimize` uses a fixed learning rate (0.1) and fixed iteration budget (500)
-regardless of N_SUB, but the search space (N_SUB² phase values) and the scale
-mismatch between the per-hogel target (normalised to sum ≈ 81) and the natural
-FFT output scale (≈ N_SUB², by Parseval) both grow sharply with N_SUB. The
-printed per-run loss curves show this directly — ratio of loss at iteration 1 to
-loss at iteration 400, averaged over the 3 colour channels:
-
-| N_SUB | loss reduction ratio (iter 1 → 400) |
-|------:|-------------------------------------:|
-|    64 |                        ~7.5 million x |
-|   128 |                        ~7.4 million x |
-|   250 |                           ~31,000 x |
-|   512 |                              ~470 x |
-
-N_SUB=64 and 128 converge equally well (both ~7.5M x), and here the curve
-**does** show the expected direction: the finer hogel (64) beats the coarser one
-(128) on both PSNR (19.50 vs. 17.78 dB) and SSIM (0.3497 vs. 0.3492, effectively
-tied). Above N_SUB=128, convergence quality collapses by two more orders of
-magnitude before N_SUB=512, confounding the spatial-resolution effect with an
-optimisation-difficulty effect the sweep does not control for. The apparent
-"recovery" at N_SUB=512 despite the *worst* convergence of the sweep is
-consistent with a second effect: at only 8x8 hogels, the reconstruction is so
-spatially coarse that it can only ever reproduce the scene's own large flat
-regions (the red/green walls dominate most of the frame), so even a poorly
-converged reconstruction can look "structurally" closer to a heavily blurred
-ground truth than a finer, sharper-but-noisier one — visible in
-`plots/ablation_sidebyside.png` (N_SUB=512 column: red/green blocks in
-roughly the right places, no other detail). Disentangling the two effects
-cleanly would need scaling the optimiser's learning rate or iteration budget
-with N_SUB — not done here, flagged as a follow-up, not a fix.
-
-**Actionable, confound-free result:** within the pair that converges equally
-well (64 vs. 128), smaller hogels win on quality, matching the literature. Our
-current operating point (250) sits past the point where convergence quality
-craters under `batch_optimize`'s fixed LR/iteration schedule — moving to a
-smaller N_SUB (e.g. 64) is a separate, low-risk win independent of the
-hogel-vs-SLFH question, at no wall-clock cost in this measurement (all four
-hogel configs cost ~11-13s regardless of N_SUB, because `GRID_SIZE * N_SUB` is
-held roughly constant by construction, so total FFT work is roughly constant
-too).
+GRID_SIZE is tied to N_SUB by `GRID_SIZE = round(GRID_BASE * BASELINE_N_SUB /
+N_SUB)`, capped at the light field's own pixel resolution
+(`grid_size_for(n_sub, max_grid=...)` — the cap was added after this ablation
+found N_SUB=9 wanted grid=444 against a 160px light field, i.e. more than one
+hogel per source pixel, which `hogel_anchor_indices` would have silently
+resolved by duplicating targets rather than sampling a genuinely finer grid;
+see `tests/test_ablation_hogel.py::test_grid_size_is_capped_at_max_grid`).
+This is our own modelling choice for the spatial side of the sweep (flagged
+in the script's docstring), independent of the angular-matching issue in
+point 2 above.
 
 ## Images looked at
 
-- **`plots/ablation_sidebyside.png`** — ground truth vs. each hogel size vs.
-  direct SLFH, for left/centre/right views. What I see: ground truth is a clean
-  Cornell box (red wall left, green wall right, two grey boxes, ceiling light).
-  Hogel N_SUB=64 (62x62 hogels) is the only hogel reconstruction where the box
-  is recognisable at a glance — walls, box silhouettes and the ceiling light are
-  all visible through a layer of salt-and-pepper colour noise. N_SUB=128 is
-  similar but visibly coarser and noisier. N_SUB=250 (our operating point) has
-  degraded to a soup of ~16x16 colour blocks; only the red/green wall bands
-  survive as recognisable structure, matching Hogel-Free Holography's Fig. 8
-  description of gross tessellation from an under-resolved hogel grid, though
-  here it is compounded by the finding above. N_SUB=512 is 8x8 solid colour
-  blocks — no object detail survives, only the left/right wall-colour bands.
-  Direct SLFH's centre column is a recognisable, heavily blurred version of the
-  scene (red/green walls, a bright blob approximating the ceiling light and back
-  wall) with no interior box detail; its left/right columns are blue-tinted
-  noise with no resemblance to the true left/right parallax views at all.
-- **`plots/ablation_tradeoff_curve.png`** — PSNR, SSIM and wall-clock vs. N_SUB,
-  with the direct-SLFH value as a reference line and the current operating point
-  (N_SUB=250) marked. Shows the V-shape described above.
-- **`plots/ablation_hogel_normalization_diagnostic.png`** — raw vs.
-  per-hogel-energy-corrected vs. true local brightness for one 16x16 hogel grid
-  (green channel). The raw reconstruction has no visible structure; the
-  corrected one shows a faint but real dark-left / bright-right pattern matching
-  the true image, confirming the per-hogel normalization diagnosis rather than
-  just asserting it.
-- **`plots/ablation_slfh_offaxis_diagnostic.png`** — direct SLFH at full
-  production settings (1000 iters, 8 frames): centre view recognisable, left and
-  right views pure noise. Confirms the off-axis failure is not a reduced-budget
-  artifact of this ablation.
+- **`plots/ablation_sidebyside.png`** (regenerated) — ground truth vs. each
+  hogel size vs. direct SLFH, left/centre/right views, all panels
+  per-view-normalized for display. Hogel N_SUB=64 is the best hogel
+  reconstruction by eye: walls, box silhouettes and ceiling light all visible
+  through salt-and-pepper noise. Quality degrades monotonically by eye
+  through 128, 250 (our operating point — mostly colour confetti, red/green
+  wall bands survive), to 512 (solid 8x8 colour blocks, no object detail).
+  Direct SLFH's centre column is a legitimate, recognisable, blurred
+  reconstruction (corrected from the previous revision's "blown-out blob"
+  misreport); its left/right columns remain incoherent noise.
+- **`plots/ablation_tradeoff_curve.png`** (regenerated) — PSNR now decreases
+  monotonically with N_SUB, matching the eye; SSIM still increases with
+  N_SUB, still disagreeing (see point 3).
+- **`plots/ablation_hogel_normalization_diagnostic.png`** (regenerated) — raw
+  vs. multiply-only (previous, incorrect) vs. achieved-sum-corrected (current)
+  vs. true GT, one fixed viewing angle, with single-view correlations printed
+  on each panel (0.08 / 0.43 / 0.71). This is now honest evidence for a real,
+  partial improvement, not the previous revision's tautological claim of a
+  fix.
+- **`plots/ablation_matched_sidebyside.png`** (new) — centre view, GT vs.
+  hogel reconstruction, at N_SUB=9/32/64 each with its OWN correctly-sized
+  light field. N_SUB=9 is close to ground truth; N_SUB=32 and 64 have both
+  collapsed into noise-dominated reconstructions, decisively confirming that
+  larger hogels lose even when given angular content matched to their
+  capacity.
+- **`plots/ablation_matched_tradeoff_curve.png`** (new) — PSNR/SSIM vs.
+  matched N_SUB: a cliff from 9 to 32, then roughly flat to 64.
+- **`plots/ablation_slfh_offaxis_diagnostic.png`** (unchanged from previous
+  revision, already per-view normalized) — direct SLFH at full production
+  settings: centre view recognisable, left/right views noise. Still the
+  correct reading.
 - **`plots/hogel_grid.png`** (pre-existing, not produced by this ablation) —
-  cited as independent corroboration that `hogel_grid.py`'s own unmodified
-  `main()` produces the same colour-noise reconstructions this ablation found
-  and diagnosed.
+  independent corroboration that `hogel_grid.py`'s own unmodified `main()`
+  produces uncorrected (i.e. pre-point-1-fix) colour-noise reconstructions at
+  full 1024x1024 production resolution.
 
 ## Metrics used
 
-PSNR: schoolbook `10*log10(data_range^2/mse)`, implemented directly (no
-dependency justified for a one-line formula). SSIM: `torchmetrics`'s
-`StructuralSimilarityIndexMeasure` (battle-tested, not hand-rolled — SSIM's
-windowing and constants are not schoolbook algebra). `torchmetrics` was
-installed (`.venv/bin/uv pip install torchmetrics`) — 2 small packages
-(`torchmetrics`, `lightning-utilities`), no heavy dependency tree. LPIPS was
-**not** added: it requires the `lpips` package plus `torchvision` (a 4th
-package, `torchvision==0.29.0`, which also downloads pretrained VGG/AlexNet
-weights on first use) — this is the "large dependency tree" the task said to
-skip in that case. PSNR and SSIM are reported instead, per the task's own
-fallback. `scikit-image` was installed separately (4 small packages, no
-`torchvision`) purely to give the SSIM implementation an independent
-cross-check in `tests/test_ablation_hogel.py` (agreement within 0.01 on
-synthetic test images) — it is a test-only dependency, not used by the ablation
-script itself.
+PSNR: schoolbook `10*log10(data_range^2/mse)`, implemented directly. SSIM:
+`torchmetrics`'s `StructuralSimilarityIndexMeasure` (battle-tested, not
+hand-rolled). `torchmetrics` installed via
+`.venv/bin/uv pip install torchmetrics` (2 small packages). LPIPS was **not**
+added — it requires `lpips` plus `torchvision` (a 4th package, also
+downloading pretrained weights on first use), the "large dependency tree" the
+task said to skip in that case; PSNR and SSIM are reported instead.
+`scikit-image` was installed separately (4 small packages, no `torchvision`)
+purely as an independent SSIM cross-check inside
+`tests/test_ablation_hogel.py` (agreement within 0.01 on synthetic images) —
+test-only, not used by the ablation script itself.
 
 ## Resolution honesty
 
-The light field used here is 160x160 px, 9x9 views, 256 spp — reduced from the
-production 1024x1024 (a 41x fewer pixels per view) specifically so the render
-could be done once (21.6s) and reused for every configuration rather than
-re-paying the ~16 minute production render cost repeatedly. Both optimisers
-also ran at 50% of their production iteration/frame counts (500 vs. 1000
-iterations; 4 vs. 8 SLFH frames), for the same reason.
+The light field is 160x160 px — reduced from production's 1024x1024 — so a
+render could be done once and reused rather than re-paying the ~16 minute
+production cost repeatedly. Both optimisers run at 50% of their production
+iteration/frame counts, for the same reason. The angular-matched sweep's
+32x32 and 64x64 light fields additionally use reduced spp (128 and 64 vs. the
+9x9 field's 256) to bound render time (157.5s and 286.8s respectively,
+one-time, cached) — a noisier ground truth for those two points, which is
+visible as grain in `plots/ablation_matched_sidebyside.png`'s GT panels for
+n_angular=32/64 and should be read as a (small) additional source of
+disagreement between the 9-point and the 32/64-points beyond the hogel-size
+effect itself.
 
-Two claims in this write-up rest on different footing:
-
-- The **hogel per-hogel-normalization defect** is confirmed independently of
-  this ablation's reduced settings — it is visible in the pre-existing
-  `plots/hogel_grid.png`, produced at full 1024x1024 production resolution by
-  `hogel_grid.py`'s own unmodified `main()`. This generalises.
-- The **direct SLFH off-axis failure** is confirmed independent of the
-  *iteration* reduction (re-tested at full 1000/8 production settings, still
-  fails), but **not** independent of the *spatial resolution* reduction — it
-  was only tested at 160x160, not 1024x1024. Whether more SLM pixels changes
-  this qualitative behaviour is an open question this ablation could not
-  afford to answer (a single 1024x1024 SLFH optimisation run, per the existing
-  `slfh.py` main(), is already the multi-minute-plus cost the task asked us to
-  avoid paying repeatedly).
-- The **hogel-size sweep's absolute PSNR/SSIM numbers** should not be
-  generalised to the full panel: at 160x160 each hogel spatial block is a much
-  larger fraction of the visible scene than it would be at 1024x1024, so the
-  "coarse grid coincidentally reproduces gross colour blocks" effect discussed
-  above is likely exaggerated at this scale relative to production. The
-  *qualitative* trade-off (spatial detail loss growing with hogel size) is
-  expected to hold at any scale; the *specific* dB numbers do not transfer.
+What generalises and what does not:
+- The **hogel per-hogel-normalization defect** (point 1) is confirmed
+  independent of this ablation's settings — visible in the pre-existing,
+  full-production-resolution `plots/hogel_grid.png`.
+- The **direct SLFH off-axis failure** (point 4) is confirmed independent of
+  iteration budget (re-tested at full 1000/8 settings) but **not** independent
+  of spatial resolution — only tested at 160x160, not 1024x1024.
+- The **angular-matched result** (point 2) — large hogels losing even when
+  properly fed — was tested at N_SUB=9/32/64 only; N_SUB=250 (our real
+  operating point) would need a 250x250-view light field, completely
+  impractical here. The direction of the effect (sharp quality loss from 9 to
+  32, then a plateau) should not be assumed to extrapolate linearly out to
+  250, though the mechanism (spatial-count cost outpacing angular-fidelity
+  gain) has no obvious reason to reverse.
+- The **absolute PSNR/SSIM numbers** in both sweeps are specific to this
+  160x160 crop and should not be read as production-scale numbers; the
+  qualitative orderings (by eye, and now largely by PSNR) are expected to be
+  more robust to scale than the specific dB values.
 
 ## Tests
 
-`tests/test_ablation_hogel.py`, 26 tests, ~2s total, all passing:
+`tests/test_ablation_hogel.py`, 31 tests, ~2s, all passing:
 
 ```
 $ MPLBACKEND=Agg .venv/bin/python -m pytest tests/test_ablation_hogel.py -v
-============================== 26 passed in 2.05s ==============================
+============================== 31 passed in ~2s ==============================
 ```
 
-Covers: PSNR against the closed-form formula on synthetic noise and a known
-constant offset; SSIM against the independent `scikit-image` reference across
-several noise levels; hogel tiling/reassembly round-trips exactly through
-`upsample_nearest` when no optimisation happens in between (parametrised over
-7 grid sizes, including the exact sizes this ablation's sweep uses); a
-documented counter-example showing the naive `linspace`-based anchor
-convention (used by `hogel_grid.py`'s own `main()`) does *not* round-trip when
-the grid size does not evenly divide the image size, motivating
-`hogel_anchor_indices()`; the angle-to-FFT-bin mapping in
-`hogel_optimizer.angle_to_fft_bin` inverts `torch.fft.fftfreq` exactly for
-every optically reachable bin; `hogel_grid.py`'s and `hogel_optimizer.py`'s
-two independent implementations of the same formula agree numerically; a
-**sympy-derived** symbolic proof that the hogel path's grating-equation
-angle convention (`sin(theta)/wavelength`) and the direct path's pupil-shift
-convention (`shift_x/(wavelength*focal_length)`, from `slfh.circular_aperture`)
-are the same physics in the paraxial limit, not merely numerically close; the
-per-hogel energy correction rescales each hogel independently and is the
-identity at unit scale; and the conserved-resolution-budget rule
-(`grid_size_for`) matches the baseline at N_SUB=250 and is monotonically
-decreasing.
+New/changed since the previous revision: `apply_per_hogel_energy_correction`'s
+tests now check the corrected (achieved-sum-based) semantics — that each
+hogel's corrected sum equals its true target sum exactly, that the result is
+invariant to whatever arbitrary scale the raw optimiser output happened to
+converge to (the property the old multiply-only version lacked), and that an
+all-zero hogel does not produce NaN/inf; `grid_size_for`'s cap at `max_grid`
+is tested directly, including the specific N_SUB=9-against-160px case that
+motivated it; `representative_view_indices` (the fix for a measured 747s
+evaluation cost at 64x64=4096 views) is tested for including both extremes
+and the centre, and for capping correctly when `n_angular < k`. All
+previously-existing tests (PSNR/SSIM vs. independent references, hogel
+tiling/reassembly round-trip, the angle-to-FFT-bin mapping, and the
+sympy-derived paraxial equivalence between the hogel and direct angle
+conventions) are unchanged and still passing.
+
+## What changed in this revision, summarised
+
+| | Previous revision | This revision |
+|---|---|---|
+| Per-hogel correction | Claimed fixed; figure showed it wasn't | Genuinely improved (0.08→0.71 single-view correlation), limits stated honestly |
+| Hogel sweep numbers (N_SUB=250) | 13.60 dB / 0.2394 | 18.35 dB / 0.4577 |
+| Hogel-vs-PSNR-vs-eye | V-shaped, contradicted the eye | Monotonic, matches the eye |
+| Angular sampling | Fixed 9x9 for every N_SUB — mechanism could not let large hogels win | Matched sweep added (9/32/64) — large hogels tested fairly and still lose |
+| Direct SLFH centre view | Reported as noise/blown-out | Corrected: legitimate reconstruction; off-axis noise confirmed as the real, separate defect |
+| Verdict | Keep hogels ahead of SLFH (weakly supported, confounded sweep) | Keep hogels ahead of SLFH (now supported by a fair sweep on our real pipeline AND an angularly-matched sweep that rules out the main objection) |

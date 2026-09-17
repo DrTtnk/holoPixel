@@ -44,6 +44,18 @@ GRID_SIZE * HOGEL_SIZE = panel width = constant, since PITCH is fixed. This
 is our own modelling assumption for this ablation, not a number read out of
 hogel_grid.py — flagged here and in docs/notes_hogel_ablation.md.
 
+Second problem, found by review rather than by this script: the fixed-N_ANGULAR
+sweep below is angularly over-determined at every N_SUB tested (a hogel of D
+sub-pixels resolves exactly D angular samples across its full grating-limited
+range — space-bandwidth conservation, proved in
+tests/test_holographic_transport.py — while our light field supplies only 9x9
+views), so a larger hogel in that sweep can only ever lose: it pays a spatial
+cost for angular capacity the input cannot use. main() therefore also runs a
+SECOND, angular-matched sweep (MATCHED_N_SUBS) with one light field rendered
+per hogel size, at that many views, so a larger hogel is judged on angular
+content it can actually use. Both sweeps are reported; see
+docs/notes_hogel_ablation.md for what changes between them.
+
 Diagnostic finding worth flagging up front: hogel_grid.py's batch_optimize
 normalizes every hogel's target to the same total energy before fitting
 (`target_t / sums * n_samples`), which destroys genuine brightness
@@ -111,6 +123,19 @@ GRID_BASE = 16                               # hogels/side at BASELINE_N_SUB (th
 N_SUB_SWEEP = [64, 128, 250, 512]
 HOGEL_N_ITERS = 500                          # 50% of hogel_grid.py's production default (1000)
 
+# ── Angular-matched hogel sweep (see module docstring: "Second problem") ──
+# tests/test_holographic_transport.py::test_hogel_angular_sample_count_equals_subpixel_count
+# proves a hogel of D sub-pixels resolves exactly D angular samples (across
+# its full grating-limited range, space-bandwidth conservation). Our light
+# field has only 9x9 views, so N_SUB=64..512 was angularly over-determined by
+# 7x-57x -- no mechanism in that sweep could let a larger hogel win, because
+# the input never supplied the angular content a larger hogel can resolve.
+# This second sweep matches N_SUB to n_angular directly (one light field
+# rendered per N_SUB, at that many views) so a larger, properly-fed hogel
+# has an actual chance to win on quality.
+MATCHED_N_SUBS = [9, 32, 64]
+MATCHED_SPP = {9: LF_SPP, 32: 128, 64: 64}  # reduced spp at higher view counts to bound render time
+
 # ── Direct SLFH path ──
 SLFH_N_ITERS = 500                           # 50% of slfh.py's production default (1000)
 SLFH_N_FRAMES = 4                            # 50% of slfh.py's production default (8)
@@ -125,14 +150,20 @@ _SSIM = StructuralSimilarityIndexMeasure(data_range=1.0)
 # Light field: render once, cache forever
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def get_lightfield():
-    if LF_CACHE.exists():
-        data = np.load(str(LF_CACHE))
-        print(f"  Loaded cached light field: {LF_CACHE} shape={data['lightfield'].shape}")
+def get_lightfield(n_angular=N_ANGULAR, spp=LF_SPP, cache_path=LF_CACHE):
+    """Render (or load a cached) light field. Angular sample count and spp
+    are parameters — not just N_ANGULAR/LF_SPP — because the matched-angular
+    sweep in main() needs the SAME spatial render at several different
+    angular resolutions (9x9, 32x32, 64x64), each cached under its own path
+    so the (much more expensive, at 32x32/64x64) render only happens once
+    ever, not once per script run."""
+    if cache_path.exists():
+        data = np.load(str(cache_path))
+        print(f"  Loaded cached light field: {cache_path} shape={data['lightfield'].shape}")
         return data["lightfield"], data["angular_positions"]
 
-    print(f"  Rendering light field ({LF_RES}x{LF_RES}, {LF_SPP} spp, "
-          f"{N_ANGULAR}x{N_ANGULAR} views)...")
+    print(f"  Rendering light field ({LF_RES}x{LF_RES}, {spp} spp, "
+          f"{n_angular}x{n_angular} views)...")
     quads, quad_mats, boxes, box_mats, light_idx = lf_renderer.build_scene()
 
     # JIT warmup (tiny image) before timing the real render
@@ -144,14 +175,14 @@ def get_lightfield():
 
     t0 = time.time()
     lightfield, angular_positions = lf_renderer.render_lightfield(
-        N_ANGULAR, ANGULAR_EXTENT, CAM_Z, LOOK_AT, FOV_DEG,
-        LF_RES, LF_RES, LF_SPP, MAX_BOUNCES,
+        n_angular, ANGULAR_EXTENT, CAM_Z, LOOK_AT, FOV_DEG,
+        LF_RES, LF_RES, spp, MAX_BOUNCES,
         quads, quad_mats, boxes, box_mats, lf_renderer.MATERIALS, light_idx)
     dt = time.time() - t0
     print(f"  Render: {dt:.1f}s")
 
-    np.savez_compressed(str(LF_CACHE), lightfield=lightfield, angular_positions=angular_positions)
-    print(f"  Cached to: {LF_CACHE}")
+    np.savez_compressed(str(cache_path), lightfield=lightfield, angular_positions=angular_positions)
+    print(f"  Cached to: {cache_path}")
     return lightfield, angular_positions
 
 
@@ -171,8 +202,17 @@ def configure_hogel_module(n_sub, n_iters):
     hogel_grid.N_ITERS = n_iters
 
 
-def grid_size_for(n_sub):
-    return max(2, round(GRID_BASE * BASELINE_N_SUB / n_sub))
+def grid_size_for(n_sub, max_grid=None):
+    """Conserved-resolution-budget grid size (see module docstring), capped
+    at max_grid (the light field's own pixel resolution) when given: a grid
+    size larger than the number of source pixels is not just impractical,
+    it is meaningless — hogel_anchor_indices would assign more than one
+    hogel to the same source pixel, silently duplicating targets rather
+    than sampling a genuinely finer grid. This bit at N_SUB=9 in the
+    angular-matched sweep (formula wants grid=444 against a 160px light
+    field) before the cap was added."""
+    grid = max(2, round(GRID_BASE * BASELINE_N_SUB / n_sub))
+    return min(grid, max_grid) if max_grid is not None else grid
 
 
 def hogel_anchor_indices(n_pixels, grid_size):
@@ -189,16 +229,34 @@ def hogel_anchor_indices(n_pixels, grid_size):
 
 
 def apply_per_hogel_energy_correction(raw_views, pre_norm_sum):
-    """raw_views: (nv, nu, B). pre_norm_sum: (B,). Broadcasts a per-hogel
-    scalar gain over the (nv, nu) viewing-angle axes — see the comment in
-    run_hogel_path for why this correction is applied and why it is not an
-    oracle."""
-    return raw_views * pre_norm_sum[None, None, :]
+    """raw_views: (nv, nu, B), the optimiser's raw per-hogel output.
+    pre_norm_sum: (B,), the TRUE target's pre-normalization sum per hogel —
+    data available before batch_optimize's internal normalization discards
+    it (see the comment in run_hogel_path for why this is not an oracle).
+
+    batch_optimize fits every hogel to a target rescaled to sum to
+    n_samples, discarding true inter-hogel brightness. Multiplying the raw
+    output by pre_norm_sum alone (an earlier, incorrect version of this
+    function) implicitly assumes the optimiser's own achieved sum over
+    viewing angles is already close to n_samples for every hogel — true only
+    if convergence is good. It is not: docs/notes_hogel_ablation.md's
+    convergence-ratio table shows achieved fit quality collapsing by orders
+    of magnitude as N_SUB grows, exactly where this correction matters most.
+    Dividing out the RAW output's own achieved sum first, before rescaling
+    to the true target sum, removes that confound instead of assuming it
+    away. This is checked non-tautologically (on a single fixed viewing
+    angle, not the achieved-sum-dependent mean) in
+    tests/test_ablation_hogel.py: correlation with the true image at one
+    viewing angle improves from 0.36 (multiply-only) to 0.73 (this version).
+    """
+    achieved_sum = raw_views.sum(axis=(0, 1))
+    achieved_sum = np.where(achieved_sum > 1e-12, achieved_sum, 1.0)
+    return raw_views / achieved_sum[None, None, :] * pre_norm_sum[None, None, :]
 
 
 def run_hogel_path(lf_mapped, angular_positions, n_sub, n_iters):
     nv, nu, H, W, _ = lf_mapped.shape
-    grid_size = grid_size_for(n_sub)
+    grid_size = grid_size_for(n_sub, max_grid=min(H, W))
     configure_hogel_module(n_sub, n_iters)
 
     lf_angles = np.arctan2(angular_positions, CAM_Z - Z0)
@@ -250,9 +308,13 @@ def run_hogel_path(lf_mapped, angular_positions, n_sub, n_iters):
         ci = "RGB".index(ch)
         recon[:, :, :, :, ci] = all_views[ch].reshape(nv, nu, grid_size, grid_size)
 
-    p99 = np.percentile(recon[recon > 0], 99) if (recon > 0).any() else 1.0
-    recon = np.clip(recon / p99, 0.0, 1.0)
-
+    # No global clip/normalize here (see display_normalize() and the fix note
+    # in run_direct_slfh_path): a single percentile taken over ALL views and
+    # hogels together is dominated by whichever hogel is brightest (e.g. the
+    # ceiling light), which can crush every other hogel toward black before
+    # metrics or plotting ever see the data. Metrics (calibrate_scale) fit
+    # their own per-view scale against ground truth; plotting normalizes
+    # per-view via display_normalize().
     return {"recon": recon, "grid_size": grid_size, "n_sub": n_sub, "wall_time": wall_time}
 
 
@@ -281,10 +343,30 @@ def run_direct_slfh_path(lf_mapped, angular_positions):
                 phases, slfh.WAVELENGTHS, slfh.PIXEL_PITCH, slfh.FOCAL_LENGTH,
                 sx, sy, SLFH_VIEW_PUPIL_DIAMETER, SLFH_VIEW_DEFOCUS, device=DEVICE)
 
-    p99 = np.percentile(views[views > 0], 99) if (views > 0).any() else 1.0
-    views = np.clip(views / p99, 0.0, 1.0)
-
+    # No global clip/normalize here — a single percentile taken over the
+    # WHOLE (nv, nu, H, H, 3) array is dominated by whichever view has the
+    # single brightest outlier pixel (an off-axis view's incoherent-noise
+    # spike, in practice), which crushes every other view — including the
+    # centre view — toward black or saturation before anything downstream
+    # sees the data. This was found and is exactly why an earlier version of
+    # this script reported the centre view as a plausible reconstruction
+    # while it was actually a badly under/over-exposed rendering of one: see
+    # docs/notes_hogel_ablation.md. slfh.py's own tonemap_recon() normalizes
+    # per-image for the same reason; we do the same, per view, at display
+    # time only (display_normalize()), and let calibrate_scale fit its own
+    # per-view scale for metrics.
     return {"views": views, "wall_time": wall_time}
+
+
+def display_normalize(img, percentile=99):
+    """Per-image percentile normalize + clip, for plotting only. Never used
+    for metrics — evaluate_view() fits its own per-view scale against ground
+    truth via calibrate_scale(), which does not need a prior percentile clip
+    and is not corrupted by one taken over unrelated images."""
+    positive = img[img > 0]
+    p = np.percentile(positive, percentile) if positive.size else 1.0
+    p = p if p > 1e-12 else 1.0
+    return np.clip(img / p, 0.0, 1.0)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -341,6 +423,18 @@ def evaluate_all_views(recon_grid, gt_grid):
             psnrs.append(p)
             ssims.append(s)
     return float(np.mean(psnrs)), float(np.mean(ssims))
+
+
+def representative_view_indices(n_angular, k=5):
+    """k evenly spaced view indices out of n_angular, always including the
+    two extremes and the centre. The original 9x9 sweep evaluates all 81
+    views (cheap); the angular-matched sweep goes up to 64x64=4096 views,
+    where evaluating all of them cost 747s for one configuration (measured)
+    — almost entirely per-view Python/SSIM-call overhead, not signal. A
+    representative subsample keeps the same viewing-angle coverage (centre
+    to extreme parallax) at a fraction of the cost."""
+    k = min(k, n_angular)
+    return np.linspace(0, n_angular - 1, k, dtype=int)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -461,7 +555,7 @@ def main():
     fig, axes = plt.subplots(len(view_sel), n_cols, figsize=(3.2 * n_cols, 3.2 * len(view_sel)))
     for ri, vi in enumerate(view_sel):
         ui = vi  # diagonal views: joint horizontal+vertical parallax
-        axes[ri, 0].imshow(gt_full[vi, ui])
+        axes[ri, 0].imshow(display_normalize(gt_full[vi, ui]))
         axes[ri, 0].set_title("Ground truth" if ri == 0 else "")
         axes[ri, 0].set_ylabel(view_labels[ri], fontsize=10)
         axes[ri, 0].set_xticks([])
@@ -469,14 +563,14 @@ def main():
 
         for ci, r in enumerate(hogel_results):
             ax = axes[ri, 1 + ci]
-            ax.imshow(r["recon_upsampled"][vi, ui])
+            ax.imshow(display_normalize(r["recon_upsampled"][vi, ui]))
             if ri == 0:
                 ax.set_title(f"Hogel N_SUB={r['n_sub']}\n({r['grid_size']}x{r['grid_size']} hogels)")
             ax.set_xticks([])
             ax.set_yticks([])
 
         ax = axes[ri, n_cols - 1]
-        ax.imshow(direct["views"][vi, ui])
+        ax.imshow(display_normalize(direct["views"][vi, ui]))
         if ri == 0:
             ax.set_title("Direct SLFH\n(no hogel tiling)")
         ax.set_xticks([])
@@ -484,13 +578,112 @@ def main():
 
     plt.suptitle(
         "Reconstructions vs. ground truth across views (hogel path upsampled "
-        "nearest-neighbour to full resolution to show tessellation)",
-        fontsize=12, fontweight="bold")
+        "nearest-neighbour to full resolution to show tessellation)\n"
+        "NOTE: N_SUB=64..512 here is angularly OVER-DETERMINED by this 9x9 "
+        "light field — see the angular-matched sweep below",
+        fontsize=11, fontweight="bold")
     plt.tight_layout()
     out_grid = PLOT_DIR / "ablation_sidebyside.png"
     fig.savefig(str(out_grid), dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {out_grid}")
+
+    torch.cuda.empty_cache()
+
+    # ── Angular-matched hogel sweep: does a larger hogel win when the input
+    # light field actually supplies the angular content it can resolve? ──
+    print("\n" + "=" * 70)
+    print("Angular-matched sweep (N_SUB matched to n_angular, one light field per N_SUB)")
+    print("=" * 70)
+
+    matched_results = []
+    for n_sub in MATCHED_N_SUBS:
+        spp = MATCHED_SPP[n_sub]
+        cache_path = LF_CACHE if n_sub == N_ANGULAR else PLOT_DIR / f"ablation_lightfield_n{n_sub}_spp{spp}.npz"
+        print(f"\n  n_angular={n_sub}, N_SUB={n_sub}, spp={spp}:")
+        m_lightfield, m_angular_positions = get_lightfield(n_angular=n_sub, spp=spp, cache_path=cache_path)
+        m_nv, m_nu, m_H, m_W, _ = m_lightfield.shape
+        m_lf_mapped = tonemap(m_lightfield)
+
+        result = run_hogel_path(m_lf_mapped, m_angular_positions, n_sub, HOGEL_N_ITERS)
+        recon_up = np.zeros((m_nv, m_nu, m_H, m_W, 3), dtype=np.float64)
+        for vi in range(m_nv):
+            for ui in range(m_nu):
+                recon_up[vi, ui] = upsample_nearest(result["recon"][vi, ui], m_H, m_W)
+
+        eval_idx = representative_view_indices(n_sub, k=5)
+        recon_eval = recon_up[np.ix_(eval_idx, eval_idx)]
+        gt_eval = m_lf_mapped[np.ix_(eval_idx, eval_idx)]
+        t_eval = time.time()
+        mean_psnr, mean_ssim = evaluate_all_views(recon_eval, gt_eval)
+        eval_dt = time.time() - t_eval
+
+        result["recon_upsampled"] = recon_up
+        result["gt"] = m_lf_mapped
+        result["psnr"] = mean_psnr
+        result["ssim"] = mean_ssim
+        result["n_angular"] = n_sub
+        print(f"    -> PSNR={mean_psnr:.2f} dB, SSIM={mean_ssim:.4f}, "
+              f"wall={result['wall_time']:.1f}s "
+              f"(eval over {len(eval_idx)**2} of {m_nv*m_nu} views: {eval_dt:.1f}s)")
+        matched_results.append(result)
+
+    print("\n" + "=" * 70)
+    print("Angular-matched summary")
+    print("=" * 70)
+    header2 = f"{'n_angular=N_SUB':>16}{'grid':>8}{'PSNR(dB)':>11}{'SSIM':>8}{'wall(s)':>10}"
+    print(header2)
+    print("-" * len(header2))
+    for r in matched_results:
+        print(f"{r['n_sub']:>16}{r['grid_size']:>8}{r['psnr']:>11.2f}{r['ssim']:>8.4f}{r['wall_time']:>10.1f}")
+
+    # ── Matched-sweep trade-off plot ──
+    m_n_subs = [r["n_sub"] for r in matched_results]
+    m_psnrs = [r["psnr"] for r in matched_results]
+    m_ssims = [r["ssim"] for r in matched_results]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].plot(m_n_subs, m_psnrs, "o-", color="tab:green")
+    axes[0].set_xticks(m_n_subs)
+    axes[0].set_xlabel("N_SUB = n_angular (matched)")
+    axes[0].set_ylabel("PSNR (dB)")
+    axes[0].set_title("PSNR vs. hogel size, angular content matched")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(m_n_subs, m_ssims, "o-", color="tab:green")
+    axes[1].set_xticks(m_n_subs)
+    axes[1].set_xlabel("N_SUB = n_angular (matched)")
+    axes[1].set_ylabel("SSIM")
+    axes[1].set_title("SSIM vs. hogel size, angular content matched")
+    axes[1].grid(True, alpha=0.3)
+
+    plt.suptitle(
+        "Angular-matched hogel sweep — each point has its OWN light field "
+        "rendered at n_angular=N_SUB views (not the fixed 9x9 above)",
+        fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    out_matched_curve = PLOT_DIR / "ablation_matched_tradeoff_curve.png"
+    fig.savefig(str(out_matched_curve), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"\n  Saved: {out_matched_curve}")
+
+    # ── Matched-sweep side-by-side (centre view of each configuration) ──
+    fig, axes = plt.subplots(1, 2 * len(matched_results), figsize=(3.2 * 2 * len(matched_results), 3.4))
+    for ci, r in enumerate(matched_results):
+        cv = r["n_angular"] // 2
+        axes[2 * ci].imshow(display_normalize(r["gt"][cv, cv]))
+        axes[2 * ci].set_title(f"GT (n_angular={r['n_angular']})", fontsize=9)
+        axes[2 * ci].set_xticks([]); axes[2 * ci].set_yticks([])
+        axes[2 * ci + 1].imshow(display_normalize(r["recon_upsampled"][cv, cv]))
+        axes[2 * ci + 1].set_title(f"Hogel N_SUB={r['n_sub']}\n({r['grid_size']}x{r['grid_size']} hogels)", fontsize=9)
+        axes[2 * ci + 1].set_xticks([]); axes[2 * ci + 1].set_yticks([])
+    plt.suptitle("Angular-matched sweep — centre view, GT vs. hogel reconstruction",
+                 fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    out_matched_grid = PLOT_DIR / "ablation_matched_sidebyside.png"
+    fig.savefig(str(out_matched_grid), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out_matched_grid}")
 
     torch.cuda.empty_cache()
 
