@@ -29,6 +29,40 @@ rendered with, so no resampling of angles is needed anywhere.
 import numpy as np
 import torch
 
+from tier2_slfh.quantization_aware import nearest_index
+
+
+def quantised_field(phase, levels=None):
+    """
+    The field the panel actually emits, given its free phase.
+
+    `levels=None` is the continuous, unit-amplitude modulator every other
+    function here assumes -- `exp(i*phase)` -- and is the default precisely
+    so every existing caller and test is untouched.
+
+    Given a `levels` (a `tier2_slfh.quantization_aware.LevelSet`, reused
+    rather than reimplemented: that module already built and tested it
+    against the real 8-level Sb2Se3/DBR device, both the idealised uniform
+    case and the realistic one whose per-level reflectance runs 0.583-0.946),
+    the panel instead emits `amplitude[level] * exp(i*phase[level])` for the
+    nearest level to each pixel's continuous phase, through a straight-
+    through estimator: the forward value is the true quantised field, the
+    backward pass treats quantisation as the identity on phase, so gradients
+    keep flowing through the one free phase variable exactly as if the panel
+    were continuous. `nearest_index` is `tier2_slfh`'s own quantiser,
+    reused as-is rather than re-derived here.
+    """
+    if levels is None:
+        return torch.exp(1j * phase)
+    level_phase = levels.phase.to(device=phase.device, dtype=phase.dtype)
+    level_amplitude = levels.amplitude.to(device=phase.device, dtype=phase.dtype)
+    idx = nearest_index(phase, level_phase)
+    q_phase = level_phase[idx]
+    q_amplitude = level_amplitude[idx]
+    phase_ste = phase + (q_phase - phase).detach()
+    complex_dtype = torch.complex128 if phase.dtype == torch.float64 else torch.complex64
+    return q_amplitude.detach().to(complex_dtype) * torch.exp(1j * phase_ste.to(complex_dtype))
+
 
 class Geometry:
     """
@@ -69,7 +103,7 @@ class Geometry:
         return float(np.degrees(self.fov_rad))
 
 
-def render_views(phase, geom, view_idx, chunk=None):
+def render_views(phase, geom, view_idx, chunk=None, levels=None):
     """
     Intensities seen from the given pupil positions. `phase` is the whole panel
     and is a single optimisation variable; the windows only read from it.
@@ -79,6 +113,12 @@ def render_views(phase, geom, view_idx, chunk=None):
     INTENSITIES add. That is the whole mechanism by which speckle falls as
     1/sqrt(M): each mode is free to choose a different phase for the same
     light field, and the realisations average.
+
+    `levels` is forwarded to `quantised_field`: `None` (the default) is the
+    continuous unit-amplitude panel every caller already assumes; a
+    `LevelSet` makes the panel emit its real 8-level quantised field instead,
+    with the same phase-to-window plumbing below untouched, since
+    quantisation is a per-pixel nonlinearity and commutes with windowing.
 
     `chunk` splits `view_idx` into groups of at most that many views, each
     written into its slice of a pre-allocated output tensor. It changes only
@@ -96,7 +136,7 @@ def render_views(phase, geom, view_idx, chunk=None):
     n = view_idx.shape[0]
     step = n if chunk is None else min(chunk, n)
 
-    field = torch.exp(1j * ph)
+    field = quantised_field(ph, levels)
     out = torch.empty(n, geom.window, geom.window, dtype=ph.dtype, device=field.device)
     for start in range(0, n, step):
         g = view_idx[start:start + step]
@@ -139,7 +179,7 @@ def psnr(rendered, target):
     return (10 * torch.log10(peak ** 2 / mse)).mean().item()
 
 
-def full_psnr(phase, geom, target_views, chunk):
+def full_psnr(phase, geom, target_views, chunk, levels=None):
     """
     PSNR averaged over every view in `target_views`, one chunk of views at a
     time. Exactly equal to `psnr(render_views(phase, geom, idx), target_views)`
@@ -165,7 +205,7 @@ def full_psnr(phase, geom, target_views, chunk):
     total = 0.0
     for start in range(0, n, chunk):
         idx = idx_all[start:start + chunk]
-        rendered = render_views(phase, geom, idx)
+        rendered = render_views(phase, geom, idx, levels=levels)
         batch = target_views[idx].to(device=geom.device, dtype=geom.dtype)
         a, b = _normalise(rendered), _normalise(batch)
         mse = ((a - b) ** 2).mean(dim=(-2, -1))
@@ -175,11 +215,23 @@ def full_psnr(phase, geom, target_views, chunk):
 
 
 def optimise(target_views, geom, iters=1000, views_per_iter=8, lr=0.05, seed=0,
-             log_every=100, log=print, compress=0.5, n_modes=1):
+             log_every=100, log=print, compress=0.5, n_modes=1, levels=None):
     """
     Adam on the whole panel phase, with stochastic pupil sampling: each step
     sees a handful of the views rather than all of them, which is what makes
     the cost independent of how many views the target has.
+
+    `levels=None` (the default) optimises the continuous, unit-amplitude
+    panel every existing call site assumes -- so nothing here changes for
+    them. Passing a `LevelSet` makes this quantisation-AWARE: every forward
+    pass during training, not just the final readout, goes through the real
+    8-level quantised field (straight-through estimator, see
+    `quantised_field`), so the free phase can route around the device's
+    quantisation -- including its non-uniform per-level amplitude -- rather
+    than discovering it only after optimisation has already committed to a
+    continuous solution (that discover-it-only-at-the-end path is "naive":
+    call `optimise` with `levels=None` and quantise the returned phase
+    separately).
 
     The phase dtype and device come from `geom`, not from a second parameter
     here, so there is one place that decides float64-CPU versus float32-GPU.
@@ -206,13 +258,13 @@ def optimise(target_views, geom, iters=1000, views_per_iter=8, lr=0.05, seed=0,
 
     for it in range(iters + 1):
         idx = torch.randperm(n_views, generator=g)[:views_per_iter]
-        rendered = render_views(phase, geom, idx)
+        rendered = render_views(phase, geom, idx, levels=levels)
         batch = target_views[idx.to(target_views.device)].to(geom.device)
         loss = view_loss(rendered, batch, compress)
 
         if it % log_every == 0:
             with torch.no_grad():
-                p = full_psnr(phase, geom, target_views, chunk=views_per_iter)
+                p = full_psnr(phase, geom, target_views, chunk=views_per_iter, levels=levels)
             history.append((it, loss.item(), p))
             log(f"  iter {it:5d}  loss {loss.item():.6f}  PSNR {p:6.2f} dB")
 
