@@ -31,6 +31,12 @@ HS = 0.015      # box half-size (15mm)
 Z0 = 0.1        # depth center (100mm)
 
 # Material indices
+# Russian roulette: start after this many bounces, and never kill a path whose
+# throughput is above this, since clamping the survival probability at 1 is
+# what keeps bright paths noise-free.
+RR_START_BOUNCE = 2
+RR_MAX_SURVIVAL = 1.0
+
 MAT_WHITE = 0
 MAT_RED = 1
 MAT_GREEN = 2
@@ -128,31 +134,41 @@ def _quad_perp(axis):
     return 0, 1
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def intersect_quad(ox, oy, oz, dx, dy, dz, quad):
+    """
+    Axis-aligned quad. The two in-plane coordinates are selected by explicit
+    branches rather than by indexing a tuple with a runtime value: the latter
+    cannot be resolved at compile time, so it blocks inlining in what is the
+    innermost loop of the whole renderer.
+    """
     axis = numba.int32(quad[0])
     pos = quad[1]
 
     if axis == 0:
-        d_ax, o_ax = dx, ox
+        if abs(dx) < 1e-15:
+            return -1.0
+        t = (pos - ox) / dx
+        if t < 1e-6:
+            return -1.0
+        ha = oy + t * dy
+        hb = oz + t * dz
     elif axis == 1:
-        d_ax, o_ax = dy, oy
+        if abs(dy) < 1e-15:
+            return -1.0
+        t = (pos - oy) / dy
+        if t < 1e-6:
+            return -1.0
+        ha = ox + t * dx
+        hb = oz + t * dz
     else:
-        d_ax, o_ax = dz, oz
-
-    if abs(d_ax) < 1e-15:
-        return -1.0
-
-    t = (pos - o_ax) / d_ax
-    if t < 1e-6:
-        return -1.0
-
-    a, b = _quad_perp(axis)
-    o_vals = (ox, oy, oz)
-    d_vals = (dx, dy, dz)
-
-    ha = o_vals[a] + t * d_vals[a]
-    hb = o_vals[b] + t * d_vals[b]
+        if abs(dz) < 1e-15:
+            return -1.0
+        t = (pos - oz) / dz
+        if t < 1e-6:
+            return -1.0
+        ha = ox + t * dx
+        hb = oy + t * dy
 
     if ha < quad[2] or ha > quad[3] or hb < quad[4] or hb > quad[5]:
         return -1.0
@@ -160,7 +176,7 @@ def intersect_quad(ox, oy, oz, dx, dy, dz, quad):
     return t
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def intersect_aabb(ox, oy, oz, dx, dy, dz,
                    bx0, by0, bz0, bx1, by1, bz1):
     o = (ox, oy, oz)
@@ -207,7 +223,7 @@ def intersect_aabb(ox, oy, oz, dx, dy, dz,
     return t_near, near_axis, near_sign
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def intersect_sphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r):
     """Nearest positive root of |o + t d - c|^2 = r^2 for a unit direction d."""
     ocx, ocy, ocz = ox - cx, oy - cy, oz - cz
@@ -223,6 +239,32 @@ def intersect_sphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r):
         if t < 1e-6:
             return -1.0
     return t
+
+
+@njit(cache=True)
+def occluded(ox, oy, oz, dx, dy, dz, max_t,
+             quads, boxes, spheres):
+    """
+    Shadow test. Returns as soon as anything blocks, instead of finding the
+    nearest hit and comparing afterwards: a shadow ray only needs to know
+    whether the light is visible, not what is in the way.
+    """
+    for qi in range(quads.shape[0]):
+        t = intersect_quad(ox, oy, oz, dx, dy, dz, quads[qi])
+        if 0.0 < t < max_t:
+            return True
+    for bi in range(boxes.shape[0]):
+        b = boxes[bi]
+        t, _, _ = intersect_aabb(ox, oy, oz, dx, dy, dz,
+                                 b[0], b[1], b[2], b[3], b[4], b[5])
+        if 0.0 < t < max_t:
+            return True
+    for si in range(spheres.shape[0]):
+        sp = spheres[si]
+        t = intersect_sphere(ox, oy, oz, dx, dy, dz, sp[0], sp[1], sp[2], sp[3])
+        if 0.0 < t < max_t:
+            return True
+    return False
 
 
 @njit(cache=True)
@@ -276,7 +318,7 @@ def intersect_scene(ox, oy, oz, dx, dy, dz,
     return t_min, nx, ny, nz, mat
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def fresnel_reflectance(cos_i, n1, n2):
     """
     Unpolarised Fresnel reflectance. Exact, not the Schlick approximation:
@@ -293,7 +335,7 @@ def fresnel_reflectance(cos_i, n1, n2):
     return 0.5 * (rs * rs + rp * rp)
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def refract_dir(dx, dy, dz, nx, ny, nz, eta):
     """
     Snell's law in vector form. `n` must face against `d`. `eta` is the ratio
@@ -308,7 +350,7 @@ def refract_dir(dx, dy, dz, nx, ny, nz, eta):
     return True, eta * dx + f * nx, eta * dy + f * ny, eta * dz + f * nz
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def cosine_hemisphere(nx, ny, nz):
     r = math.sqrt(np.random.random())
     phi = 2.0 * math.pi * np.random.random()
@@ -339,26 +381,27 @@ def cosine_hemisphere(nx, ny, nz):
             tz * lx + bz * ly + nz * lz)
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def sample_light_point(quads, light_idx):
+    """
+    A point on the area light. The previous version built two Python lists per
+    call to place the coordinates by axis index; numba heap-allocates those,
+    and this runs on every diffuse bounce of every sample, so it was several
+    hundred million allocations per view.
+    """
     q = quads[light_idx]
     axis = numba.int32(q[0])
     pos = q[1]
-    a, b = _quad_perp(axis)
 
     a_val = q[2] + np.random.random() * (q[3] - q[2])
     b_val = q[4] + np.random.random() * (q[5] - q[4])
-
-    p = [0.0, 0.0, 0.0]
-    p[axis] = pos
-    p[a] = a_val
-    p[b] = b_val
-
-    n = [0.0, 0.0, 0.0]
-    n[axis] = q[6]
-
     area = (q[3] - q[2]) * (q[5] - q[4])
-    return p[0], p[1], p[2], n[0], n[1], n[2], area
+
+    if axis == 0:
+        return pos, a_val, b_val, q[6], 0.0, 0.0, area
+    elif axis == 1:
+        return a_val, pos, b_val, 0.0, q[6], 0.0, area
+    return a_val, b_val, pos, 0.0, 0.0, q[6], area
 
 
 @njit(cache=True)
@@ -462,12 +505,12 @@ def trace_path(ox, oy, oz, dx, dy, dz,
             cos_l = -(tlx * lnx + tly * lny + tlz * lnz)
 
             if cos_i > 0 and cos_l > 0:
-                st, _, _, _, smat = intersect_scene(
+                blocked = occluded(
                     hx + nx * EPS, hy + ny * EPS, hz + nz * EPS,
-                    tlx, tly, tlz,
-                    quads, quad_mats, boxes, box_mats, spheres, sphere_mats)
+                    tlx, tly, tlz, dist_l - 2 * EPS,
+                    quads, boxes, spheres)
 
-                if st >= dist_l - 2 * EPS:
+                if not blocked:
                     lmat = quad_mats[light_idx]
                     lem_r = materials[lmat, 3]
                     lem_g = materials[lmat, 4]
@@ -487,6 +530,23 @@ def trace_path(ox, oy, oz, dx, dy, dz,
         thr_r *= albr
         thr_g *= albg
         thr_b *= albb
+
+        # Russian roulette. The Cornell box is a CLOSED room, so a path never
+        # escapes and every one runs to the bounce limit, even after its
+        # throughput has decayed to nothing: at an albedo of 0.73 a path
+        # carries 0.08 of its energy by the eighth bounce but costs the same
+        # as the first. Killing it with probability 1-p and dividing the
+        # survivors by p leaves the estimator unbiased. Held off until after
+        # the second bounce, where the energy is still worth the variance.
+        if bounce >= RR_START_BOUNCE:
+            p_survive = max(thr_r, max(thr_g, thr_b))
+            if p_survive < RR_MAX_SURVIVAL:
+                if np.random.random() > p_survive:
+                    break
+                inv_p = 1.0 / p_survive
+                thr_r *= inv_p
+                thr_g *= inv_p
+                thr_b *= inv_p
 
         ox = hx + nx * EPS
         oy = hy + ny * EPS
@@ -590,12 +650,17 @@ def main():
           f"{spheres.shape[0]} spheres")
 
     # Parameters
-    n_angular = 9
-    angular_extent = 0.02   # 20mm eyebox
+    # Angular sampling is the binding constraint, not spatial: the coherent
+    # mode count of this light field tracks the number of views (about 9 modes
+    # for 90% of the energy at 9x9 views) and is nearly independent of the
+    # pixel count. So spend the budget on views. 17x17 at 512px costs less
+    # wall-clock than the old 9x9 at 1024px did before Russian roulette.
+    n_angular = 17
+    angular_extent = 0.02   # 20mm eyebox, unchanged -- denser, not wider
     cam_z = 0.2             # 200mm
     look_at = np.array([0.0, 0.0, Z0])
     fov_deg = 20.0
-    width = height = 1024
+    width = height = 512
     spp = 256
     max_bounces = 8   # glass: enter + exit costs two before anything is lit
 
