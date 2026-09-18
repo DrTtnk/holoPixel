@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from tier2_hfh.optimise import Geometry, optimise, psnr, render_views, view_loss
+from tier2_hfh.optimise import Geometry, full_psnr, optimise, psnr, render_views, view_loss
 
 
 def small_geometry(**kw):
@@ -54,6 +54,23 @@ def test_rendered_views_have_the_shape_of_the_window():
     phase = torch.zeros(geom.panel, geom.panel, dtype=torch.float64)
     out = render_views(phase, geom, torch.arange(len(geom.offsets)))
     assert out.shape == (25, geom.window, geom.window)
+
+
+def test_chunking_the_view_batch_does_not_change_the_result():
+    """
+    `chunk` exists only to bound memory when evaluating many views at once
+    (the periodic full-panel PSNR log); it must not change a single pixel of
+    the result, whatever the chunk size relative to the view count.
+    """
+    geom = small_geometry()
+    rng = np.random.default_rng(4)
+    phase = torch.from_numpy(rng.uniform(0, 2 * np.pi, (geom.panel, geom.panel)))
+    idx = torch.arange(len(geom.offsets))
+
+    whole = render_views(phase, geom, idx)
+    for chunk in (1, 4, 25, 100):
+        chunked = render_views(phase, geom, idx, chunk=chunk)
+        assert torch.equal(whole, chunked)
 
 
 def test_a_flat_panel_puts_all_its_light_in_the_central_direction():
@@ -110,6 +127,66 @@ def test_the_optimiser_recovers_a_target_a_panel_can_actually_produce():
     first_psnr, last_psnr = history[0][2], history[-1][2]
     assert last_psnr > first_psnr + 3.0
     assert history[-1][1] < history[0][1] / 2
+
+
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+
+
+@cuda_only
+def test_float32_cuda_rendering_agrees_with_float64_cpu():
+    """
+    A float32 CUDA geometry exists to fit a real panel on a GPU, not to change
+    the physics. Render the SAME phase through both and require them to agree
+    to float32 precision, isolated from any RNG divergence between dtypes.
+    """
+    geom64 = small_geometry(device="cpu", dtype=torch.float64)
+    geom32 = small_geometry(device="cuda", dtype=torch.float32)
+    rng = np.random.default_rng(2)
+    truth64 = torch.from_numpy(rng.uniform(0, 2 * np.pi, (geom64.panel, geom64.panel)))
+    truth32 = truth64.to(torch.float32).to("cuda")
+
+    idx = torch.arange(len(geom64.offsets))
+    v64 = render_views(truth64, geom64, idx)
+    v32 = render_views(truth32, geom32, idx).cpu().to(torch.float64)
+
+    assert (v64 - v32).abs().max() / v64.abs().max() < 1e-5
+
+
+@cuda_only
+def test_the_optimiser_recovers_a_target_on_cuda_float32():
+    """
+    The load-bearing recovery property, repeated on the GPU path: a float32
+    CUDA geometry must still be able to fit a target a panel can produce.
+    """
+    geom = small_geometry(device="cuda", dtype=torch.float32)
+    rng = np.random.default_rng(2)
+    truth = torch.from_numpy(
+        rng.uniform(0, 2 * np.pi, (geom.panel, geom.panel))).to(torch.float32).to("cuda")
+    target = render_views(truth, geom, torch.arange(len(geom.offsets)))
+
+    _, history = optimise(target, geom, iters=400, views_per_iter=4, lr=0.1,
+                          log_every=400, log=lambda *_: None)
+
+    first_psnr, last_psnr = history[0][2], history[-1][2]
+    assert last_psnr > first_psnr + 3.0
+    assert history[-1][1] < history[0][1] / 2
+
+
+def test_full_psnr_agrees_with_rendering_every_view_at_once():
+    """
+    `full_psnr` exists to avoid ever holding every view's render in memory at
+    once, purely for a training-time log. It must still equal the direct,
+    memory-heavy computation it replaces, for any chunk size.
+    """
+    geom = small_geometry()
+    rng = np.random.default_rng(5)
+    phase = torch.from_numpy(rng.uniform(0, 2 * np.pi, (geom.panel, geom.panel)))
+    target = torch.from_numpy(
+        rng.uniform(0.1, 1, (len(geom.offsets), geom.window, geom.window)))
+
+    direct = psnr(render_views(phase, geom, torch.arange(len(geom.offsets))), target)
+    for chunk in (1, 3, 25):
+        assert full_psnr(phase, geom, target, chunk=chunk) == pytest.approx(direct, rel=1e-9)
 
 
 def _pixels_seen_by_some_pupil(geom):
