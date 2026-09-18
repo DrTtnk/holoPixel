@@ -185,3 +185,36 @@
   `--index-strategy unsafe-best-match`.
 - `uv pip install` defaults to a 30s HTTP timeout, which is not enough for the
   ~500MB cuDNN wheel. Set `UV_HTTP_TIMEOUT=300`.
+
+## Session 2026-09-18 (continued)
+
+### Wrong: a light field's coherent mode count is small
+
+Measured on 1D strips of the Cornell light field, the mode count looked like
+9 to 16 for 90% of the energy, and appeared to track the number of views. That
+was an artefact of my own preprocessing: I embedded 9 or 17 angular samples
+into a 127- or 255-wide frequency grid by ZERO PADDING. Padding asserts the
+light field is exactly zero at every other angle, which band-limits it by
+construction and forces low rank. I noted the padding as a caveat and then
+reported the number anyway.
+
+On the proper square grid (17 spatial by 17 angular samples, no padding) the
+same scene needs 231 to 256 modes out of 289, and the eigenvalue spectrum is
+nearly flat.
+
+The reason is physics, not numerics. A path-traced diffuse scene under an area
+light is spatially INCOHERENT, so its mutual coherence matrix is essentially
+diagonal, and a diagonal matrix has full rank with equal eigenvalues. Measured
+off-diagonal energy: 0.0073 at an occlusion edge, 0.0109 on a plain wall,
+0.0395 through the glass ball, against 0.0000 for a synthetic fully incoherent
+field and 0.9925 for a single coherent one.
+
+Consequence: a coherent-mode decomposition cannot be used to build a target
+wavefront from a light field. There is no coherence to decompose. Depth in
+hogel-free holography is not recovering the scene's coherence either -- it is
+a heuristic phase assignment that happens to also produce correct focus cues.
+Without depth the phase must come from optimisation instead.
+
+The glass ball carrying 4-5x more off-diagonal energy than the diffuse regions
+is real and worth remembering: refraction correlates neighbouring points, so a
+dielectric is the most spatially coherent thing in the scene.
