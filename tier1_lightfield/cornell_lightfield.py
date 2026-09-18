@@ -35,13 +35,17 @@ MAT_WHITE = 0
 MAT_RED = 1
 MAT_GREEN = 2
 MAT_LIGHT = 3
+MAT_GLASS = 4
 
-# Materials: [albedo_r, g, b, emission_r, g, b]
+# Materials: [albedo_r, g, b, emission_r, g, b, ior]
+# ior == 0 means a diffuse (Lambertian) surface; ior > 0 means a smooth
+# dielectric, which neither absorbs nor scatters and so ignores the albedo.
 MATERIALS = np.array([
-    [0.73, 0.73, 0.73, 0.0, 0.0, 0.0],      # white
-    [0.65, 0.05, 0.05, 0.0, 0.0, 0.0],      # red
-    [0.12, 0.45, 0.15, 0.0, 0.0, 0.0],      # green
-    [0.78, 0.78, 0.78, 15.0, 15.0, 15.0],   # area light
+    [0.73, 0.73, 0.73, 0.0, 0.0, 0.0, 0.0],      # white
+    [0.65, 0.05, 0.05, 0.0, 0.0, 0.0, 0.0],      # red
+    [0.12, 0.45, 0.15, 0.0, 0.0, 0.0, 0.0],      # green
+    [0.78, 0.78, 0.78, 15.0, 15.0, 15.0, 0.0],   # area light
+    [1.00, 1.00, 1.00, 0.0, 0.0, 0.0, 1.5],      # glass, n = 1.5
 ], dtype=np.float64)
 
 
@@ -97,9 +101,18 @@ def build_scene():
     ], dtype=np.float64)
     box_mats = np.array([MAT_WHITE, MAT_WHITE], dtype=np.int32)
 
+    # Glass sphere resting on the small box. Its radius matches the box's
+    # horizontal half-size so it sits squarely on the lid, and its centre is
+    # one radius above that lid.
+    sphere_r = sb_sx
+    spheres = np.array([
+        [sb_cx, sb_cy + sb_sy + sphere_r, sb_cz, sphere_r],
+    ], dtype=np.float64)
+    sphere_mats = np.array([MAT_GLASS], dtype=np.int32)
+
     return (np.array(quads, dtype=np.float64),
             np.array(quad_mats, dtype=np.int32),
-            boxes, box_mats, light_idx)
+            boxes, box_mats, spheres, sphere_mats, light_idx)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -195,8 +208,26 @@ def intersect_aabb(ox, oy, oz, dx, dy, dz,
 
 
 @njit(cache=True)
+def intersect_sphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r):
+    """Nearest positive root of |o + t d - c|^2 = r^2 for a unit direction d."""
+    ocx, ocy, ocz = ox - cx, oy - cy, oz - cz
+    b = ocx * dx + ocy * dy + ocz * dz
+    c = ocx * ocx + ocy * ocy + ocz * ocz - r * r
+    disc = b * b - c
+    if disc < 0.0:
+        return -1.0
+    sq = math.sqrt(disc)
+    t = -b - sq
+    if t < 1e-6:
+        t = -b + sq          # origin is inside the sphere
+        if t < 1e-6:
+            return -1.0
+    return t
+
+
+@njit(cache=True)
 def intersect_scene(ox, oy, oz, dx, dy, dz,
-                    quads, quad_mats, boxes, box_mats):
+                    quads, quad_mats, boxes, box_mats, spheres, sphere_mats):
     t_min = 1e30
     nx, ny, nz = 0.0, 0.0, 0.0
     mat = numba.int32(-1)
@@ -231,7 +262,50 @@ def intersect_scene(ox, oy, oz, dx, dy, dz,
                 nz = near_sign
             mat = box_mats[bi]
 
+    for si in range(spheres.shape[0]):
+        sp = spheres[si]
+        t = intersect_sphere(ox, oy, oz, dx, dy, dz, sp[0], sp[1], sp[2], sp[3])
+        if 0.0 < t < t_min:
+            t_min = t
+            inv_r = 1.0 / sp[3]
+            nx = (ox + t * dx - sp[0]) * inv_r
+            ny = (oy + t * dy - sp[1]) * inv_r
+            nz = (oz + t * dz - sp[2]) * inv_r
+            mat = sphere_mats[si]
+
     return t_min, nx, ny, nz, mat
+
+
+@njit(cache=True)
+def fresnel_reflectance(cos_i, n1, n2):
+    """
+    Unpolarised Fresnel reflectance. Exact, not the Schlick approximation:
+    Schlick is noticeably wrong near the critical angle, which is exactly
+    where a glass sphere puts most of its interesting structure.
+    Verified against closed forms in tests/test_dielectric.py.
+    """
+    s2t = (n1 / n2) * (n1 / n2) * (1.0 - cos_i * cos_i)
+    if s2t > 1.0:
+        return 1.0                      # total internal reflection
+    cos_t = math.sqrt(1.0 - s2t)
+    rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)
+    rp = (n1 * cos_t - n2 * cos_i) / (n1 * cos_t + n2 * cos_i)
+    return 0.5 * (rs * rs + rp * rp)
+
+
+@njit(cache=True)
+def refract_dir(dx, dy, dz, nx, ny, nz, eta):
+    """
+    Snell's law in vector form. `n` must face against `d`. `eta` is the ratio
+    of the index being left over the index being entered. Returns a flag
+    because total internal reflection has no transmitted ray.
+    """
+    cos_i = -(dx * nx + dy * ny + dz * nz)
+    k = 1.0 - eta * eta * (1.0 - cos_i * cos_i)
+    if k < 0.0:
+        return False, 0.0, 0.0, 0.0
+    f = eta * cos_i - math.sqrt(k)
+    return True, eta * dx + f * nx, eta * dy + f * ny, eta * dz + f * nz
 
 
 @njit(cache=True)
@@ -289,17 +363,22 @@ def sample_light_point(quads, light_idx):
 
 @njit(cache=True)
 def trace_path(ox, oy, oz, dx, dy, dz,
-               quads, quad_mats, boxes, box_mats,
+               quads, quad_mats, boxes, box_mats, spheres, sphere_mats,
                materials, light_idx, max_bounces):
     AMBIENT = 0.05
     rad_r, rad_g, rad_b = 0.0, 0.0, 0.0
     thr_r, thr_g, thr_b = 1.0, 1.0, 1.0
     EPS = 1e-5
+    # Emission is normally added only on the camera ray, because next-event
+    # estimation already accounts for it at every diffuse bounce. A dielectric
+    # gets no next-event estimation, so the light seen THROUGH the glass would
+    # otherwise vanish. Carrying this flag restores it without double counting.
+    count_emission = True
 
     for bounce in range(max_bounces + 1):
         t, nx, ny, nz, mat_idx = intersect_scene(
             ox, oy, oz, dx, dy, dz,
-            quads, quad_mats, boxes, box_mats)
+            quads, quad_mats, boxes, box_mats, spheres, sphere_mats)
 
         if mat_idx < 0:
             break
@@ -310,20 +389,56 @@ def trace_path(ox, oy, oz, dx, dy, dz,
 
         albr, albg, albb = materials[mat_idx, 0], materials[mat_idx, 1], materials[mat_idx, 2]
         emr, emg, emb = materials[mat_idx, 3], materials[mat_idx, 4], materials[mat_idx, 5]
+        ior = materials[mat_idx, 6]
 
-        # Emission only on camera ray (avoid double-counting with NEE)
-        if bounce == 0:
+        if count_emission:
             rad_r += thr_r * emr
             rad_g += thr_g * emg
             rad_b += thr_b * emb
 
-        # Ambient fill
+        if bounce >= max_bounces:
+            break
+
+        # ── Smooth dielectric ───────────────────────────────────────────
+        if ior > 0.0:
+            d_dot_n = dx * nx + dy * ny + dz * nz
+            entering = d_dot_n < 0.0
+            if entering:
+                n1, n2 = 1.0, ior
+                fnx, fny, fnz = nx, ny, nz
+            else:
+                n1, n2 = ior, 1.0
+                fnx, fny, fnz = -nx, -ny, -nz
+            cos_i = -(dx * fnx + dy * fny + dz * fnz)
+
+            refl = fresnel_reflectance(cos_i, n1, n2)
+            ok, tx, ty, tz = refract_dir(dx, dy, dz, fnx, fny, fnz, n1 / n2)
+
+            if (not ok) or np.random.random() < refl:
+                # Reflect. Choosing the branch with probability equal to its
+                # Fresnel weight makes the estimator unbiased with no weight.
+                ndx = dx - 2.0 * (dx * fnx + dy * fny + dz * fnz) * fnx
+                ndy = dy - 2.0 * (dx * fnx + dy * fny + dz * fnz) * fny
+                ndz = dz - 2.0 * (dx * fnx + dy * fny + dz * fnz) * fnz
+                ox = hx + fnx * EPS
+                oy = hy + fny * EPS
+                oz = hz + fnz * EPS
+            else:
+                ndx, ndy, ndz = tx, ty, tz
+                ox = hx - fnx * EPS
+                oy = hy - fny * EPS
+                oz = hz - fnz * EPS
+
+            dx, dy, dz = ndx, ndy, ndz
+            count_emission = True        # the next hit is seen through glass
+            continue
+
+        # ── Lambertian ──────────────────────────────────────────────────
+        count_emission = False
+
         rad_r += thr_r * albr * AMBIENT
         rad_g += thr_g * albg * AMBIENT
         rad_b += thr_b * albb * AMBIENT
-
-        if bounce >= max_bounces:
-            break
 
         # Ensure normal faces incoming ray
         if nx * dx + ny * dy + nz * dz > 0:
@@ -350,7 +465,7 @@ def trace_path(ox, oy, oz, dx, dy, dz,
                 st, _, _, _, smat = intersect_scene(
                     hx + nx * EPS, hy + ny * EPS, hz + nz * EPS,
                     tlx, tly, tlz,
-                    quads, quad_mats, boxes, box_mats)
+                    quads, quad_mats, boxes, box_mats, spheres, sphere_mats)
 
                 if st >= dist_l - 2 * EPS:
                     lmat = quad_mats[light_idx]
@@ -388,8 +503,8 @@ def trace_path(ox, oy, oz, dx, dy, dz,
 @njit(parallel=True, cache=True)
 def render_image(cam_pos, cam_right, cam_up, cam_fwd, half_fov,
                  width, height, spp,
-                 quads, quad_mats, boxes, box_mats, materials,
-                 light_idx, max_bounces):
+                 quads, quad_mats, boxes, box_mats, spheres, sphere_mats,
+                 materials, light_idx, max_bounces):
     image = np.zeros((height, width, 3))
 
     for pixel_idx in prange(height * width):
@@ -412,7 +527,7 @@ def render_image(cam_pos, cam_right, cam_up, cam_fwd, half_fov,
             r, g, b = trace_path(
                 cam_pos[0], cam_pos[1], cam_pos[2],
                 dx, dy, dz,
-                quads, quad_mats, boxes, box_mats,
+                quads, quad_mats, boxes, box_mats, spheres, sphere_mats,
                 materials, light_idx, max_bounces)
             acc_r += r
             acc_g += g
@@ -437,8 +552,8 @@ def make_camera(position, target):
 
 def render_lightfield(n_angular, angular_extent, cam_z, look_at, fov_deg,
                       width, height, spp, max_bounces,
-                      quads, quad_mats, boxes, box_mats, materials,
-                      light_idx):
+                      quads, quad_mats, boxes, box_mats, spheres, sphere_mats,
+                      materials, light_idx):
     half_fov = math.tan(math.radians(fov_deg / 2))
     angular_pos = np.linspace(-angular_extent / 2, angular_extent / 2, n_angular)
     lightfield = np.zeros((n_angular, n_angular, height, width, 3))
@@ -453,8 +568,8 @@ def render_lightfield(n_angular, angular_extent, cam_z, look_at, fov_deg,
                 img = render_image(
                     cam_pos, right, up, fwd, half_fov,
                     width, height, spp,
-                    quads, quad_mats, boxes, box_mats, materials,
-                    light_idx, max_bounces)
+                    quads, quad_mats, boxes, box_mats, spheres, sphere_mats,
+                    materials, light_idx, max_bounces)
                 lightfield[vi, ui] = img
                 pbar.update(1)
 
@@ -470,8 +585,9 @@ def main():
     print("Cornell Box Light Field Renderer")
     print("=" * 60)
 
-    quads, quad_mats, boxes, box_mats, light_idx = build_scene()
-    print(f"  Scene: {quads.shape[0]} quads, {boxes.shape[0]} AABBs")
+    quads, quad_mats, boxes, box_mats, spheres, sphere_mats, light_idx = build_scene()
+    print(f"  Scene: {quads.shape[0]} quads, {boxes.shape[0]} AABBs, "
+          f"{spheres.shape[0]} spheres")
 
     # Parameters
     n_angular = 9
@@ -481,7 +597,7 @@ def main():
     fov_deg = 20.0
     width = height = 1024
     spp = 256
-    max_bounces = 2
+    max_bounces = 8   # glass: enter + exit costs two before anything is lit
 
     print(f"  Light field: {n_angular}×{n_angular} views, {width}×{height} px, "
           f"{spp} spp, {max_bounces} bounces")
@@ -493,7 +609,7 @@ def main():
     _ = render_image(
         np.array([0.0, 0.0, cam_z]), right, up, fwd, half_fov,
         4, 4, 1,
-        quads, quad_mats, boxes, box_mats, MATERIALS,
+        quads, quad_mats, boxes, box_mats, spheres, sphere_mats, MATERIALS,
         light_idx, max_bounces)
     print(" done")
 
@@ -502,7 +618,8 @@ def main():
     lightfield, angular_pos = render_lightfield(
         n_angular, angular_extent, cam_z, look_at, fov_deg,
         width, height, spp, max_bounces,
-        quads, quad_mats, boxes, box_mats, MATERIALS, light_idx)
+        quads, quad_mats, boxes, box_mats, spheres, sphere_mats,
+        MATERIALS, light_idx)
     dt = time.time() - t0
     print(f"\n  Total: {dt:.1f}s ({dt / 60:.1f} min)")
 

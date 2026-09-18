@@ -7,6 +7,32 @@
 - The enhancement factor F = (1+√R₁)/(1-√R₁) is the small-signal phase sensitivity multiplier
 - You MUST be operating at a cavity resonance (δ = 2mπ) for the enhancement to work
 
+## Resonance enhancement in phase-vs-index does not predict phase-vs-wavelength bandwidth ordering
+- DRAFT 8.4's DBR-only stack shows green's phase-vs-Sb2Se3-index range enhanced ~30%
+  over the bare double-pass value, while red/blue roughly match it. The reasonable
+  hypothesis (by analogy with a GTE, where finesse F narrows the phase transition
+  width as 1/F) was that green's spectral bandwidth against a 1-2nm laser diode would
+  therefore be the narrowest of the three colours. Measured (`tier2_rcwa/spectral_bandwidth.py`,
+  `tests/test_spectral_bandwidth.py`), it is the opposite: green has the *widest*
+  pi/8 phase-LUT-error bandwidth, both with and without the AR coat. The GTE's 1/F
+  law describes the width of the phase-vs-*index* (or phase-vs-detuning-from-resonance)
+  transition at fixed wavelength; it does not directly transfer to the width of
+  phase-vs-*wavelength* for a LUT whose index values are re-evaluated at a different
+  wavelength, because changing wavelength moves the whole cavity's resonance
+  condition (both the round-trip phase and each layer's optical thickness), not just
+  a single detuning parameter the way index does at fixed wavelength. Do not assume a
+  phase-vs-index enhancement factor is also the relevant phase-vs-wavelength
+  enhancement factor without checking — they are different derivatives of the same
+  phase function and can rank colours in opposite order.
+- Corollary, also measured rather than assumed: DBR pair count (4-6) barely moves the
+  phase-vs-wavelength bandwidth even though it substantially raises reflectance
+  (green: R_mean 0.656 at 4 pairs -> 0.812 at 6 pairs, bandwidth changes <1%). The
+  likely reason is that the Sb2Se3/AR front-surface Fresnel reflection (fixed, ~0.25-0.34)
+  is already the finesse-limiting "front mirror" of the implicit GTE-like cavity once
+  the DBR "back mirror" clears it by 4 pairs — consistent with `tests/test_gte_physics.py`
+  proving a GTE's finesse is set by the front mirror alone once the back is reflective
+  enough. "Reduce DBR pairs to fix a bandwidth problem" is not a real lever here.
+
 ## Phase Unwrapping Pitfalls
 - np.angle returns [-π, π]; at the GTE resonance the phase IS at ±π (a discontinuity)
 - Starting a phase sweep AT the resonance causes np.unwrap to fail or give misleading results
