@@ -408,3 +408,32 @@ one value falls out of trend, suspect that the count interacted with a hidden
 periodicity in the indexing before concluding anything about the count itself.
 Here the stride and the grid width were both 6, which is exactly the kind of
 coincidence that produces a clean-looking but meaningless data point.
+
+### The test suite was ten times slower for using every core
+
+The suite ran 313 s at 1773% CPU. Single-threaded it runs 30 s at 99% CPU: a
+factor of 10.4 gained by using LESS of the machine.
+
+These tests are hundreds of operations on tiny tensors -- 16x16 panels, 6x6
+windows. Torch fans each operation across all 18 cores and then spends longer
+synchronising than computing. The arithmetic was never the cost.
+
+Fixed in `tests/conftest.py`, which sets OMP_NUM_THREADS and MKL_NUM_THREADS
+before torch imports and calls `torch.set_num_threads(1)`.
+
+This is the same lesson as the Gaussian rasteriser, in a different costume:
+there, cost per primitive did not change with primitive size, and the answer was
+that launches rather than arithmetic dominated. Here, cost did not fall when
+cores were added. Both times the tell was a cost that ignored the quantity it
+should have depended on. When work is small, parallelism is a tax.
+
+### Mathlib v4.30.0-rc1 has no `Complex.abs`
+
+It was removed. Use `Complex.normSq` and real coordinates instead, which also
+turns out to make the phase-retrieval proofs far more tractable: the projection
+arguments are about squared distances anyway, so avoiding the square root
+avoids the side conditions it drags in.
+
+Also: `lake build Holopixel.<NewFile>` works without registering the file
+anywhere, because Lake globs the whole `Holopixel/` directory for the library
+target. New theorem files need no edit to `Holopixel.lean` or `lakefile.toml`.
