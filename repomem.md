@@ -155,10 +155,14 @@ Three findings that follow:
       B = 12                                    12/12
       B = 36 (pure Gauss-Seidel)                11/12
 
-  Note `B = 6` collapses to 3/12, out of trend. The suspected cause is that
-  stride-6 grouping on a 6x6 pupil grid puts an entire COLUMN of pupils in one
-  block. A random-grouping control was running when this file was written and
-  is not yet reported.
+  `B = 6` collapses to 3/12, out of trend, and the control explains it:
+  **how you group matters more than how many groups**. Stride-6 grouping on a
+  6x6 pupil grid puts an entire COLUMN of pupils in each block, so a block sees
+  only a narrow vertical strip of the panel and information propagates poorly.
+  Regrouping the same B = 6 at random takes it from **3/12 to 11/12**. At
+  B = 3 the counts match but random reaches a median energy of 0.99 against
+  75.3. Design rule: spread each block across the pupil grid, never align it
+  with the grid's own periodicity.
 
 **No early predictor of success was found.** F at iterations 10, 25, 50 and 100
 separates solved from stuck runs on average (934 against 2509 by iteration 100)

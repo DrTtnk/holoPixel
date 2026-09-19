@@ -386,3 +386,25 @@ and it made the real bottleneck legible. But the 25x CPU regression should have
 been read immediately as "the scaling is wrong" rather than as "the CPU does
 not matter". The second reading is the comfortable one and it was nearly the
 one I kept.
+
+### Block grouping matters more than block count
+
+Splitting the pupil views into B groups, with an exact diagonal solve inside a
+group and the updated panel between groups, interpolates between the Jacobi
+solver (B = 1) and Gerchberg-Saxton (B = number of views). More groups is
+broadly better, and B = 12 beat both ends at 12/12 against 1/12 and 11/12.
+
+But B = 6 collapsed to 3/12, badly out of trend. The cause was not the count.
+The views are indexed row-major on a 6x6 pupil grid, so grouping by stride 6
+put an ENTIRE COLUMN of pupil positions in each block. Those views share one
+x-offset, so their windows overlap heavily in x and tile in y: the block
+constrains a narrow vertical strip of the panel and leaves the rest untouched,
+and information propagates poorly between groups.
+
+Regrouping the same B = 6 at random: 3/12 becomes 11/12.
+
+The lesson generalises beyond this solver. When an experiment sweeps a count and
+one value falls out of trend, suspect that the count interacted with a hidden
+periodicity in the indexing before concluding anything about the count itself.
+Here the stride and the grid width were both 6, which is exactly the kind of
+coincidence that produces a clean-looking but meaningless data point.
