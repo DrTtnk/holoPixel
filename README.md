@@ -1,5 +1,17 @@
 # HoloPixel — 150 PPI True Holographic Pixel R&D
 
+> **Work in progress. Public so it can be read, not so it can be used.**
+>
+> This is an active research notebook, not a library and not a product. Results
+> change week to week, several conclusions here have already reversed at least
+> once, and `useful_knowledge.md` exists precisely to record the assumptions
+> that turned out to be wrong. Anything in here may be wrong too.
+>
+> Interfaces are not stable, nothing is versioned, and no part of it is
+> supported. Please do not build on it.
+>
+> No licence is granted. All rights reserved.
+
 Two work tracks in one repository:
 
 - **`tier*/`** — Python physics research. Analytical, TMM and RCWA simulation of a
