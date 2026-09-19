@@ -17,3 +17,7 @@ release/
 # in the root either. Findings go in docs/notes_*.md with a citation instead.
 docs/papers/
 *.pdf
+
+# Lean build tree. .lake holds the Mathlib cache and runs to about 7 GB;
+# `lake build` refetches it from the toolchain pinned in lean-toolchain.
+lean/**/.lake/
