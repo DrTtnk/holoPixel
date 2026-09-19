@@ -529,3 +529,127 @@ def test_an_opaque_near_primitive_still_blocks_across_a_chunk_boundary():
     assert torch.allclose(split, together, atol=1e-12)
     centre = split[16, 16]
     assert float(centre[0]) > 0.9 and float(centre[1]) < 0.05, "the near red one must win"
+
+
+# ---------------------------------------------------------------------------
+# Tiling. Work should follow projected area again, and the tile size must be
+# a performance knob only -- never a correctness one.
+# ---------------------------------------------------------------------------
+
+def _cloud(n, seed, width=64, height=64, scale=0.05):
+    g = torch.Generator().manual_seed(seed)
+    r = lambda *s: torch.rand(*s, generator=g, dtype=torch.float64)
+    scene = GaussianScene(
+        position=(r(n, 3) - 0.5) * 3 - torch.tensor([0.0, 0.0, 6.0], dtype=torch.float64),
+        quaternion=r(n, 4) - 0.5,
+        scale=scale * (0.5 + r(n, 3)),
+        opacity=0.2 + 0.6 * r(n),
+        colour=r(n, 3))
+    return scene, a_camera(width=width, height=height)
+
+
+@pytest.mark.parametrize("tile", [4, 8, 16, 32])
+def test_the_tile_size_does_not_change_the_image(tile):
+    import tier1_gaussians.render as R
+    scene, cam = _cloud(40, seed=5)
+    original = R.TILE
+    try:
+        R.TILE = 16
+        reference = render(scene, cam)
+        R.TILE = tile
+        got = render(scene, cam)
+    finally:
+        R.TILE = original
+    assert float(reference.max()) > 0.05, "the scene must be in front of the camera"
+    assert torch.allclose(reference, got, atol=1e-12), \
+        f"tile {tile} differs by {float((reference - got).abs().max()):.3e}"
+
+
+@pytest.mark.parametrize("n", [1, 12, 60])
+def test_tiled_rendering_still_equals_the_longhand_sum(n):
+    scene, cam = _cloud(n, seed=100 + n, width=48, height=48)
+    got = render(scene, cam).detach().numpy()
+    want, _ = _composite_longhand(scene, cam)
+    assert got.max() > 0.05, "the scene must be in front of the camera"
+    assert np.allclose(got, want, atol=1e-12), f"max diff {np.abs(got - want).max():.3e}"
+
+
+@pytest.mark.parametrize("size", [17, 31, 33, 64, 65])
+def test_a_frame_not_divisible_by_the_tile_size_still_works(size):
+    """The frame is padded up to whole tiles and cropped back."""
+    scene, cam = _cloud(15, seed=9, width=size, height=size)
+    got = render(scene, cam)
+    assert got.shape == (size, size, 3)
+    want, _ = _composite_longhand(scene, cam)
+    assert np.allclose(got.detach().numpy(), want, atol=1e-12)
+
+
+def test_a_non_square_frame_is_not_transposed():
+    """A width/height swap is the classic tiling bug and looks plausible."""
+    scene, _ = _cloud(20, seed=4)
+    cam = a_camera(width=48, height=24)
+    got = render(scene, cam)
+    assert got.shape == (24, 48, 3)
+    want, _ = _composite_longhand(scene, cam)
+    assert np.allclose(got.detach().numpy(), want, atol=1e-12)
+
+
+def test_a_gaussian_straddling_a_tile_boundary_has_no_seam():
+    """
+    Place one broad Gaussian dead centre and walk across the middle. A tiling
+    bug shows up as a discontinuity exactly on the tile edge, which an
+    aggregate comparison can average away but a derivative cannot.
+    """
+    import tier1_gaussians.render as R
+    cam = a_camera(width=64, height=64)
+    scene = GaussianScene(
+        position=torch.tensor([[0.0, 0.0, -4.0]], dtype=torch.float64),
+        quaternion=IDENTITY_Q[None],
+        scale=torch.full((1, 3), 0.35, dtype=torch.float64),
+        opacity=torch.tensor([0.9], dtype=torch.float64),
+        colour=torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float64))
+    row = render(scene, cam)[32, :, 0].detach().numpy()
+    lit = np.nonzero(row > 1e-6)[0]
+    assert len(lit) > 20, "the blob should be broad enough to cross tiles"
+    steps = np.abs(np.diff(row[lit.min():lit.max() + 1]))
+    assert steps.max() < 0.08, f"seam: largest one-pixel step is {steps.max():.4f}"
+
+
+def test_an_empty_tile_keeps_the_background():
+    cam = a_camera(width=48, height=48)
+    scene = GaussianScene(
+        position=torch.tensor([[0.0, 0.0, -4.0]], dtype=torch.float64),
+        quaternion=IDENTITY_Q[None],
+        scale=torch.full((1, 3), 0.02, dtype=torch.float64),
+        opacity=torch.tensor([1.0], dtype=torch.float64),
+        colour=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float64))
+    bg = torch.tensor([0.0, 0.25, 0.5], dtype=torch.float64)
+    img = render(scene, cam, background=bg)
+    assert torch.allclose(img[0, 0], bg, atol=1e-12), "a far corner must be pure background"
+    assert float(img[24, 24, 0]) > 0.5, "and the centre must not be"
+
+
+def test_tiling_visits_far_fewer_pixels_than_the_whole_frame():
+    """
+    The point of the exercise. Count the pixel-primitive pairs the tiled path
+    evaluates and require it to be a small fraction of the dense product.
+    """
+    from tier1_gaussians.render import tile_assignment
+    scene, cam = _cloud(300, seed=11, width=128, height=128, scale=0.03)
+    slots, n_tiles, k_max = tile_assignment(scene, cam)
+    evaluated = n_tiles * k_max * (16 ** 2)
+    dense = 300 * 128 * 128
+    assert evaluated < dense / 5, (
+        f"tiled evaluates {evaluated} against dense {dense}, only "
+        f"{dense / max(evaluated, 1):.1f}x better")
+
+
+def test_rendering_stays_differentiable_through_the_tiling():
+    scene, cam = _cloud(12, seed=2, width=32, height=32)
+    for name in ("position", "quaternion", "scale", "opacity", "colour"):
+        getattr(scene, name).requires_grad_(True)
+    render(scene, cam).sum().backward()
+    for name in ("position", "quaternion", "scale", "opacity", "colour"):
+        g = getattr(scene, name).grad
+        assert g is not None and torch.isfinite(g).all() and float(g.abs().sum()) > 0, \
+            f"no gradient reached {name}"

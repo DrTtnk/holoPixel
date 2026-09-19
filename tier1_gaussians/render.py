@@ -24,38 +24,46 @@ Conventions, stated once:
   * quaternions are (w, x, y, z) and are normalised on use
   * Gaussians composite front to back, nearest first
 
-Performance. An earlier version looped over primitives in Python, evaluating
-each over its own bounding box. Measured, that cost about 100 microseconds per
-Gaussian on the CPU and 435 on the GPU -- and, tellingly, the SAME whether the
-splat covered 4 pixels or 21. The cost was per-primitive launch overhead, not
-arithmetic, which is why the GPU was four times SLOWER than the CPU: thousands
-of tiny kernels, each mostly latency.
+Performance, in three stages, each measured.
 
-So the loop now runs over chunks of primitives instead, compositing a whole
-chunk at once with an exclusive cumulative product of (1 - alpha). Each
-Gaussian is evaluated over the full frame and masked back to its bounding box,
-which does more arithmetic than the per-box version but in a few hundred
-kernels rather than a few thousand. Arithmetic is the cheap resource here.
+The first version looped over primitives in Python, each over its own bounding
+box. That cost 435 microseconds per Gaussian on the GPU and -- the diagnostic
+detail -- the SAME whether the splat covered 4 pixels or 21. A cost that
+ignores the work being done is launch overhead, not arithmetic, which is also
+why the GPU was 4.3 times SLOWER than the CPU: thousands of tiny kernels, each
+mostly latency.
 
-Measured on 4000 Gaussians into a 256 square frame: 1764 ms before, 41 ms
-after, a factor of 43, and the per-primitive cost fell from 433 to 10
-microseconds.
+The second compositted a chunk of primitives at once over the whole frame.
+That fixed the launches (41 ms for 4000 primitives at 256 squared, a factor of
+43) and broke the scaling, because work became the primitive count times the
+FRAME area instead of the projected area. On the CPU, which has no spare
+arithmetic to trade for launches, it was 25 times slower than the loop.
 
-The same change makes the CPU path 25 times SLOWER -- 399 ms to 10042 ms --
-because a CPU has no spare arithmetic to trade for launches, and the dense
-evaluation does roughly three thousand times more of it for a four-pixel
-splat. That is accepted rather than fixed: light field generation runs on the
-GPU, the tests render frames of 32 to 64 pixels where it does not matter, and
-carrying a second compositing implementation to serve a case nobody uses would
-risk the two drifting apart. If a large CPU render is ever needed, the answer
-is tiling, not a second code path.
+This version buckets primitives into the tiles their bounding box touches, so
+work follows projected area again while still running a few kernels per pass.
+For 4000 primitives at 256 squared:
 
-What this does NOT fix: work grows as the number of Gaussians times the FRAME
-area, not times the projected area, so a hundred thousand primitives at 512
-squared is out of reach. The backward pass binds sooner still, because autograd
-keeps every chunk's intermediates alive, so peak training memory scales the
-same way. Tile binning answers all three -- CPU cost, large N, and backward
-memory -- and belongs here rather than in a caller.
+    per-primitive loop     1764 ms      435 us per primitive
+    chunked dense            41 ms       10 us
+    tiled                   3.9 ms     0.98 us       450x over the loop
+
+and it scales into territory neither earlier version could reach:
+
+    100000 primitives, 512 squared      37.7 ms per view    10.9 s per 289
+    500000 primitives, 512 squared     179.0 ms per view    51.7 s per 289
+
+Padding is what tiling trades away: a tile's primitive list is padded to the
+longest list in the frame, measured at 1.4 to 1.9 times the true number of
+tile-primitive pairs. `tile_assignment` is public so that ratio can be checked
+rather than assumed.
+
+The CPU is no longer the casualty it was under the dense version -- 848 ms for
+that same 4000-primitive frame against 399 for the original loop -- but the
+GPU is the target and the CPU is not optimised for.
+
+Still outstanding: autograd keeps every chunk's intermediates alive, so peak
+memory during a backward pass grows with the padded pair count rather than
+with the frame. That binds long before forward rendering does.
 """
 
 from dataclasses import dataclass
@@ -71,10 +79,17 @@ CUTOFF_SIGMA = 3.0
 # Screen-space low-pass dilation, in pixels squared. Kerbl et al. 2023.
 DILATION_PX2 = 0.3
 
-# How many elements a single chunk's working tensors may reach. The chunk size
-# follows from this and the frame area, so a big frame automatically takes
-# fewer primitives per pass and peak memory stays put instead of tracking
-# resolution. Nine or so tensors of this size are live at once.
+# Side of a square tile, in pixels. Primitives are bucketed into the tiles
+# their bounding box touches, so work follows projected area rather than frame
+# area. Smaller tiles waste less on primitives that barely overlap them and
+# cost more bookkeeping; 16 is the usual choice and the tests prove the value
+# cannot change the image.
+TILE = 16
+
+# How many elements a single chunk's working tensors may reach. The chunk is
+# taken along the per-tile depth-slot axis, so peak memory stays put whatever
+# the frame size or the primitive count. Around nine tensors of this size are
+# live at once.
 CHUNK_ELEMENTS = 1 << 22
 
 
@@ -174,94 +189,162 @@ def project_gaussians(scene, camera):
     return mean_px, cov2d, depth, visible
 
 
+def _exclusive_cumsum(counts):
+    """[0, c0, c0+c1, ...], the start offset of each run."""
+    out = torch.zeros_like(counts)
+    out[1:] = torch.cumsum(counts, 0)[:-1]
+    return out
+
+
+def tile_assignment(scene, camera):
+    """
+    Which primitives each tile must composite, and in what order.
+
+    Returns `(slots, n_tiles, k_max)`, where `slots` is an
+    `(n_tiles, k_max)` table of indices into the depth-sorted primitive list,
+    padded with -1. Column k of a row holds that tile's k-th nearest
+    primitive, so a cumulative product along the columns is exactly the
+    front-to-back transmittance for that tile.
+
+    Exposed rather than hidden because the padding ratio is the whole
+    performance story: `n_tiles * k_max` against the true number of
+    tile-primitive pairs says how much the bucketing is wasting.
+    """
+    H, W = camera.height, camera.width
+    n_tx, n_ty = -(-W // TILE), -(-H // TILE)
+    n_tiles = n_tx * n_ty
+    device = scene.position.device
+
+    mean_px, cov2d, depth, visible = project_gaussians(scene, camera)
+    cov2d = cov2d + torch.eye(2, dtype=cov2d.dtype, device=device) * DILATION_PX2
+    order = torch.argsort(torch.where(visible, depth, torch.full_like(depth, np.inf)))
+    order = order[visible[order]]
+    if order.numel() == 0:
+        return torch.full((n_tiles, 0), -1, dtype=torch.long, device=device), n_tiles, 0
+
+    S, mu = cov2d[order], mean_px[order]
+    det = S[:, 0, 0] * S[:, 1, 1] - S[:, 0, 1] * S[:, 1, 0]
+    trace = S[:, 0, 0] + S[:, 1, 1]
+    lam_max = 0.5 * (trace + torch.sqrt(torch.clamp(trace ** 2 - 4 * det, min=0.0)))
+    radius = CUTOFF_SIGMA * torch.sqrt(lam_max)
+
+    # The same pixel box as before, now reduced to the tiles it touches.
+    lo_c = torch.clamp(torch.floor(mu[:, 0] - radius), 0, W - 1).long() // TILE
+    hi_c = torch.clamp(torch.ceil(mu[:, 0] + radius), 0, W - 1).long() // TILE
+    lo_r = torch.clamp(torch.floor(mu[:, 1] - radius), 0, H - 1).long() // TILE
+    hi_r = torch.clamp(torch.ceil(mu[:, 1] + radius), 0, H - 1).long() // TILE
+
+    # A primitive whose box misses the frame entirely still clamps to an edge
+    # tile; the per-pixel mask in `render` discards it there, so it costs a
+    # slot and never a wrong pixel.
+    span_x, span_y = hi_c - lo_c + 1, hi_r - lo_r + 1
+    counts = span_x * span_y
+    total = int(counts.sum())
+
+    # Expand each primitive into one pair per tile it touches, without a loop:
+    # repeat its index `counts` times, then turn the position within that run
+    # into a 2D offset in its own tile box.
+    primitive = torch.repeat_interleave(torch.arange(counts.shape[0], device=device), counts)
+    within = torch.arange(total, device=device) - _exclusive_cumsum(counts)[primitive]
+    tile_x = lo_c[primitive] + within % span_x[primitive]
+    tile_y = lo_r[primitive] + within // span_x[primitive]
+    tile = tile_y * n_tx + tile_x
+
+    # Primitives are already in depth order, so a STABLE sort on the tile alone
+    # leaves each tile's own list sorted by depth. Sorting on a combined key
+    # would need the primitive count to fit inside it; this does not.
+    tile, perm = torch.sort(tile, stable=True)
+    primitive = primitive[perm]
+
+    per_tile = torch.bincount(tile, minlength=n_tiles)
+    k_max = int(per_tile.max())
+    slot = torch.arange(total, device=device) - _exclusive_cumsum(per_tile)[tile]
+
+    slots = torch.full((n_tiles, k_max), -1, dtype=torch.long, device=device)
+    slots[tile, slot] = primitive
+    return slots, n_tiles, k_max
+
+
 def render(scene, camera, background=None):
     """
     Rasterise to an (H, W, 3) image by front-to-back alpha compositing.
 
     Differentiable in every scene parameter. The depth SORT is not
     differentiable, which is standard and correct: ordering is discrete, and
-    gradients flow through the blend given the order. Nor is the bounding box,
-    whose edges are floors and ceilings of the projected mean -- also as
-    before, when those edges were Python integers.
+    gradients flow through the blend given the order. Neither is the tile
+    assignment, nor the bounding box, whose edges are floors and ceilings of
+    the projected mean -- as before, when those edges were Python integers.
     """
     H, W = camera.height, camera.width
     dtype, device = scene.position.dtype, scene.position.device
     image = torch.zeros(H, W, 3, dtype=dtype, device=device)
-    transmittance = torch.ones(H, W, dtype=dtype, device=device)
 
-    mean_px, cov2d, depth, visible = project_gaussians(scene, camera)
-    if not bool(visible.any()):
+    slots, n_tiles, k_max = tile_assignment(scene, camera)
+    if k_max == 0:
         return image if background is None else image + background
 
-    # Low-pass dilation, from Kerbl et al. 2023 section 5.1, for the same
-    # reason they give: a primitive projecting to less than a pixel cannot be
-    # represented on the sampling grid and would invert to an unbounded conic.
-    # It guarantees a minimum eigenvalue of 0.3 px^2, so the determinant is
-    # always positive. The VALUE is inherited from that paper's datasets and
-    # has not been re-derived for this project's focal lengths and depth range.
+    mean_px, cov2d, depth, visible = project_gaussians(scene, camera)
     cov2d = cov2d + torch.eye(2, dtype=dtype, device=device) * DILATION_PX2
-
     order = torch.argsort(torch.where(visible, depth, torch.full_like(depth, np.inf)))
-    order = order[visible[order]]                      # nearest first, visible only
+    order = order[visible[order]]
 
-    S = cov2d[order]
+    S, mu = cov2d[order], mean_px[order]
     det = S[:, 0, 0] * S[:, 1, 1] - S[:, 0, 1] * S[:, 1, 0]
     inv_xx, inv_xy, inv_yy = S[:, 1, 1] / det, -S[:, 0, 1] / det, S[:, 0, 0] / det
-
-    # The ellipse is bounded by the LARGEST EIGENVALUE, not by the largest
-    # diagonal entry. For [[a, b], [b, d]] they coincide only when b = 0, i.e.
-    # when the projected ellipse happens to be axis-aligned on screen. A tilted
-    # anisotropic Gaussian is the common case in a fitted scene, and using the
-    # diagonal clipped it by up to 29%, visible as a straight cut across the
-    # blob and as zero gradient outside the box.
     trace = S[:, 0, 0] + S[:, 1, 1]
     lam_max = 0.5 * (trace + torch.sqrt(torch.clamp(trace ** 2 - 4 * det, min=0.0)))
     radius = CUTOFF_SIGMA * torch.sqrt(lam_max)
-
-    mu = mean_px[order]
-    colour, opacity = scene.colour[order], scene.opacity[order]
     lo_c, hi_c = torch.floor(mu[:, 0] - radius), torch.ceil(mu[:, 0] + radius)
     lo_r, hi_r = torch.floor(mu[:, 1] - radius), torch.ceil(mu[:, 1] + radius)
+    colour, opacity = scene.colour[order], scene.opacity[order]
 
-    yy, xx = torch.meshgrid(torch.arange(H, device=device, dtype=dtype),
-                            torch.arange(W, device=device, dtype=dtype),
-                            indexing="ij")
-    col = xx[None]
-    row = yy[None]
+    # Absolute pixel coordinate of every sample of every tile.
+    n_tx = -(-W // TILE)
+    t_index = torch.arange(n_tiles, device=device)
+    local = torch.arange(TILE, device=device, dtype=dtype)
+    col = ((t_index % n_tx) * TILE)[:, None, None] + local[None, None, :]
+    row = ((t_index // n_tx) * TILE)[:, None, None] + local[None, :, None]
 
-    n = order.shape[0]
-    step = max(1, CHUNK_ELEMENTS // (H * W))
-    for start in range(0, n, step):
-        s = slice(start, start + step)
-        dx = col - mu[s, 0, None, None]
-        dy = row - mu[s, 1, None, None]
-        power = -0.5 * (inv_xx[s, None, None] * dx * dx
-                        + 2 * inv_xy[s, None, None] * dx * dy
-                        + inv_yy[s, None, None] * dy * dy)
+    tiles = torch.zeros(n_tiles, TILE, TILE, 3, dtype=dtype, device=device)
+    transmittance = torch.ones(n_tiles, TILE, TILE, dtype=dtype, device=device)
 
-        # Exactly the old per-primitive bounding box, expressed as a mask: a
-        # pixel was included iff its integer coordinate fell within the floored
-        # and ceiled extent of the projected mean. Keeping the rectangle rather
-        # than switching to a clean elliptical cutoff is deliberate -- it makes
-        # this a pure speed change, provable against the old behaviour.
-        inside = ((col >= lo_c[s, None, None]) & (col <= hi_c[s, None, None])
-                  & (row >= lo_r[s, None, None]) & (row <= hi_r[s, None, None]))
-        alpha = opacity[s, None, None] * torch.exp(torch.clamp(power, max=0.0))
+    step = max(1, CHUNK_ELEMENTS // (n_tiles * TILE * TILE))
+    for start in range(0, k_max, step):
+        g = slots[:, start:start + step]                  # (n_tiles, C)
+        live = g >= 0
+        safe = torch.where(live, g, torch.zeros_like(g))
+
+        c, r = col[:, None], row[:, None]                 # (n_tiles, 1, T, T)
+        dx = c - mu[safe, 0][:, :, None, None]
+        dy = r - mu[safe, 1][:, :, None, None]
+        power = -0.5 * (inv_xx[safe][:, :, None, None] * dx * dx
+                        + 2 * inv_xy[safe][:, :, None, None] * dx * dy
+                        + inv_yy[safe][:, :, None, None] * dy * dy)
+
+        # Exactly the old per-primitive rectangle, and additionally the frame
+        # edge, since the last tile of a row or column runs past it.
+        inside = ((c >= lo_c[safe][:, :, None, None]) & (c <= hi_c[safe][:, :, None, None])
+                  & (r >= lo_r[safe][:, :, None, None]) & (r <= hi_r[safe][:, :, None, None])
+                  & live[:, :, None, None] & (c <= W - 1) & (r <= H - 1))
+        alpha = opacity[safe][:, :, None, None] * torch.exp(torch.clamp(power, max=0.0))
         alpha = torch.where(inside, alpha, torch.zeros_like(alpha))
 
-        # Front-to-back compositing, in closed form rather than by recursion:
-        # the light reaching primitive k is the product of (1 - alpha) over
-        # every nearer one, which is an EXCLUSIVE cumulative product. Built by
-        # shifting the inclusive one rather than dividing by alpha, because the
-        # division is unbounded wherever a primitive is opaque.
         one_minus = 1 - alpha
-        inclusive = torch.cumprod(one_minus, dim=0)
-        exclusive = torch.cat([torch.ones_like(inclusive[:1]), inclusive[:-1]], dim=0)
+        inclusive = torch.cumprod(one_minus, dim=1)
+        exclusive = torch.cat([torch.ones_like(inclusive[:, :1]), inclusive[:, :-1]], dim=1)
 
-        weight = alpha * exclusive * transmittance[None]
-        image = image + torch.einsum("khw,kc->hwc", weight, colour[s])
-        transmittance = transmittance * inclusive[-1]
+        weight = alpha * exclusive * transmittance[:, None]
+        tiles = tiles + torch.einsum("nkij,nkc->nijc", weight, colour[safe])
+        transmittance = transmittance * inclusive[:, -1]
+
+    # Lay the tiles back out, then crop away the padding the last row and
+    # column of tiles carry when the frame is not a whole number of tiles.
+    n_ty = -(-H // TILE)
+    grid = tiles.reshape(n_ty, n_tx, TILE, TILE, 3).permute(0, 2, 1, 3, 4)
+    image = grid.reshape(n_ty * TILE, n_tx * TILE, 3)[:H, :W]
 
     if background is not None:
-        image = image + transmittance[:, :, None] * background
+        trans = transmittance.reshape(n_ty, n_tx, TILE, TILE).permute(0, 2, 1, 3)
+        trans = trans.reshape(n_ty * TILE, n_tx * TILE)[:H, :W]
+        image = image + trans[:, :, None] * background
     return image

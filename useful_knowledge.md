@@ -360,3 +360,29 @@ It would have kept passing through any rewrite of the compositing maths.
 The fix is not just the sign: every image-comparison test now asserts that the
 render is non-blank BEFORE comparing. A comparison test needs a liveness check,
 or it silently becomes a tautology.
+
+### Tiling beat both of its predecessors, and the middle version was a detour
+
+The Gaussian rasteriser went through three forms, and the measured numbers for
+4000 primitives at 256 squared on the GPU tell the whole story:
+
+    per-primitive Python loop   1764 ms    435 us per primitive
+    chunked dense over frame      41 ms     10 us
+    tiled                        3.9 ms   0.98 us
+
+The middle version traded the right thing (kernel launches) for the wrong one
+(work proportional to FRAME area rather than projected area). It was a 43x win
+on the GPU and a 25x loss on the CPU, and the CPU loss was the signal that the
+scaling was wrong -- a change that helps one device that much and hurts the
+other that much is not a clean win, it is a trade.
+
+Tiling gets both: work follows projected area again AND the launches stay
+batched. It also made the CPU regression mostly go away (848 ms against the
+original loop's 399) without a second code path.
+
+The lesson is about the intermediate step rather than the destination. Shipping
+the dense version was still right -- it was small, it was provably equivalent,
+and it made the real bottleneck legible. But the 25x CPU regression should have
+been read immediately as "the scaling is wrong" rather than as "the CPU does
+not matter". The second reading is the comfortable one and it was nearly the
+one I kept.
