@@ -29,6 +29,7 @@ rendered with, so no resampling of angles is needed anywhere.
 import numpy as np
 import torch
 
+from tier2_hfh.acuity import foveate
 from tier2_slfh.quantization_aware import nearest_index
 
 
@@ -154,9 +155,10 @@ def _normalise(x):
     return x / x.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-30)
 
 
-def view_loss(rendered, target, compress=1.0):
+def view_loss(rendered, target, compress=1.0, level=None, weight=None):
     """
-    Squared error between views, optionally on a compressed intensity scale.
+    Squared error between views, optionally on a compressed intensity scale
+    and optionally through the eye's own space-variant blur.
 
     `compress=1.0` compares raw intensity, which a bright highlight dominates:
     in the Cornell scene the ceiling light is about 50x the walls, so it
@@ -164,12 +166,33 @@ def view_loss(rendered, target, compress=1.0):
     reproduces the lamp and abandons the room. `compress=0.5` compares
     amplitudes, which is the usual choice in computer-generated holography and
     is also closer to how brightness is perceived.
+
+    `weight` is a per-sample loss weight, normally `acuity.foveal_weight`,
+    which makes the fovea count for more while leaving the target at full
+    detail. This is the route the foveated-holography literature takes
+    (Chakravarthula et al., arXiv:2108.06192, Equation 9) and it is NOT
+    interchangeable with `level` below: weighting reallocates the optimiser's
+    effort, blurring replaces what it is aiming at.
+
+    `level` is a per-sample foveation pyramid depth (`acuity.level_for_cutoff`
+    builds one from a retinal resolution limit). Both images pass through
+    `acuity.foveate` before they are compared, so peripheral detail neither
+    image can be seen to carry simply stops appearing in the loss. Blurring is
+    applied to INTENSITY, before `compress`: the retina integrates light and
+    only then compresses, so doing it the other way round would low-pass a
+    quantity the eye never low-passes.
     """
     a, b = _normalise(rendered), _normalise(target)
+    if level is not None:
+        level = level.to(device=a.device, dtype=a.dtype)
+        a, b = foveate(a, level), foveate(b, level)
     if compress != 1.0:
         a = a.clamp_min(0) ** compress
         b = b.clamp_min(0) ** compress
-    return ((a - b) ** 2).sum(dim=(-2, -1)).mean()
+    squared = (a - b) ** 2
+    if weight is not None:
+        squared = squared * weight.to(device=a.device, dtype=a.dtype)
+    return squared.sum(dim=(-2, -1)).mean()
 
 
 def psnr(rendered, target):
@@ -179,13 +202,17 @@ def psnr(rendered, target):
     return (10 * torch.log10(peak ** 2 / mse)).mean().item()
 
 
-def full_psnr(phase, geom, target_views, chunk, levels=None):
+def full_psnr(phase, geom, target_views, chunk, levels=None, level=None):
     """
     PSNR averaged over every view in `target_views`, one chunk of views at a
     time. Exactly equal to `psnr(render_views(phase, geom, idx), target_views)`
     for `idx` covering every view, because PSNR is already an unweighted
     average of a per-view quantity -- accumulating that average one chunk at
     a time changes nothing but how it is computed.
+
+    `level` foveates both images first, exactly as in `view_loss`, so the
+    number reported is the one an eye with that acuity map would see rather
+    than the one a camera would.
 
     This exists because that direct call would render and hold every view at
     once just to reduce them to one number afterwards: for a periodic
@@ -208,6 +235,9 @@ def full_psnr(phase, geom, target_views, chunk, levels=None):
         rendered = render_views(phase, geom, idx, levels=levels)
         batch = target_views[idx].to(device=geom.device, dtype=geom.dtype)
         a, b = _normalise(rendered), _normalise(batch)
+        if level is not None:
+            lv = level.to(device=a.device, dtype=a.dtype)
+            a, b = foveate(a, lv), foveate(b, lv)
         mse = ((a - b) ** 2).mean(dim=(-2, -1))
         peak = b.amax(dim=(-2, -1))
         total += (10 * torch.log10(peak ** 2 / mse)).sum().item()
@@ -215,7 +245,8 @@ def full_psnr(phase, geom, target_views, chunk, levels=None):
 
 
 def optimise(target_views, geom, iters=1000, views_per_iter=8, lr=0.05, seed=0,
-             log_every=100, log=print, compress=0.5, n_modes=1, levels=None):
+             log_every=100, log=print, compress=0.5, n_modes=1, levels=None,
+             level=None, weight=None):
     """
     Adam on the whole panel phase, with stochastic pupil sampling: each step
     sees a handful of the views rather than all of them, which is what makes
@@ -246,6 +277,16 @@ def optimise(target_views, geom, iters=1000, views_per_iter=8, lr=0.05, seed=0,
     streaming per-iteration slices is what lets a window that large train at
     all on a memory-constrained GPU; a target that already fits on the GPU
     (the common, smaller-scale case) pays only a same-device no-op here.
+
+    `weight` and `level` are the two foveation routes, and they are different
+    things: `weight` keeps the full-detail target and makes the fovea count
+    for more, `level` low-passes both images to what the eye can resolve.
+    Measured here, weighting is the one that works.
+
+    `level` (singular -- distinct from `levels`, which is the modulator's
+    quantisation) foveates the loss and the logged PSNR. Note the two names
+    are unrelated: `levels` is a device property, `level` is a property of the
+    eye looking at it.
     """
     target_views = target_views.to(dtype=geom.dtype)
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -260,11 +301,12 @@ def optimise(target_views, geom, iters=1000, views_per_iter=8, lr=0.05, seed=0,
         idx = torch.randperm(n_views, generator=g)[:views_per_iter]
         rendered = render_views(phase, geom, idx, levels=levels)
         batch = target_views[idx.to(target_views.device)].to(geom.device)
-        loss = view_loss(rendered, batch, compress)
+        loss = view_loss(rendered, batch, compress, level=level, weight=weight)
 
         if it % log_every == 0:
             with torch.no_grad():
-                p = full_psnr(phase, geom, target_views, chunk=views_per_iter, levels=levels)
+                p = full_psnr(phase, geom, target_views, chunk=views_per_iter,
+                              levels=levels, level=level)
             history.append((it, loss.item(), p))
             log(f"  iter {it:5d}  loss {loss.item():.6f}  PSNR {p:6.2f} dB")
 

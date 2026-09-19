@@ -228,7 +228,7 @@ gives a hogel pitch of 169.33 µm and `D = 338.7` sub-pixels.
 | 632 nm | 12.83′ | 27.2° | 2.17 mm | 11.7 |
 
 Foveal acuity is about 1 arcminute. Our grid delivers 9–13 arcminutes. Under
-Watson's `1/(1 + e/2.3)` falloff, 10.8 arcminutes is precisely what the eye
+the classical `1/(1 + e/2.3)` acuity falloff, 10.8 arcminutes is precisely what the eye
 requires at about **22 degrees of eccentricity**.
 
 The conclusion follows without any further argument:
@@ -271,10 +271,32 @@ M = 1, 4, 16, 64.
 `M` is a single number that three separate things all contribute to: the
 number of time-multiplexed subframes, the number of illumination modes from a
 reduced-coherence source, and the number of wavelengths in a multiplexed
-scheme. They are interchangeable in the formalism, and the achievable subframe
-count is exactly what the phase-change-material switching budget determines.
-**The coherence formalism and the hardware timing budget are the same
-variable.**
+scheme.
+
+They enter the speckle formula identically, but they are **not**
+interchangeable, and an earlier version of this section said they were. Each
+carries a different side cost:
+
+- **Subframes** cost switching time. The phase-change-material budget sets the
+  ceiling, and the measured mode sweep puts the requirement at M = 5.3 at the
+  worst pupil position, i.e. 477 Hz against 2690 Hz available.
+- **Illumination modes** cost nothing in time but require a source with the
+  right degree of partial coherence, which is a hardware property we do not
+  currently have a part number for.
+- **Wavelengths** cost ANGULAR RESOLUTION. A spread of wavelengths disperses
+  the diffracted orders, so the achievable spread is bounded by
+  `dlam/lam <= lam / (D p tan(theta))`, and buying speckle suppression this way
+  buys it by blurring the image. It is not a free axis.
+
+So the three are equivalent for suppressing speckle and inequivalent for
+everything else. What remains true is the narrower claim: **the coherence
+formalism and the hardware timing budget meet in the subframe count.**
+
+One further asymmetry, from `docs/notes_peripheral_colour_and_flicker.md`:
+`M` cannot be foveated the way spatial detail can. Cutting it in the periphery
+leaves residual speckle that, if redrawn each frame, modulates at the frame
+rate -- right at the peripheral flicker ceiling, which is the one place the
+periphery outperforms the fovea.
 
 ## 10. Where foveation enters
 

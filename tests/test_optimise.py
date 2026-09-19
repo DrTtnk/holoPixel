@@ -379,3 +379,116 @@ def test_naive_quantisation_after_continuous_optimisation_costs_amplitude_unifor
     realistic_psnr = full_psnr(cont_phase, geom, target, chunk=8, levels=realistic_levels(8))
 
     assert uniform_psnr >= realistic_psnr - 1e-6
+
+
+# --------------------------------------------------------------------------
+# Foveation: the loss stops asking for detail the eye cannot resolve.
+# --------------------------------------------------------------------------
+
+def _two_views(n=32, seed=11):
+    g = torch.Generator().manual_seed(seed)
+    return torch.rand(2, n, n, generator=g, dtype=torch.float64) + 0.1
+
+
+def test_view_loss_without_a_level_is_unchanged():
+    a, b = _two_views(), _two_views(seed=12)
+    assert view_loss(a, b, level=None) == view_loss(a, b)
+
+
+def test_a_zero_level_map_leaves_the_loss_alone():
+    a, b = _two_views(), _two_views(seed=12)
+    zero = torch.zeros(32, 32, dtype=torch.float64)
+    assert view_loss(a, b, level=zero) == pytest.approx(view_loss(a, b), rel=1e-12)
+
+
+def test_blurring_the_periphery_lowers_the_loss_on_peripheral_error():
+    """
+    Two images that differ only in fine peripheral detail must cost less once
+    the periphery is blurred -- that is the entire saving foveation buys.
+    """
+    n = 64
+    base = torch.zeros(1, n, n, dtype=torch.float64) + 1.0
+    other = base.clone()
+    other[0, :, ::2] += 0.5                       # finest possible detail, everywhere
+    level = torch.zeros(n, n, dtype=torch.float64)
+    sharp = view_loss(base, other, level=level)
+    level[:] = 3.0
+    blurred = view_loss(base, other, level=level)
+    assert float(blurred) < 0.05 * float(sharp)
+
+
+def test_foveation_does_not_forgive_error_at_the_fovea():
+    n = 64
+    base = torch.ones(1, n, n, dtype=torch.float64)
+    other = base.clone()
+    other[0, n // 2 - 1:n // 2 + 1, n // 2 - 1:n // 2 + 1] += 4.0
+    level = torch.full((n, n), 3.0, dtype=torch.float64)
+    level[n // 2 - 8:n // 2 + 8, n // 2 - 8:n // 2 + 8] = 0.0
+    assert float(view_loss(base, other, level=level)) > 0.5 * float(view_loss(base, other))
+
+
+def test_foveated_loss_still_backpropagates():
+    a = _two_views().requires_grad_(True)
+    level = torch.full((32, 32), 1.5, dtype=torch.float64)
+    view_loss(a, _two_views(seed=12), level=level).backward()
+    assert a.grad is not None and float(a.grad.abs().sum()) > 0
+
+
+def test_optimise_accepts_a_level_map_and_still_converges():
+    geom = Geometry(panel=64, window=16, n_views=3)
+    target = torch.rand(9, 16, 16, dtype=torch.float64) + 0.2
+    level = torch.zeros(16, 16, dtype=torch.float64)
+    level[:4] = 2.0
+    _, history = optimise(target, geom, iters=40, views_per_iter=3, log_every=40,
+                          log=lambda _: None, level=level)
+    assert history[-1][1] < history[0][1]
+
+
+# --------------------------------------------------------------------------
+# The weighting route: keep the full-detail target, make the fovea count more.
+# --------------------------------------------------------------------------
+
+def test_a_uniform_weight_leaves_the_loss_alone():
+    a, b = _two_views(), _two_views(seed=12)
+    ones = torch.ones(32, 32, dtype=torch.float64)
+    assert view_loss(a, b, weight=ones) == pytest.approx(view_loss(a, b), rel=1e-12)
+
+
+def test_weighting_moves_the_loss_toward_the_weighted_region():
+    """Error under a heavy weight must cost more than the same error elsewhere."""
+    n = 32
+    base = torch.ones(1, n, n, dtype=torch.float64)
+    left, right = base.clone(), base.clone()
+    left[0, :, :4] += 0.5
+    right[0, :, -4:] += 0.5
+
+    weight = torch.ones(n, n, dtype=torch.float64)
+    weight[:, :4] = 10.0
+    assert float(view_loss(base, left, weight=weight)) > \
+           float(view_loss(base, right, weight=weight))
+    assert float(view_loss(base, left)) == pytest.approx(float(view_loss(base, right)))
+
+
+def test_weight_and_level_are_independent_and_can_combine():
+    a, b = _two_views(), _two_views(seed=12)
+    w = torch.rand(32, 32, dtype=torch.float64) + 0.5
+    lv = torch.full((32, 32), 1.0, dtype=torch.float64)
+    both = view_loss(a, b, weight=w, level=lv)
+    assert both != view_loss(a, b, weight=w)
+    assert both != view_loss(a, b, level=lv)
+
+
+def test_weighted_loss_backpropagates():
+    a = _two_views().requires_grad_(True)
+    w = torch.rand(32, 32, dtype=torch.float64) + 0.5
+    view_loss(a, _two_views(seed=12), weight=w).backward()
+    assert a.grad is not None and float(a.grad.abs().sum()) > 0
+
+
+def test_optimise_accepts_a_weight_map():
+    geom = Geometry(panel=64, window=16, n_views=3)
+    target = torch.rand(9, 16, 16, dtype=torch.float64) + 0.2
+    w = torch.linspace(0.5, 2.0, 16, dtype=torch.float64)[None, :].expand(16, 16)
+    _, history = optimise(target, geom, iters=40, views_per_iter=3, log_every=40,
+                          log=lambda _: None, weight=w.contiguous())
+    assert history[-1][1] < history[0][1]
