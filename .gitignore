@@ -12,5 +12,8 @@ release/
 # Solver output: light fields and phase maps run to gigabytes
 *.npz
 *.npy
-# Research PDFs pulled by the literature agents
+# Literature. PDFs of published papers are not ours to redistribute, so none
+# are tracked: not the agents' downloads under docs/papers, and not one left
+# in the root either. Findings go in docs/notes_*.md with a citation instead.
 docs/papers/
+*.pdf
