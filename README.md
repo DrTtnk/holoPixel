@@ -3,7 +3,8 @@
 Two work tracks in one repository:
 
 - **`tier*/`** — Python physics research. Analytical, TMM and RCWA simulation of a
-  Sb₂Se₃ phase-change-material hogel, plus light-field and hologram generation.
+  Sb₂Se₃ phase-change-material hogel, plus light-field, Gaussian-splat and
+  hologram generation, and the hogel-free optimiser.
 - **`holosim/`** — HoloSim, the interactive Rust/CUDA/Electron hogel light-field
   simulator. It has its own README with its own build steps.
 
@@ -38,11 +39,17 @@ is re-derived with sympy inside the test rather than hard-coded.
 ## Run Simulations
 
 ```bash
-# === Tier 1: Light Field Generation ===
-python tier1_lightfield/cornell_lightfield.py  # Numba path tracer → 9×9 LF (512×512)
+# === Tier 1: Scene Generation ===
+python tier1_lightfield/cornell_lightfield.py  # Numba path tracer → 17×17 LF (512², 256 spp,
+                                               #   8 bounces, glass sphere, Russian roulette)
+# tier1_gaussians/render.py is a differentiable EWA splat rasteriser (library, not a script)
 
-# === Tier 2: SLFH Hologram Optimization ===
+# === Tier 2: Hologram Optimization ===
 python tier2_slfh/slfh.py                      # Stochastic Light Field Holography (PyTorch+CUDA)
+# tier2_hfh/ is the hogel-free optimiser: a light field in, one panel phase out, NO depth
+#   optimise.py   stochastic-pupil Adam, quantisation-aware, multi-subframe, foveation-aware
+#   acuity.py     retinal geometry, Watson acuity, foveation pyramid
+#   propagate.py  angular spectrum;  display.py  pupil + defocus;  modes.py  coherent modes
 
 # === Tier 1: GTE / TMM Analysis ===
 python tier1_tmm/gte_definitive.py       # Definitive GTE feasibility (corrected)
@@ -81,6 +88,8 @@ See [holosim/README.md](holosim/README.md).
 
 ```text
 tier1_lightfield/  — Numba path tracer for Cornell box light field generation
+tier1_gaussians/   — differentiable EWA Gaussian splat rasteriser
+tier2_hfh/         — hogel-free optimiser: light field in, panel phase out, no depth
 tier1_tmm/         — Tier 1: Analytical & TMM thin-film simulations
 tier2_slfh/        — SLFH hologram optimizer (Schiffers et al.)
 tier2_rcwa/        — Tier 2: RCWA periodic array simulations
@@ -92,13 +101,20 @@ plots/             — Generated simulation outputs
 docs/              — Findings, technical notes and literature surveys
 ```
 
-## Key Findings (Light Field + SLFH Pipeline)
+## Key Findings (Light Field + Hologram Pipeline)
 
-- **Path tracer**: Numba CPU, 9×9 angular views × 512×512 px, 256 spp, 2 bounces → 70s
-- **SLFH optimizer**: PyTorch CUDA (RTX 5090), 1000 iters × 3 channels → 2 min
-- **Physics**: Angular Spectrum propagation (Eq. 16-19), stochastic pupil sampling (Eq. 15)
-- **Center view** reproduces Cornell box (red/green walls, boxes, area light)
-- **Speckle** in off-axis views matches expected coherent display behavior for 512×512 SBP
+- **Path tracer**: Numba CPU, 17×17 views × 512², 256 spp, 8 bounces, dielectric sphere
+- **Hogel-free, no depth**: a light field alone drives the solve, so glass and refraction
+  survive — a depth map cannot represent them
+- **Scale reached**: panel 8192², window 2048 (12.48 mm panel, 3121 µm pupil) on an
+  RTX 5090, float32, 3000 iterations in 196 s
+- **Subframes**: 16 modes reach 47.5 dB. A pupil-position sweep measures the speckle
+  exponent at −0.46 to −0.99 (against −0.5 for independent averaging), so the worst
+  position needs M = 5.3, i.e. 477 Hz against 2690 Hz available
+- **Quantisation**: the real 8-level Sb₂Se₃ device costs 2.63 dB if applied after the
+  fact, 0.89 dB if the optimiser is aware of it
+- **A light field is spatially incoherent** (231–256 modes of 289), so a coherent-mode
+  decomposition cannot supply the missing phase — optimisation must
 
 ## Key Findings (Tier 1)
 
@@ -119,5 +135,9 @@ See [DRAFT.md](DRAFT.md) §6–8 for full findings.
 
 ## Literature Surveys
 
+- [docs/holographic_rendering_equation.md](docs/holographic_rendering_equation.md) — the derived rendering equation, Wigner form, and where foveation enters
 - [docs/research_foveated_holography.md](docs/research_foveated_holography.md) — foveated holographic rendering for head-mounted displays
 - [docs/research_holo_sota.md](docs/research_holo_sota.md) — CGH, speckle, quantization and PCM SLM state of the art
+- [docs/notes_peripheral_colour_and_flicker.md](docs/notes_peripheral_colour_and_flicker.md) — what peripheral vision does and does not give us
+- [docs/notes_gaussian_splatting_holography.md](docs/notes_gaussian_splatting_holography.md) — Gaussian splats as a light-field source
+- [useful_knowledge.md](useful_knowledge.md) — assumptions that turned out wrong, and why

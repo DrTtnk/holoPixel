@@ -218,3 +218,145 @@ Without depth the phase must come from optimisation instead.
 The glass ball carrying 4-5x more off-diagonal energy than the diffuse regions
 is real and worth remembering: refraction correlates neighbouring points, so a
 dielectric is the most spatially coherent thing in the scene.
+
+### Wrong: the periphery is the forgiving place, so cut subframes there
+
+I was heading toward spending fewer time-multiplexed subframes in the periphery,
+on the reasoning that if peripheral vision resolves less detail it must be the
+cheap place to cut everything.
+
+That is right for the spatial axis and backwards for the temporal one. Photopic
+critical flicker fusion RISES from the fovea outwards, by 5 to 15 Hz, before
+falling again past 30 to 60 degrees (Hartmann, Lachenmayr and Brettel 1979), and
+the rise survives cortical-magnification scaling (Rovamo and Raninen 1984), so it
+is a genuinely faster temporal channel rather than a receptive-field artefact.
+Peripheral vision is coarser in space and FASTER in time.
+
+Krajancich et al. (2021) additionally show the two axes are non-separable, so a
+spatial foveation budget cannot be assumed to cover the temporal one.
+
+The absolute rate is still fine: every measured flicker ceiling is 90 to
+110 Hz and the mode sweep's worst case is 477 Hz.
+
+The precise risk, stated carefully rather than as a slogan. Cutting M in the
+periphery does not by itself create flicker -- the subframe rate is unchanged.
+What it leaves behind is speckle that has not averaged away, and if that
+residual pattern is redrawn from a new random phase every FRAME it modulates at
+the frame rate, roughly 90 Hz, which is exactly where the peripheral flicker
+ceiling sits and exactly where the periphery beats the fovea. So the failure
+mode is peripheral temporal noise, not peripheral blur, and it is invisible to
+any purely spatial acuity budget. Holding the peripheral phase across frames
+instead of resampling it would avoid this, at the cost of a fixed speckle
+pattern that a moving eye would then sweep across the retina.
+
+An earlier scratchpad estimate put foveating the mode count at 20.4x. That
+figure is spatial-only and does not account for any of the above, so treat it
+as an upper bound that has not been tested against the temporal axis.
+
+### Wrong: colour vision stops in the periphery, so we can drop wavelengths there
+
+The "colourblind periphery" claim comes from Ferree and Rand (1919) and Moreland
+and Cruz (1959), both using SMALL targets. Gordon and Abramov (1977) showed that
+at 45 degrees a large target recovers the full range of hues with fovea-like hue
+functions; Bowers, Gegenfurtner and Goettker (2025) found colour vision present
+to at least 75 degrees and attributed the older result directly to stimulus size.
+
+Our entire screen lies inside 46 degrees, so there is nowhere in our field where
+a wavelength can be dropped. A hard cutoff would show as a desaturation ring, and
+would be worse than a graded falloff exactly because large uniform peripheral
+colour is genuinely seen.
+
+What is true instead is narrower and less exciting: chromatic resolution is
+coarser than luminance resolution EVERYWHERE including the fovea (11-12 c/deg
+against 30-60), and red-green fine detail specifically becomes behaviourally
+absent by 25 to 30 degrees while blue-yellow tracks the luminance falloff. The
+only work that validated peripheral chroma reduction against real observers
+(Mohanto et al. 2026) got 31-37%, not the 2-3x the raw sensitivity ratios imply.
+
+### Wrong: foveate by low-passing the target
+
+I built foveation as a space-variant blur of the TARGET: a Gaussian pyramid, with
+the level at each retinal sample set by the eye's resolution limit there. The
+reasoning in the docstring was that merely down-weighting the periphery still
+asks the optimiser for detail the eye cannot resolve and then forgives it for
+failing, whereas low-passing the target stops asking and frees the panel's
+degrees of freedom for the fovea.
+
+That reasoning is wrong and the experiment says so. At panel 8192 / window 2048,
+3000 iterations, same seed, the foveated solve was WORSE than the uniform one at
+the fovea by 2.4 to 5.7 dB across three pupil positions, and it won its own
+perceptual metric at only one of the three.
+
+Two reasons, and the second is the deeper one.
+
+1. At one subframe the error is SPECKLE, not a shortage of capacity, and
+   foveation cannot touch speckle. Étendue says the panel is 1.8x over-provisioned
+   for a single pupil, and 16 subframes reach 47.5 dB at the same scale, so
+   capacity was never the binding constraint. Repeating the comparison at M = 4
+   did move foveation into positive territory, which supports this.
+2. Each view is blurred about ITS OWN centre, so the foveated target set is
+   mutually inconsistent across views: no single physical field can produce it.
+   The unblurred light field is realisable by construction, because a real scene
+   produced it. Blurring makes the target easier to score and harder to achieve.
+
+What the literature actually does (Chakravarthula et al., arXiv:2108.06192,
+Eq. 8-9) is the opposite of what I did. They keep the full-detail target and
+apply a per-pixel WEIGHT proportional to midget ganglion cell density, so the
+fovea simply counts for more. Separately they convolve the RECONSTRUCTION with
+the eye's optical point spread function (a Gaussian of 0.6 pixels) before
+comparing it with the sharp target, so the panel must produce a field that is
+correct after the eye blurs it. Their own ablation finds the PSF term is worth
+more than the foveation term.
+
+Blurring the target and weighting the loss are not two routes to the same place.
+Weighting reallocates effort; blurring destroys information.
+
+### Process: read the equation the survey points at, before writing the code
+
+`docs/research_foveated_holography.md` already named Chakravarthula et al.
+(arXiv:2108.06192) as THE foveated-CGH reference, with the relevant equation
+numbers, "Eq. 8-9", written out. I designed and built a foveation scheme
+without opening it, got a negative result, and only then read the paper --
+which says plainly to weight the loss and keep the full-detail target, the
+opposite of what I had built.
+
+The survey was in the repository and correct. The cost was a wrong
+implementation and roughly two hours of GPU time, both avoidable by reading one
+equation first.
+
+Rule: when a survey in this repository points at a specific equation in a
+specific paper, read that equation before writing the code that replaces it.
+
+### Measured: the Gaussian rasteriser was launch-bound, not arithmetic-bound
+
+The per-primitive Python loop cost about 100 microseconds per Gaussian on the
+CPU and 435 on the GPU, and -- the diagnostic detail -- the SAME whether the
+splat covered 4 pixels or 21. A cost independent of the work done is not
+arithmetic, it is overhead. That is also why the GPU was four times slower than
+the CPU: thousands of tiny kernels, each mostly launch latency.
+
+Compositing a chunk of primitives at once, with an exclusive cumulative product
+of (1 - alpha), took 4000 Gaussians at 256 squared from 1764 ms to 41 ms on the
+GPU, a factor of 43.
+
+The same change is 25x SLOWER on the CPU (399 ms to 10042 ms), because dense
+evaluation does about three thousand times more arithmetic for a four-pixel
+splat and a CPU has none to spare. Accepted deliberately: the real workload is
+on the GPU, and a second compositing path would be a correctness risk for a
+case nobody uses.
+
+Lesson worth keeping: when a cost per item does not move with the size of the
+item, stop optimising the arithmetic and count the launches.
+
+### A test that passes because it renders nothing
+
+The equivalence test for the vectorised rasteriser put its Gaussians at z = +6
+and used the test-suite camera helper, which looks along -Z. Every primitive
+was behind the camera, so both the new and the reference implementation
+returned a blank image, and the test compared zeros with zeros and passed.
+
+It would have kept passing through any rewrite of the compositing maths.
+
+The fix is not just the sign: every image-comparison test now asserts that the
+render is non-blank BEFORE comparing. A comparison test needs a liveness check,
+or it silently becomes a tautology.
