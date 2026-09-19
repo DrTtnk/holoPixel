@@ -24,11 +24,38 @@ Conventions, stated once:
   * quaternions are (w, x, y, z) and are normalised on use
   * Gaussians composite front to back, nearest first
 
-Performance: this evaluates each Gaussian over a bounding box rather than
-binning into tiles, so cost grows as the number of Gaussians times their
-projected area. That is ample for scenes of a few thousand primitives and is
-NOT the architecture for a hundred thousand; tiling is the fix when it is
-needed, and it belongs here rather than in a caller.
+Performance. An earlier version looped over primitives in Python, evaluating
+each over its own bounding box. Measured, that cost about 100 microseconds per
+Gaussian on the CPU and 435 on the GPU -- and, tellingly, the SAME whether the
+splat covered 4 pixels or 21. The cost was per-primitive launch overhead, not
+arithmetic, which is why the GPU was four times SLOWER than the CPU: thousands
+of tiny kernels, each mostly latency.
+
+So the loop now runs over chunks of primitives instead, compositing a whole
+chunk at once with an exclusive cumulative product of (1 - alpha). Each
+Gaussian is evaluated over the full frame and masked back to its bounding box,
+which does more arithmetic than the per-box version but in a few hundred
+kernels rather than a few thousand. Arithmetic is the cheap resource here.
+
+Measured on 4000 Gaussians into a 256 square frame: 1764 ms before, 41 ms
+after, a factor of 43, and the per-primitive cost fell from 433 to 10
+microseconds.
+
+The same change makes the CPU path 25 times SLOWER -- 399 ms to 10042 ms --
+because a CPU has no spare arithmetic to trade for launches, and the dense
+evaluation does roughly three thousand times more of it for a four-pixel
+splat. That is accepted rather than fixed: light field generation runs on the
+GPU, the tests render frames of 32 to 64 pixels where it does not matter, and
+carrying a second compositing implementation to serve a case nobody uses would
+risk the two drifting apart. If a large CPU render is ever needed, the answer
+is tiling, not a second code path.
+
+What this does NOT fix: work grows as the number of Gaussians times the FRAME
+area, not times the projected area, so a hundred thousand primitives at 512
+squared is out of reach. The backward pass binds sooner still, because autograd
+keeps every chunk's intermediates alive, so peak training memory scales the
+same way. Tile binning answers all three -- CPU cost, large N, and backward
+memory -- and belongs here rather than in a caller.
 """
 
 from dataclasses import dataclass
@@ -43,6 +70,12 @@ CUTOFF_SIGMA = 3.0
 
 # Screen-space low-pass dilation, in pixels squared. Kerbl et al. 2023.
 DILATION_PX2 = 0.3
+
+# How many elements a single chunk's working tensors may reach. The chunk size
+# follows from this and the frame area, so a big frame automatically takes
+# fewer primitives per pass and peak memory stays put instead of tracking
+# resolution. Nine or so tensors of this size are live at once.
+CHUNK_ELEMENTS = 1 << 22
 
 
 @dataclass
@@ -147,7 +180,9 @@ def render(scene, camera, background=None):
 
     Differentiable in every scene parameter. The depth SORT is not
     differentiable, which is standard and correct: ordering is discrete, and
-    gradients flow through the blend given the order.
+    gradients flow through the blend given the order. Nor is the bounding box,
+    whose edges are floors and ceilings of the projected mean -- also as
+    before, when those edges were Python integers.
     """
     H, W = camera.height, camera.width
     dtype, device = scene.position.dtype, scene.position.device
@@ -167,53 +202,65 @@ def render(scene, camera, background=None):
     cov2d = cov2d + torch.eye(2, dtype=dtype, device=device) * DILATION_PX2
 
     order = torch.argsort(torch.where(visible, depth, torch.full_like(depth, np.inf)))
+    order = order[visible[order]]                      # nearest first, visible only
+
+    S = cov2d[order]
+    det = S[:, 0, 0] * S[:, 1, 1] - S[:, 0, 1] * S[:, 1, 0]
+    inv_xx, inv_xy, inv_yy = S[:, 1, 1] / det, -S[:, 0, 1] / det, S[:, 0, 0] / det
+
+    # The ellipse is bounded by the LARGEST EIGENVALUE, not by the largest
+    # diagonal entry. For [[a, b], [b, d]] they coincide only when b = 0, i.e.
+    # when the projected ellipse happens to be axis-aligned on screen. A tilted
+    # anisotropic Gaussian is the common case in a fitted scene, and using the
+    # diagonal clipped it by up to 29%, visible as a straight cut across the
+    # blob and as zero gradient outside the box.
+    trace = S[:, 0, 0] + S[:, 1, 1]
+    lam_max = 0.5 * (trace + torch.sqrt(torch.clamp(trace ** 2 - 4 * det, min=0.0)))
+    radius = CUTOFF_SIGMA * torch.sqrt(lam_max)
+
+    mu = mean_px[order]
+    colour, opacity = scene.colour[order], scene.opacity[order]
+    lo_c, hi_c = torch.floor(mu[:, 0] - radius), torch.ceil(mu[:, 0] + radius)
+    lo_r, hi_r = torch.floor(mu[:, 1] - radius), torch.ceil(mu[:, 1] + radius)
+
     yy, xx = torch.meshgrid(torch.arange(H, device=device, dtype=dtype),
                             torch.arange(W, device=device, dtype=dtype),
                             indexing="ij")
+    col = xx[None]
+    row = yy[None]
 
-    for i in order.tolist():
-        if not bool(visible[i]):
-            continue
-        S = cov2d[i]
-        det = S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0]
-        inv = torch.stack([torch.stack([S[1, 1], -S[0, 1]]),
-                           torch.stack([-S[1, 0], S[0, 0]])]) / det
+    n = order.shape[0]
+    step = max(1, CHUNK_ELEMENTS // (H * W))
+    for start in range(0, n, step):
+        s = slice(start, start + step)
+        dx = col - mu[s, 0, None, None]
+        dy = row - mu[s, 1, None, None]
+        power = -0.5 * (inv_xx[s, None, None] * dx * dx
+                        + 2 * inv_xy[s, None, None] * dx * dy
+                        + inv_yy[s, None, None] * dy * dy)
 
-        # The ellipse is bounded by the LARGEST EIGENVALUE, not by the largest
-        # diagonal entry. For [[a, b], [b, d]] they coincide only when b = 0,
-        # i.e. when the projected ellipse happens to be axis-aligned on screen.
-        # A tilted anisotropic Gaussian is the common case in a fitted scene,
-        # and using the diagonal clipped it by up to 29%, visible as a straight
-        # cut across the blob and as zero gradient outside the box.
-        trace = S[0, 0] + S[1, 1]
-        lam_max = 0.5 * (trace + torch.sqrt(torch.clamp(trace ** 2 - 4 * det, min=0.0)))
-        radius = CUTOFF_SIGMA * torch.sqrt(lam_max)
-        c0 = int(max(0, torch.floor(mean_px[i, 0] - radius).item()))
-        c1 = int(min(W, torch.ceil(mean_px[i, 0] + radius).item() + 1))
-        r0 = int(max(0, torch.floor(mean_px[i, 1] - radius).item()))
-        r1 = int(min(H, torch.ceil(mean_px[i, 1] + radius).item() + 1))
-        if c0 >= c1 or r0 >= r1:
-            continue
+        # Exactly the old per-primitive bounding box, expressed as a mask: a
+        # pixel was included iff its integer coordinate fell within the floored
+        # and ceiled extent of the projected mean. Keeping the rectangle rather
+        # than switching to a clean elliptical cutoff is deliberate -- it makes
+        # this a pure speed change, provable against the old behaviour.
+        inside = ((col >= lo_c[s, None, None]) & (col <= hi_c[s, None, None])
+                  & (row >= lo_r[s, None, None]) & (row <= hi_r[s, None, None]))
+        alpha = opacity[s, None, None] * torch.exp(torch.clamp(power, max=0.0))
+        alpha = torch.where(inside, alpha, torch.zeros_like(alpha))
 
-        dx = xx[r0:r1, c0:c1] - mean_px[i, 0]
-        dy = yy[r0:r1, c0:c1] - mean_px[i, 1]
-        power = -0.5 * (inv[0, 0] * dx * dx + 2 * inv[0, 1] * dx * dy
-                        + inv[1, 1] * dy * dy)
-        alpha = scene.opacity[i] * torch.exp(torch.clamp(power, max=0.0))
+        # Front-to-back compositing, in closed form rather than by recursion:
+        # the light reaching primitive k is the product of (1 - alpha) over
+        # every nearer one, which is an EXCLUSIVE cumulative product. Built by
+        # shifting the inclusive one rather than dividing by alpha, because the
+        # division is unbounded wherever a primitive is opaque.
+        one_minus = 1 - alpha
+        inclusive = torch.cumprod(one_minus, dim=0)
+        exclusive = torch.cat([torch.ones_like(inclusive[:1]), inclusive[:-1]], dim=0)
 
-        # Slice assignment, NOT Tensor.index_put: the out-of-place form clones
-        # the whole image for every primitive, so cost scaled with frame area
-        # rather than with the Gaussian's footprint -- measured at 6.07 ms per
-        # call against 0.008 ms for this, a factor of 755.
-        # The patches are CLONED before the write. Autograd saves the views it
-        # needs for the backward pass, and overwriting a slice in place would
-        # invalidate the very view the blend depends on. Cloning a bounding box
-        # is cheap; cloning the frame, which index_put did, was not.
-        patch_image = image[r0:r1, c0:c1].clone()
-        patch_T = transmittance[r0:r1, c0:c1].clone()
-        image[r0:r1, c0:c1] = patch_image + \
-            (patch_T * alpha)[:, :, None] * scene.colour[i]
-        transmittance[r0:r1, c0:c1] = patch_T * (1 - alpha)
+        weight = alpha * exclusive * transmittance[None]
+        image = image + torch.einsum("khw,kc->hwc", weight, colour[s])
+        transmittance = transmittance * inclusive[-1]
 
     if background is not None:
         image = image + transmittance[:, :, None] * background

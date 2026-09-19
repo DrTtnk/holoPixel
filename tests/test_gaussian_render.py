@@ -407,3 +407,125 @@ def test_rendering_stays_differentiable_after_the_in_place_write():
     for t in (scene.position, scene.scale):
         assert t.grad is not None and torch.isfinite(t.grad).all()
         assert t.grad.abs().max() > 0
+
+
+# ---------------------------------------------------------------------------
+# The rasteriser composites a chunk at a time with a cumulative product rather
+# than one primitive at a time. That is a pure speed change, so it has to agree
+# with the compositing definition written out longhand.
+# ---------------------------------------------------------------------------
+
+def _composite_longhand(scene, camera):
+    """
+    sum_i c_i a_i prod_(j<i) (1 - a_j), evaluated with an explicit Python loop
+    over primitives in depth order. Deliberately naive and deliberately not
+    sharing code with `render`, so agreement means something.
+    """
+    from tier1_gaussians.render import (CUTOFF_SIGMA, DILATION_PX2,
+                                        project_gaussians)
+    H, W = camera.height, camera.width
+    mean_px, cov2d, depth, visible = project_gaussians(scene, camera)
+    cov2d = cov2d + torch.eye(2, dtype=cov2d.dtype) * DILATION_PX2
+
+    image = np.zeros((H, W, 3))
+    trans = np.ones((H, W))
+    order = np.argsort(np.where(visible.numpy(), depth.detach().numpy(), np.inf))
+
+    for i in order:
+        if not bool(visible[i]):
+            continue
+        S = cov2d[i].detach().numpy()
+        det = S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0]
+        inv = np.array([[S[1, 1], -S[0, 1]], [-S[1, 0], S[0, 0]]]) / det
+        lam_max = np.linalg.eigvalsh(S).max()
+        radius = CUTOFF_SIGMA * np.sqrt(lam_max)
+        u, v = mean_px[i].detach().numpy()
+
+        cols = np.arange(W)[None, :]
+        rows = np.arange(H)[:, None]
+        dx, dy = cols - u, rows - v
+        power = -0.5 * (inv[0, 0] * dx ** 2 + 2 * inv[0, 1] * dx * dy + inv[1, 1] * dy ** 2)
+        inside = ((cols >= np.floor(u - radius)) & (cols <= np.ceil(u + radius))
+                  & (rows >= np.floor(v - radius)) & (rows <= np.ceil(v + radius)))
+        alpha = np.where(inside, float(scene.opacity[i]) * np.exp(np.minimum(power, 0.0)), 0.0)
+
+        image += (trans * alpha)[:, :, None] * scene.colour[i].detach().numpy()
+        trans = trans * (1 - alpha)
+    return image, trans
+
+
+@pytest.mark.parametrize("n", [1, 5, 40])
+def test_chunked_compositing_equals_the_longhand_sum(n):
+    g = torch.Generator().manual_seed(7 + n)
+    r = lambda *s: torch.rand(*s, generator=g, dtype=torch.float64)
+    scene = GaussianScene(
+        position=(r(n, 3) - 0.5) * 3 - torch.tensor([0.0, 0.0, 6.0], dtype=torch.float64),
+        quaternion=r(n, 4) - 0.5,
+        scale=0.05 * (0.5 + r(n, 3)),
+        opacity=0.2 + 0.6 * r(n),
+        colour=r(n, 3))
+    cam = a_camera(width=48, height=48)
+
+    got = render(scene, cam).detach().numpy()
+    want, _ = _composite_longhand(scene, cam)
+    # Guard against the test passing by rendering nothing: this camera looks
+    # along -Z, and an earlier version of this scene sat behind it, so the
+    # comparison was between two blank images and could not fail.
+    assert got.max() > 0.05, "the scene must actually be in front of the camera"
+    assert np.allclose(got, want, atol=1e-12), f"max diff {np.abs(got - want).max():.3e}"
+
+
+def test_chunking_does_not_change_the_result():
+    """The chunk size is a memory knob; it must not be a correctness knob."""
+    import tier1_gaussians.render as R
+    g = torch.Generator().manual_seed(3)
+    r = lambda *s: torch.rand(*s, generator=g, dtype=torch.float64)
+    n = 30
+    scene = GaussianScene(
+        position=(r(n, 3) - 0.5) * 3 - torch.tensor([0.0, 0.0, 6.0], dtype=torch.float64),
+        quaternion=r(n, 4) - 0.5, scale=0.06 * (0.5 + r(n, 3)),
+        opacity=0.2 + 0.6 * r(n), colour=r(n, 3))
+    cam = a_camera(width=40, height=40)
+
+    original = R.CHUNK_ELEMENTS
+    try:
+        R.CHUNK_ELEMENTS = 1 << 22
+        big = render(scene, cam)
+        R.CHUNK_ELEMENTS = 40 * 40            # exactly one primitive per chunk
+        one = render(scene, cam)
+        R.CHUNK_ELEMENTS = 40 * 40 * 7
+        seven = render(scene, cam)
+    finally:
+        R.CHUNK_ELEMENTS = original
+
+    assert float(big.max()) > 0.05, "the scene must actually be in front of the camera"
+    assert torch.allclose(big, one, atol=1e-12)
+    assert torch.allclose(big, seven, atol=1e-12)
+
+
+def test_an_opaque_near_primitive_still_blocks_across_a_chunk_boundary():
+    """
+    The running transmittance has to survive between chunks. If it did not,
+    a blocker in chunk 0 would stop hiding things in chunk 1.
+    """
+    import tier1_gaussians.render as R
+    cam = a_camera(width=32, height=32)
+    scene = GaussianScene(
+        position=torch.tensor([[0.0, 0.0, -3.0], [0.0, 0.0, -6.0]], dtype=torch.float64),
+        quaternion=torch.tensor([[1.0, 0, 0, 0]] * 2, dtype=torch.float64),
+        scale=torch.full((2, 3), 0.4, dtype=torch.float64),
+        opacity=torch.tensor([1.0, 1.0], dtype=torch.float64),
+        colour=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=torch.float64))
+
+    original = R.CHUNK_ELEMENTS
+    try:
+        R.CHUNK_ELEMENTS = 32 * 32            # one primitive per chunk: they split
+        split = render(scene, cam)
+        R.CHUNK_ELEMENTS = 1 << 22            # both in one chunk
+        together = render(scene, cam)
+    finally:
+        R.CHUNK_ELEMENTS = original
+
+    assert torch.allclose(split, together, atol=1e-12)
+    centre = split[16, 16]
+    assert float(centre[0]) > 0.9 and float(centre[1]) < 0.05, "the near red one must win"
