@@ -23,8 +23,6 @@ import numpy as np  # noqa: E402
 
 import lf_evaluate as ev  # noqa: E402
 import lf_pipeline as lp  # noqa: E402
-import mla_design as mla  # noqa: E402
-import mla_mesh  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
 FOV_DEG = 90.0
@@ -68,16 +66,13 @@ def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, sam
     ev.validate_surfaces(remapper)
     work = Path(work) / name
     work.mkdir(parents=True, exist_ok=True)
-    radius = mla.radius_for_focal_length_um(float(design["focal_um"]), spec.LENS_INDEX)
-    mesh = mla_mesh.build(panel_um=spec.PANEL_MM * 1e3, side_um=spec.LENS_SIDE_UM, radius_um=radius,
-                          min_thickness_um=spec.LENS_MIN_THICKNESS_UM, subdivisions=2)
+    mesh, gap, _ = ev.lenslet_array(design, spec.PANEL_MM * 1e3, 2)
     np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
              face_lens=mesh.face_lens)
     np.save(work / "panel.npy", test_chart() if panel_rgb is None else panel_rgb.astype(np.float32))
     blend = out_dir / f"{name}.blend"
     cfg = {"mode": "display", "mla_npz": str(work / "mla_mesh.npz"), "index": spec.LENS_INDEX,
-           "panel_pose": design["panel_pose"], "gap_um": mla.back_focal_gap_um(radius, spec.LENS_INDEX,
-                                                                                mesh.centre_thickness),
+           "panel_pose": design["panel_pose"], "gap_um": gap,
            "panel_pixels": spec.PANEL_PIXELS, "pixel_um": spec.PIXEL_UM,
            "camera": {"resolution": resolution, "fov_deg": FOV_DEG}, "views_mm": [[0.0, 0.0]],
            "tmp_dir": str(work / "exr"), "remapper_npz": str(remapper), "panel_image_npy": str(work / "panel.npy"),

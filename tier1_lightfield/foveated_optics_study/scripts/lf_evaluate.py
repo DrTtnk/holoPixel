@@ -3,7 +3,8 @@
     python lf_evaluate.py <design_dir> [--work <dir>] [--pixels 2044]
 
 <design_dir>/design.json:
-    {"focal_um": lenslet focal length,
+    {"focal_um": lenslet focal length        (a uniform array), or
+     "lenslets": "variable_retina"           (foveation_target.lenslet_focal_of_radius_um),
      "panel_pose": {"origin_mm": [x, y, z], "basis": [u_world, v_world, w_world]},
      "remapper_npz": "remapper.npz"}          (relative to design_dir)
 
@@ -123,12 +124,7 @@ def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0
     design = json.loads((design_dir / "design.json").read_text())
     remapper = (design_dir / design["remapper_npz"]).resolve()
     validate_surfaces(remapper)
-    focal = float(design["focal_um"])
-    radius = mla.radius_for_focal_length_um(focal, INDEX)
-    panel_um = panel_pixels * PIXEL_UM
-    mesh = mla_mesh.build(panel_um=panel_um, side_um=SIDE_UM, radius_um=radius,
-                          min_thickness_um=MIN_THICKNESS_UM, subdivisions=subdivisions)
-    gap = mla.back_focal_gap_um(radius, INDEX, mesh.centre_thickness)
+    mesh, gap, lenslets = lenslet_array(design, panel_pixels * PIXEL_UM, subdivisions)
     work.mkdir(parents=True, exist_ok=True)
     np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
              face_lens=mesh.face_lens)
@@ -143,12 +139,32 @@ def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0
     lp.run_blender(cfg, work)
     report = metrics(work / "views", views, mesh.centres, panel_pixels)
     report["geometry"] = geometry(design, remapper, mesh, gap)
-    report["design"] = {"focal_um": focal, "gap_um": gap, "radius_um": radius,
-                        "centre_thickness_um": mesh.centre_thickness, "n_views": len(views),
+    report["design"] = {**lenslets, "gap_um": gap, "centre_thickness_um": mesh.centre_thickness,
+                        "n_views": len(views),
                         "panel_pixels": panel_pixels, "resolution": resolution}
     report["accept"] = acceptance(report)
     (work / "report.json").write_text(json.dumps(report, indent=1))
     return report
+
+
+def lenslet_array(design, panel_um, subdivisions):
+    """The design's lenslet array: exactly one of "focal_um" (uniform) or
+    "lenslets": "variable_retina". Returns the mesh, the air gap and a summary."""
+    kinds = [k for k in ("focal_um", "lenslets") if k in design]
+    if len(kinds) != 1:
+        raise ValueError(f"design.json needs exactly one of focal_um, lenslets; has {kinds}")
+    if kinds[0] == "focal_um":
+        focal = float(design["focal_um"])
+        radius = mla.radius_for_focal_length_um(focal, INDEX)
+        mesh = mla_mesh.build(panel_um=panel_um, side_um=SIDE_UM, radius_um=radius,
+                              min_thickness_um=MIN_THICKNESS_UM, subdivisions=subdivisions)
+        return mesh, mla.back_focal_gap_um(radius, INDEX, mesh.centre_thickness), {"focal_um": focal}
+    if design["lenslets"] != "variable_retina":
+        raise ValueError(f"unknown lenslets {design['lenslets']!r}")
+    v = mla_mesh.build_variable(panel_um=panel_um, side_um=SIDE_UM, focal_of_radius=ft.lenslet_focal_of_radius_um,
+                                index=INDEX, min_thickness_um=MIN_THICKNESS_UM, subdivisions=subdivisions)
+    return v.mesh, v.gap_um, {"lenslets": "variable_retina", "focal_um_range": [float(v.focal_um.min()),
+                                                                                 float(v.focal_um.max())]}
 
 
 def metrics(view_dir, views, centres, panel_pixels):

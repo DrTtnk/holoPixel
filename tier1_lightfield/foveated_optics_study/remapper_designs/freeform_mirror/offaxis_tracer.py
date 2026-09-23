@@ -32,6 +32,8 @@ class Batch(NamedTuple):
     xy: torch.Tensor      # (B, S, I, J) coefficient of x^i y^j
     n: torch.Tensor       # (B, S) index after each surface
     mirror: tuple         # (S,) static: which surfaces reflect
+    image_sag: tuple = () # optional (r_grid, sag) mm: a radial tabulated image surface
+                          # (shared by the batch), replacing the last surface's shape
 
 
 def pack(prescriptions, device):
@@ -113,6 +115,25 @@ def _newton(o, d, c, k, C, t):
 _newton_fused = torch.compile(_newton, dynamic=True)
 
 
+def table_sag(x, y, grid, table):
+    """Radial tabulated sag, linear in r between grid points: sag, gradient and
+    the domain mask (r inside the table)."""
+    r = torch.sqrt(x**2 + y**2)
+    ok = r <= grid[-1]
+    i = torch.clamp(torch.searchsorted(grid, r.detach().contiguous()) - 1, 0, len(grid) - 2)
+    g0, g1, s0, s1 = grid[i], grid[i + 1], table[i], table[i + 1]
+    slope = (s1 - s0) / (g1 - g0)
+    s = s0 + (r - g0) * slope
+    rr = torch.clamp(r, min=1e-12)
+    return s, slope * x / rr, slope * y / rr, ok
+
+
+def _newton_table(o, d, grid, table, t):
+    p = o + t[..., None] * d
+    s, sx, sy, _ = table_sag(p[..., 0], p[..., 1], grid, table)
+    return t - (p[..., 2] - s) / (d[..., 2] - sx * d[..., 0] - sy * d[..., 1])
+
+
 def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
     """fields_deg (F, 2) as (theta_x, theta_y); pupil (P, 2) normalised.
     Returns the landing (B, F, P, 2) in the image surface's local (x, y), the
@@ -136,18 +157,23 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
         a = batch.rx[:, s, None, None]
         c, k, C = batch.c[:, s, None, None], batch.k[:, s, None, None], batch.xy[:, s, None, None]
         ol, dl = _rot_x(o - origin, -a), _rot_x(d, -a)                    # local frame
+        tabulated = s == S - 1 and len(batch.image_sag) == 2
+        step = (lambda o_, d_, t_: _newton_table(o_, d_, *batch.image_sag, t_)) if tabulated else \
+            (lambda o_, d_, t_: _newton_fused(o_, d_, c, k, C, t_))  # noqa: E731
         with torch.no_grad():
             t = -ol[..., 2] / dl[..., 2]
             for _ in range(NEWTON_STEPS - GRAD_STEPS):
-                t = _newton_fused(ol.detach(), dl.detach(), c.detach(), k.detach(), C.detach(), t)
+                t = step(ol.detach(), dl.detach(), t) if tabulated else \
+                    _newton_fused(ol.detach(), dl.detach(), c.detach(), k.detach(), C.detach(), t)
             # every forward value stays finite, so the backward pass is finite too
             finite = torch.isfinite(t)
             t = torch.where(finite, t, torch.zeros_like(t))
         alive = alive & finite
         for _ in range(GRAD_STEPS):
-            t = _newton_fused(ol, dl, c, k, C, t)
+            t = step(ol, dl, t)
         p = ol + t[..., None] * dl
-        f, sx, sy, in_domain = sag(p[..., 0], p[..., 1], c, k, C)
+        f, sx, sy, in_domain = (table_sag(p[..., 0], p[..., 1], *batch.image_sag) if tabulated
+                                else sag(p[..., 0], p[..., 1], c, k, C))
         if diagnostics:
             domain.append(1.0 - (1.0 + k) * c * c * (p[..., 0] ** 2 + p[..., 1] ** 2))
         converged = (p[..., 2] - f).abs() < 1e-9

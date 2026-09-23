@@ -36,7 +36,7 @@ def test_the_prescription_traces_exactly_like_the_parameter_batch(designs, devic
     lay, x, idx = designs
     ctx = fs.context(device)
     direct = ot.trace(fs.to_batch(x, idx, lay), ctx["fields"], ctx["pupil"])
-    packed = ot.pack([fs.to_prescription(x[b], idx[b], lay) for b in range(len(x))], device)
+    packed = fs.pack([fs.to_prescription(x[b], idx[b], lay) for b in range(len(x))], device)
     via = ot.trace(packed, ctx["fields"], ctx["pupil"])
     assert torch.equal(direct[2], via[2])
     ok = direct[2]
@@ -53,19 +53,22 @@ def test_merit_and_its_gradient_are_finite_on_random_seeds(designs, device):
 
 
 def test_pupil_cells_follow_the_pixel_footprint_on_the_pupil():
-    """Centre: the pixel's footprint on the pupil, 7.2 um * F / f_lenslet, is far
-    larger than the 4 mm pupil: one cell. Field edge: the lenslet is chosen so
-    the pupil fills one lens pitch, 36 um = 5 pixels, so the footprint is 4/5 mm:
-    5 x 5 squares, of which those that hold hexagonal pupil points survive."""
+    """The variable-focal lenslets make the pupil fill one lens pitch (36 um =
+    5 pixels) everywhere, so a pixel's footprint on the pupil is 4/5 mm at every
+    field inside 35 deg: 5 x 5 squares, of which those that hold hexagonal pupil
+    points survive."""
     pupil = fs.pupil_samples()
-    ids, _ = fs.pupil_cells(np.array([[0.0, 0.0], [35.0, 0.0]]), pupil)
-    assert len(np.unique(ids[0])) == 1
-    side = 7.2 * float(fs.ft.local_focal_mm(np.radians(35.0))) / fs.LENSLET_FOCAL_UM
-    assert side == pytest.approx(4.0 / 5.0, rel=1e-9)
+    fields = np.array([[0.0, 0.0], [10.0, 0.0], [35.0, 0.0]])
+    ids, _ = fs.pupil_cells(fields, pupil)
     uv = pupil * 2.0 + 2.0
-    n = math.ceil(4.0 / side - 1e-9)                         # points on the far rim belong to the last cell
-    expected = len({(min(int(u / side), n - 1), min(int(v / side), n - 1)) for u, v in uv})
-    assert len(np.unique(ids[1])) == expected
+    for f, (fx, fy) in enumerate(fields):
+        ecc = np.arctan(np.hypot(np.tan(np.radians(fx)), np.tan(np.radians(fy))))
+        side = 7.2 * float(fs.ft.local_focal_mm(ecc)) / float(
+            fs.ft.lenslet_focal_of_radius_um(fs.ft.panel_radius_mm(ecc) * 1e3))
+        assert side == pytest.approx(4.0 / 5.0, rel=1e-6)
+        n = max(1, math.ceil(4.0 / side))                    # points on the far rim belong to the last cell
+        expected = len({(min(int(u / side), n - 1), min(int(v / side), n - 1)) for u, v in uv})
+        assert len(np.unique(ids[f])) == expected
 
 
 def test_cell_blur_is_the_rms_angle_about_each_cells_centroid(device):
@@ -101,3 +104,22 @@ def test_panel_corners_lie_on_the_image_plane(designs, device):
     assert np.einsum("bkc,bc->bk", corners - origin[:, None], normal) == pytest.approx(0.0, abs=1e-12)
     side = np.linalg.norm(corners[:, 1] - corners[:, 0], axis=-1)
     assert side == pytest.approx(18.432, abs=1e-9)
+
+
+def test_the_image_surface_is_the_lens_vertex_bowl(designs, device):
+    """Traced landings lie on the variable-focal array's vertex profile: local z
+    of the hit = (h(r) - h(0)) mm, the lenses standing up towards the light."""
+    lay, x, idx = designs
+    _, d_img, alive, diag = ot.trace(fs.to_batch(x, idx, lay), fs.context(device)["fields"],
+                                     fs.context(device)["pupil"], diagnostics=True)
+    assert bool((d_img[..., 2][alive] < 0).all())                        # light arrives along -z
+    batch = fs.to_batch(x, idx, lay)
+    p = diag["points"][:, -1]                                            # global
+    a = batch.rx[:, -1, None, None]
+    y = p[..., 1] - batch.y[:, -1, None, None]
+    z = p[..., 2] - batch.z[:, -1, None, None]
+    local = torch.stack([p[..., 0], y * torch.cos(a) + z * torch.sin(a), -y * torch.sin(a) + z * torch.cos(a)], -1)
+    r = torch.linalg.norm(local[..., :2], dim=-1)[alive].cpu().numpy()
+    expected = np.interp(r, fs.BOWL_R_MM, fs.BOWL_SAG_MM)
+    assert local[..., 2][alive].cpu().numpy() == pytest.approx(expected, abs=1e-9)
+    assert fs.BOWL_SAG_MM[0] == 0.0 and fs.BOWL_SAG_MM[-1] < -1.0          # ~1.5 mm deep

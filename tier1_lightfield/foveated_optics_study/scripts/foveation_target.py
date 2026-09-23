@@ -27,7 +27,9 @@ _R_UNIT = np.concatenate([[0.0], np.cumsum(0.5 * (_S[1:] + _S[:-1]) * np.diff(_T
 F0_MM = HALF_PANEL_MM / np.interp(EDGE_RAD, _TH, _R_UNIT)
 SAMPLING_OVER_RETINA = LENS_NEIGHBOUR_MM / F0_MM / np.radians(_P0)
 WAVELENGTH_MM = 0.55e-3
-AIRY_RAD = 1.22 * WAVELENGTH_MM / spec.PUPIL_DIAMETER_MM
+# RMS radius (sqrt(2) sigma) of the least-squares Gaussian fit to the Airy pattern:
+# the blur metric is an RMS radius, and the Airy pattern's own diverges.
+DIFFRACTION_RMS_RAD = np.sqrt(2.0) * 0.42 * WAVELENGTH_MM / spec.PUPIL_DIAMETER_MM
 
 
 def local_focal_mm(theta_rad):
@@ -55,8 +57,8 @@ def retina_pitch_rad(theta_x_rad, theta_z_rad):
 
 def blur_tolerance_rad(theta_x_rad, theta_z_rad):
     """Blur the eye cannot see: the retina's own pitch there, but never below
-    the Airy radius of the design pupil, which no optics can beat."""
-    return np.maximum(retina_pitch_rad(theta_x_rad, theta_z_rad), AIRY_RAD)
+    the RMS diffraction blur of the design pupil, which no optics can beat."""
+    return np.maximum(retina_pitch_rad(theta_x_rad, theta_z_rad), DIFFRACTION_RMS_RAD)
 
 
 def lenslet_focal_um():
@@ -72,3 +74,17 @@ def field_to_panel_mm(theta_x, theta_y):
     az = np.arctan2(np.tan(ty), np.tan(tx))
     r = panel_radius_mm(ecc)
     return r * np.cos(az), r * np.sin(az)
+
+
+# The steepest usable plano-convex lenslet: its sphere must reach past the hex
+# corner (and past the panel-border lattice triangles, up to ~1.1 x side).
+LENSLET_MIN_RADIUS_OVER_SIDE = 1.15
+
+
+def lenslet_focal_of_radius_um(r_um):
+    """Variable-focal lenslet array: the lens at panel radius r gets
+    f = pitch F(theta(r)) / D, so the pupil's image fills one lens pitch
+    everywhere (5 x 5 views per lens), floored at the steepest usable lens."""
+    wanted = spec.LENS_PITCH_UM * local_focal_mm(eccentricity_rad(np.asarray(r_um) * 1e-3)) / spec.PUPIL_DIAMETER_MM
+    floor = LENSLET_MIN_RADIUS_OVER_SIDE * spec.LENS_SIDE_UM / (spec.LENS_INDEX - 1.0)
+    return np.maximum(wanted, floor)

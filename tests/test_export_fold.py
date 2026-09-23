@@ -67,17 +67,25 @@ def test_traced_segments_meet_the_exported_meshes_where_the_tracer_says(exported
             assert hit == pytest.approx(np.linalg.norm(wb - wa), abs=2e-3)
 
 
-def test_the_lenslet_array_lies_on_the_image_surface_facing_the_light(exported):
+def test_the_lens_vertices_lie_on_the_image_surface_and_face_the_light(exported):
+    """The variable-focal array stands with its lens vertices on the design's
+    image surface: every traced image point sits at w = h(r) above the array's
+    flat face, h the array's own vertex profile, and the light arrives against w."""
     out, _, pts, _ = exported
-    pose = json.loads((out / "design.json").read_text())["panel_pose"]
-    basis = np.asarray(pose["basis"])
+    design = json.loads((out / "design.json").read_text())
+    assert design["lenslets"] == "variable_retina" and "focal_um" not in design
+    pose = design["panel_pose"]
+    basis, origin = np.asarray(pose["basis"]), np.asarray(pose["origin_mm"])
     assert np.linalg.det(basis) == pytest.approx(1.0, abs=1e-12)          # right-handed: the MLA keeps its winding
-    w = basis[2]
     img = ef.to_world(pts[-1].reshape(-1, 3))
-    offsets = (img - np.asarray(pose["origin_mm"])) @ w
-    assert np.ptp(offsets) < 1e-9                                        # one plane
-    incoming = ef.to_world(pts[-1].reshape(-1, 3)) - ef.to_world(pts[-2].reshape(-1, 3))
-    assert np.all(incoming @ w < 0)                                      # the light arrives against w
+    local = (img - origin) @ basis.T                                     # (u, v, w) mm
+    r_um = np.hypot(local[:, 0], local[:, 1]) * 1e3
+    h_um = ef.mla_mesh.variable_vertex_profile_um(r_um, ef.spec.PANEL_MM * 1e3, ef.spec.LENS_SIDE_UM,
+                                                  fs.ft.lenslet_focal_of_radius_um, ef.spec.LENS_INDEX,
+                                                  ef.spec.LENS_MIN_THICKNESS_UM)
+    assert local[:, 2] * 1e3 == pytest.approx(h_um, abs=0.05)             # 50 nm: the tracer's table step
+    incoming = img - ef.to_world(pts[-2].reshape(-1, 3))
+    assert np.all(incoming @ basis[2] < 0)
 
 
 def test_the_exported_optics_cover_both_halves_of_the_field(exported):
@@ -96,8 +104,8 @@ def test_the_exported_optics_cover_both_halves_of_the_field(exported):
 
 
 def test_the_baffle_hides_the_hardware_from_the_pupil(exported):
-    """Every line of sight from a pupil point to a hardware vertex that lies above
-    the baffle plane and in front of the face plane meets the baffle first."""
+    """Every line of sight from any pupil sample point to a hardware vertex that
+    lies above the baffle plane and in front of the face plane meets the baffle first."""
     _, r, _, _ = exported
     k = int(r["n_surfaces"]) - 1
     assert str(r[f"surf{k}_kind"]) == "absorber"
@@ -108,11 +116,12 @@ def test_the_baffle_hides_the_hardware_from_the_pupil(exported):
     t = to_tracer(hw)
     above = (fs.baffle_plane(torch.tensor(t)).numpy() > 0) & (t[:, 2] >= fs.MIN_Z_MM)
     checked = 0
-    for i in rng.choice(np.nonzero(above)[0], 40, replace=False):
-        for px, py in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0)):
+    pupil = fs.pupil_samples()
+    for i in rng.choice(np.nonzero(above)[0], 25, replace=False):
+        for px, py in pupil:
             start = ef.to_world(np.array([px * 2.0, py * 2.0, 0.0]))
             seg = hw[i] - start
             d = seg / np.linalg.norm(seg)
             assert ev._axis_hit_mm(bv, bf, start, d) < np.linalg.norm(seg) - 1e-6
             checked += 1
-    assert checked == 120
+    assert checked == 25 * len(pupil)

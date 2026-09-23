@@ -62,16 +62,32 @@ def test_the_display_samples_the_retina_at_one_constant_factor():
     assert 1.8 < factor[0] < 2.2
 
 
-def test_blur_tolerance_is_the_retina_clipped_at_the_diffraction_limit():
-    """The retinal pitch, but never below the Airy radius of the design pupil
-    (1.22 lambda / D, 0.58 arcmin for 4 mm at 550 nm): no optics can do better."""
+def test_the_diffraction_floor_is_the_rms_radius_of_the_best_gaussian_fit_to_airy():
+    """The blur metric is an RMS radius, and the Airy pattern has none (its tail
+    makes the second moment diverge), so the floor is the RMS radius sqrt(2) sigma
+    of the least-squares Gaussian fit to the Airy intensity. Fit it numerically."""
+    from scipy.optimize import curve_fit
+    from scipy.special import j1
+    lam, D = ft.WAVELENGTH_MM, spec.PUPIL_DIAMETER_MM
+    theta = np.linspace(1e-9, 3.0 * lam / D, 4001)                      # out to ~2.5 dark rings
+    x = np.pi * D * theta / lam
+    airy = (2.0 * j1(x) / x) ** 2
+    weight = theta                                                       # least squares over the 2D plane
+    (amp, sigma), _ = curve_fit(lambda t, a, s: a * np.exp(-t**2 / (2 * s**2)), theta, airy,
+                                p0=(1.0, 0.4 * lam / D), sigma=1.0 / np.sqrt(weight))
+    assert sigma / (lam / D) == pytest.approx(0.42, rel=0.03)
+    assert ft.DIFFRACTION_RMS_RAD == pytest.approx(np.sqrt(2.0) * sigma, rel=0.03)
+
+
+def test_blur_tolerance_is_the_retina_clipped_at_the_rms_diffraction_floor():
+    """The retinal pitch, never below the diffraction floor. With a 4 mm pupil the
+    floor (0.28 arcmin) is below the finest retinal pitch (0.46 arcmin), so the
+    retina sets the tolerance everywhere."""
     tx = np.radians(np.array([0.0, 0.5, 5.0, 20.0, 35.0]))
     tz = np.zeros_like(tx)
     retina = np.radians(square_equivalent_pitch_deg(np.degrees(tx), 0.0))
-    airy = 1.22 * 0.55e-3 / spec.PUPIL_DIAMETER_MM
-    assert ft.blur_tolerance_rad(tx, tz) == pytest.approx(np.maximum(retina, airy), rel=1e-12)
-    assert ft.blur_tolerance_rad(0.0, 0.0) == pytest.approx(airy, rel=1e-12)     # the fovea is diffraction-limited
-    assert np.all(ft.blur_tolerance_rad(tx[2:], tz[2:]) == pytest.approx(retina[2:], rel=1e-12))
+    assert ft.blur_tolerance_rad(tx, tz) == pytest.approx(np.maximum(retina, ft.DIFFRACTION_RMS_RAD), rel=1e-12)
+    assert np.all(retina > ft.DIFFRACTION_RMS_RAD)
 
 
 def test_lenslet_focal_length_lets_the_pupil_fill_one_lens_at_the_field_edge():
@@ -80,3 +96,18 @@ def test_lenslet_focal_length_lets_the_pupil_fill_one_lens_at_the_field_edge():
     f = ft.lenslet_focal_um()
     edge = ft.local_focal_mm(np.radians(35.0))
     assert f * spec.PUPIL_DIAMETER_MM / edge == pytest.approx(spec.LENS_PITCH_UM, rel=1e-12)
+
+
+def test_variable_lenslets_follow_the_local_focal_length_down_to_a_hemisphere_floor():
+    """Lens at panel radius r: f = pitch F(theta(r)) / D, so the pupil fills one
+    lens pitch everywhere; but a plano-convex lens cannot be steeper than a
+    sphere reaching past its hex corner, so f stops at the floor."""
+    import mla_design as mla
+    r_mm = np.array([0.0, 1.0, 5.0, 9.216, 12.0])
+    f = ft.lenslet_focal_of_radius_um(r_mm * 1e3)
+    wanted = spec.LENS_PITCH_UM * ft.local_focal_mm(ft.eccentricity_rad(r_mm)) / spec.PUPIL_DIAMETER_MM
+    floor = mla.focal_length_um(ft.LENSLET_MIN_RADIUS_OVER_SIDE * spec.LENS_SIDE_UM, spec.LENS_INDEX)
+    assert f == pytest.approx(np.maximum(wanted, floor), rel=1e-12)
+    assert f[0] == pytest.approx(spec.LENS_PITCH_UM * ft.F0_MM / spec.PUPIL_DIAMETER_MM, rel=1e-12)
+    assert f[3] == pytest.approx(ft.lenslet_focal_um(), rel=1e-9)       # the field edge is not floored
+    assert f[4] == pytest.approx(floor, rel=1e-12)                       # the panel corner is

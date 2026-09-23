@@ -1,11 +1,12 @@
 """Export one folded-remapper design to the shared evaluator contract (lf_evaluate.py).
 
-    python export_fold.py <best_fold_*.json> <out_dir> [--rank 0] [--focal-um F]
+    python export_fold.py <best_fold_*.json> <out_dir> [--rank 0]
 
 The mirror becomes a freeform sheet, each corrector a closed freeform solid
 (the back surface is sampled along the front surface's local axis), both with
 exact loop normals and sized to the traced footprint plus MARGIN_MM. The
-lenslet array's vertex sits on the design's image surface, facing the light.
+lenslet array is the variable-focal one: its vertex bowl is the design's image
+surface, the centre lens's vertex at the image surface's origin.
 World frame (lf_blender.py): +Y forward, +Z up, pupil at y = PUPIL_Y_MM; the
 tracer frame (z forward, y up) maps by the proper rotation (x, y, z) ->
 (-x, PUPIL_Y_MM + z, y).
@@ -25,7 +26,7 @@ sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
 import fold_search as fs  # noqa: E402
 import lf_pipeline as lp  # noqa: E402
-import mla_design as mla  # noqa: E402
+import mla_mesh  # noqa: E402
 import offaxis_tracer as ot  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
@@ -165,12 +166,12 @@ def baffle_geometry(hardware):
     return verts, faces
 
 
-def export(best_json, out_dir, rank=0, focal_um=fs.LENSLET_FOCAL_UM, device="cuda"):
+def export(best_json, out_dir, rank=0, device="cuda"):
     entry = json.loads(Path(best_json).read_text())[rank]
-    return export_entry(entry, out_dir, focal_um, device, source={"design": Path(best_json).name, "rank": rank})
+    return export_entry(entry, out_dir, device, source={"design": Path(best_json).name, "rank": rank})
 
 
-def export_entry(entry, out_dir, focal_um=fs.LENSLET_FOCAL_UM, device="cuda", source={}):
+def export_entry(entry, out_dir, device="cuda", source={}):
     dev = torch.device(device)
     lay = fs.layout(entry["n_el"])
     x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
@@ -208,14 +209,18 @@ def export_entry(entry, out_dir, focal_um=fs.LENSLET_FOCAL_UM, device="cuda", so
 
     s_img = batch.z.shape[1] - 1
     o, axes = _frame(batch, s_img)
-    toward_light = -np.sign(float(d_img[0, ..., 2].mean())) * axes[2]
+    if not bool((d_img[0, ..., 2] < 0).all()):
+        raise ValueError("light must reach the image surface along its local -z (the bowl faces +z)")
+    toward_light = axes[2]
     u = axes[0]
     v = np.cross(toward_light, u)
     basis = np.stack([u, v, toward_light]) @ TRACER_TO_WORLD
-    radius = mla.radius_for_focal_length_um(focal_um, spec.LENS_INDEX)
-    thickness_um = spec.LENS_MIN_THICKNESS_UM + float(mla.sag_um(spec.LENS_SIDE_UM, radius))
-    origin = to_world(o) - thickness_um * 1e-3 * basis[2]
-    design = {"focal_um": focal_um, "remapper_npz": "remapper.npz",
+    # the centre lens's vertex sits on the image surface's origin; the bowl follows
+    centre_height_um = float(mla_mesh.variable_vertex_profile_um(0.0, spec.PANEL_MM * 1e3, spec.LENS_SIDE_UM,
+                                                                 fs.ft.lenslet_focal_of_radius_um, spec.LENS_INDEX,
+                                                                 spec.LENS_MIN_THICKNESS_UM))
+    origin = to_world(o) - centre_height_um * 1e-3 * basis[2]
+    design = {"lenslets": fs.LENSLETS, "remapper_npz": "remapper.npz",
               "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
               "source": {**source, "material": entry["material"]}}
     (out / "design.json").write_text(json.dumps(design, indent=1))
@@ -247,9 +252,8 @@ def main():
     ap.add_argument("best_json")
     ap.add_argument("out_dir")
     ap.add_argument("--rank", type=int, default=0)
-    ap.add_argument("--focal-um", type=float, default=fs.LENSLET_FOCAL_UM)
     args = ap.parse_args()
-    print(export(args.best_json, args.out_dir, args.rank, args.focal_um))
+    print(export(args.best_json, args.out_dir, args.rank))
 
 
 if __name__ == "__main__":

@@ -13,7 +13,9 @@ tilts. Plane-symmetric: every surface is an XY polynomial even in x.
 Merit, in the units the acceptance evaluator (lf_evaluate.py) uses:
   blur    per-pixel beam width. A pixel behind a lenslet collects the rays from
           one pupil cell of size pixel * F(theta) / f_lenslet (F: local focal
-          length of the R = 6 target); the rays of a cell must land together.
+          length of the retina-matched target; the variable-focal lenslets make
+          every cell pixel * pupil / pitch = 0.8 mm); the rays of a cell must
+          land together on the image surface, the lens-vertex bowl.
           Their landing spread, mapped to field angle by the design's own
           local Jacobian, is scored against foveation_target.blur_tolerance_rad.
   ratio   the local magnification (singular values of the Jacobian) over the
@@ -40,6 +42,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
 import foveation_target as ft  # noqa: E402
+import mla_mesh  # noqa: E402
 import offaxis_tracer as ot  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
@@ -48,7 +51,15 @@ FIELDS_X_DEG = (0.0, 1.0, 2.5, 5.0, 10.0, 17.0, 24.0, 30.0, 35.0)
 FIELDS_Y_DEG = (-22.5, -15.0, -8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0, 15.0, 22.5)
 FD_DEG = 0.1
 PUPIL_SPACING_MM = 0.4
-LENSLET_FOCAL_UM = ft.lenslet_focal_um()
+LENSLETS = "variable_retina"     # lens focal length follows the local F (foveation_target)
+BOWL_R_MM = np.linspace(0.0, 60.0, 60001)   # the image surface: the lens-vertex bowl (flat past the panel,
+                                            # so a ray landing off the panel is penalised, not lost)
+BOWL_SAG_MM = 1e-3 * (mla_mesh.variable_vertex_profile_um(BOWL_R_MM * 1e3, spec.PANEL_MM * 1e3, spec.LENS_SIDE_UM,
+                                                           ft.lenslet_focal_of_radius_um, spec.LENS_INDEX,
+                                                           spec.LENS_MIN_THICKNESS_UM)
+                      - mla_mesh.variable_vertex_profile_um(0.0, spec.PANEL_MM * 1e3, spec.LENS_SIDE_UM,
+                                                            ft.lenslet_focal_of_radius_um, spec.LENS_INDEX,
+                                                            spec.LENS_MIN_THICKNESS_UM))
 TOP_FIELD_DEG = 22.5
 CONE_MARGIN_MM = 2.0            # rim of an element beyond its footprint, plus air
 BAFFLE_OFFSET_MM = 0.5          # baffle plane above the top ray of the view cone
@@ -172,7 +183,21 @@ def to_batch(x, indices, lay):
     add(M + s[:, None] * u + lat[:, None] * up, 2 * a + torch.deg2rad(tilt), flat, torch.ones_like(zero))
     st = lambda v: torch.stack(v, 1)  # noqa: E731
     return ot.Batch(y=st(ys), z=st(zs), rx=st(rxs), c=st(cs), k=st(ks), xy=st(Cs), n=st(ns),
-                    mirror=(True,) + (False,) * (2 * lay["n_el"] + 1))
+                    mirror=(True,) + (False,) * (2 * lay["n_el"] + 1), image_sag=bowl(x.device))
+
+
+def bowl(device):
+    """The image surface: the vertex bowl of the variable-focal lenslet array, as
+    a radial table in the image surface's local frame (rays arrive along -z)."""
+    t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
+    return t(BOWL_R_MM), t(BOWL_SAG_MM)
+
+
+def pack(prescriptions, device):
+    """offaxis_tracer.pack for fold prescriptions: their image surface is the bowl."""
+    if any(rx["image_surface"] != LENSLETS for rx in prescriptions):
+        raise ValueError(f"fold prescriptions must declare image_surface {LENSLETS!r}")
+    return ot.pack(prescriptions, device)._replace(image_sag=bowl(device))
 
 
 def to_prescription(x_row, indices_row, lay):
@@ -184,7 +209,7 @@ def to_prescription(x_row, indices_row, lay):
         out.append({"y_mm": float(b.y[0, s]), "z_mm": float(b.z[0, s]), "rx_deg": math.degrees(float(b.rx[0, s])),
                     "radius_mm": math.inf if c == 0.0 else 1.0 / c, "conic": float(b.k[0, s]),
                     "xy": b.xy[0, s].tolist(), "mirror": b.mirror[s], "index_after": float(b.n[0, s])})
-    return {"surfaces": out}
+    return {"surfaces": out, "image_surface": LENSLETS}
 
 
 def pupil_samples(spacing_mm=PUPIL_SPACING_MM):
@@ -206,7 +231,8 @@ def pupil_cells(fields_deg, pupil):
     (whole pupil in one cell where that exceeds it). Returns (F, P) ids and the
     count of cells."""
     ecc = np.arctan(np.hypot(np.tan(np.radians(fields_deg[:, 0])), np.tan(np.radians(fields_deg[:, 1]))))
-    side = spec.PIXEL_UM * ft.local_focal_mm(ecc) / LENSLET_FOCAL_UM          # mm on the pupil
+    focal_um = ft.lenslet_focal_of_radius_um(ft.panel_radius_mm(ecc) * 1e3)    # the lens this field lands on
+    side = spec.PIXEL_UM * ft.local_focal_mm(ecc) / focal_um                    # mm on the pupil
     uv = pupil * spec.PUPIL_DIAMETER_MM / 2.0 + spec.PUPIL_DIAMETER_MM / 2.0   # 0 .. D
     ids = np.zeros((len(fields_deg), len(pupil)), dtype=np.int64)
     for f, a in enumerate(side):

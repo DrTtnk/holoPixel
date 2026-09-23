@@ -130,3 +130,24 @@ def test_gradients_match_finite_differences(device):
             ym = landing(batch._replace(**{name: dm.reshape(leaf.shape)}))[1]
             fd.append(float((yp - ym) / (2 * h)))
         assert g.cpu().numpy() == pytest.approx(np.array(fd), rel=1e-4, abs=1e-5), name
+
+
+def test_a_tabulated_image_surface_lands_rays_like_the_analytic_one(device):
+    """The variable-focal lenslet array needs a radial, tabulated image surface
+    (its vertex bowl). Tabulate a sphere at 1 um steps: the landings must match
+    the analytic sphere image surface to 1e-6 mm, and so must the gradients."""
+    rx = _fold(np.random.default_rng(5))
+    radius = -35.0
+    sphere = {**rx, "surfaces": rx["surfaces"][:-1] + [{**rx["surfaces"][-1], "radius_mm": radius}]}
+    flat = ot.pack([rx], device)
+    grid = torch.linspace(0.0, 25.0, 25001, dtype=torch.float64, device=device)
+    c = 1.0 / radius
+    table = c * grid**2 / (1.0 + torch.sqrt(1.0 - c * c * grid**2))
+    tabulated = flat._replace(image_sag=(grid, table))
+    fields, pupil = torch.tensor(FIELDS, device=device), torch.tensor(PUPIL, device=device)
+    ref, _, ok_ref = ot.trace(ot.pack([sphere], device), fields, pupil)
+    got, _, ok = ot.trace(tabulated, fields, pupil)
+    assert torch.equal(ok, ok_ref) and bool(ok.all())
+    assert got.cpu().numpy() == pytest.approx(ref.cpu().numpy(), abs=1e-6)
+    flat_land, _, _ = ot.trace(flat, fields, pupil)
+    assert float((flat_land - got).abs().max()) > 0.1                    # the table is really used
