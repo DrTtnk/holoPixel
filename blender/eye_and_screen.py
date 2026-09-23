@@ -133,6 +133,12 @@ def half_annulus(name, inner, outer, y, material, segments=64):
 
 def build():
     reset()
+    build_eye()
+    build_screen()
+
+
+def build_eye():
+    """The schematic eye alone, into the current scene, with no reset."""
     cornea_half = math.asin((CORNEA_APERTURE / 2) / CORNEA_R)
     # where the cornea meets the sclera, as an angle on the eyeball
     sclera_start = math.asin(min(1.0, (CORNEA_APERTURE / 2) / EYE_R))
@@ -150,6 +156,14 @@ def build():
                  mat("iris", (0.24, 0.40, 0.55), rough=0.6))
     half_annulus("pupil_4mm", 0.0, PUPIL_D / 2, PUPIL_Y - 0.03,
                  mat("pupil", (0.01, 0.01, 0.02), rough=0.95))
+
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.45, location=(0, ROTATION_Y, 0))
+    r = bpy.context.object
+    r.name = "centre_of_rotation"
+    r.data.materials.append(mat("rot", (1.0, 0.3, 0.08), emit=6.0))
+
+
+def build_screen():
     half_annulus("eyebox_10mm", EYEBOX / 2 - 0.15, EYEBOX / 2, PUPIL_Y + 0.4,
                  mat("eyebox", (1.0, 0.85, 0.2), emit=4.0))
 
@@ -159,11 +173,6 @@ def build():
     half_annulus("holo_screen_flat_alternative", 0.0, FLAT_D / 2,
                  PUPIL_Y + RELIEF,
                  mat("flat", (0.95, 0.42, 0.20), alpha=0.10, rough=0.3))
-
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.45, location=(0, ROTATION_Y, 0))
-    r = bpy.context.object
-    r.name = "centre_of_rotation"
-    r.data.materials.append(mat("rot", (1.0, 0.3, 0.08), emit=6.0))
 
 
 def report():

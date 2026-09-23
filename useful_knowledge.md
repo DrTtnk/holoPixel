@@ -437,3 +437,80 @@ avoids the side conditions it drags in.
 Also: `lake build Holopixel.<NewFile>` works without registering the file
 anywhere, because Lake globs the whole `Holopixel/` directory for the library
 target. New theorem files need no edit to `Holopixel.lean` or `lakefile.toml`.
+
+## Session 2026-09-23 — Foveated hex MLA Blender scene
+
+### Wrong: the lenslet focal length is the eye relief
+
+I set the MLA focal length to f0 = 20 mm because `waveoptics_encoder.py` uses
+a 20 mm throw to the pupil. That throw is the distance from the lenslet to the
+pupil, not the focal length. In an integral-imaging screen the panel sits at
+the lenslet's focal plane, so f equals the panel-to-lens GAP, and each pixel
+under a lenslet becomes one collimated direction. The gap follows from how far
+the views must spread: the ~28 um of pixels under one lenslet must cover the
+4 mm pupil at 20 mm, i.e. about 0.2 rad, so f is about 28 um / 0.2 = 0.14 mm,
+not 20 mm. With n = 1.5 that gives a radius of curvature of about 70 um and a
+real sag of about 1.6 um, which is visible without any exaggeration. The x15
+"visual exaggeration" I added only existed to hide the wrong focal length.
+
+Rule: before deriving a lens from a system distance, write down which two
+planes that lens must image onto each other.
+
+### Blender: one object per lenslet is quadratic
+
+Creating 169k objects one at a time (`bpy.data.objects.new` plus a collection
+link each) ran for more than 80 minutes and never finished. One merged mesh per
+variant built in 2.5 s. For large arrays use one mesh, or Geometry Nodes
+instancing, never one object per element.
+
+### Blender 5.2 / Cycles traps met while building the physical model
+
+- Setting `colorspace_settings.name` on a GENERATED image rebuilds its buffer
+  and silently zeroes pixels written earlier with `foreach_set`. Set the
+  colorspace first, then write, then read back and compare.
+- A new World renders from its node tree; `world.color` is ignored. Set the
+  Background node's colour. The default is grey 0.05, which quietly broke a
+  threshold measurement.
+- Depth of field has only `aperture_fstop`. The aperture radius in scene units
+  is `lens_mm * 1e-3 / (2 * fstop)` and does NOT follow `unit_settings.scale_length`:
+  with 1 unit = 1 mm, the obvious `lens / (2 * fstop)` is 1000x too large.
+  Measured with a defocused point: 1.91 mm for a 2 mm target, 0.49 for 0.5.
+- In a world shader, `Texture Coordinate > Generated` is the unit world-space
+  ray direction. Render row 0 is the bottom of the frame.
+- The Refraction BSDF DROPS the path under total internal reflection (black),
+  and the Glass BSDF picks Fresnel reflection at random. For a deterministic,
+  lossless dielectric: mix Refraction with a sharp Glossy, factor
+  `Fresnel(IOR) > 0.9999`. Verified on a 45 degree prism: the pupil points it
+  loses are exactly the ones Snell's law puts below the critical angle.
+- Russian roulette ends 1-sample paths at random after a few bounces, even at
+  unit throughput. Set `min_light_bounces` to the bounce limit.
+- The Glossy BSDF's default colour is 0.8, not 1.0, and its default
+  distribution is multiscatter GGX.
+- A hand-wound glass solid came out wound inwards, and Cycles then refracts with
+  the index inverted, silently. The evaluator now rejects open or inward glass.
+
+### Wrong: a pinhole view proves a light-field screen
+
+With the panel at the lenslet focal plane every pixel is one collimated beam,
+so for content at infinity the direct-view screen resolves one pixel BIN,
+pixel / f = 4 / 150 = 26.7 mrad, not the lens pitch. A pinhole camera still
+shows a crisp lens mosaic, because it samples one ray per lens. Measured: a
+linear light field comes back with mean error exactly quantum / 4 = 0.0222,
+the uniform-quantisation value. Only a remapper with the lenses at its focal
+surface turns lens = field sample and pixel = pupil view.
+
+### Wrong: estimate a lens's direction as the robust mean over the pupil
+
+The pupil patch that sees a lens's pixels is its hexagon scaled by L / f, and
+it shifts with the lens position, so the all-ray mean is biased, and
+anisotropically (the hexagon is wider across corners than across flats). An
+inlier window around that biased mean locked onto it: vertical scale came out
+26 mm instead of 20. The physical definition is simpler and unbiased: a lens's
+field direction is where it is seen from the pupil centre.
+
+### Hex grid spacing: orientation and formula must match
+
+Vertices at 30 + 60*i degrees give a POINTY-TOP hexagon. Its tiling is
+dx = sqrt(3)*R within a row and dy = 1.5*R between rows, with odd rows offset
+by dx/2. The original script used the flat-top formulas (dx = 1.5*R,
+dy = sqrt(3)*R), which overlapped neighbours horizontally.

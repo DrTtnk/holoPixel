@@ -48,6 +48,18 @@ The suite checks the physics claims recorded in `DRAFT.md` and
 `useful_knowledge.md` against the code that produced them. Every hand derivation
 is re-derived with sympy inside the test rather than hard-coded.
 
+Tests marked `blender` render through headless Blender 5.2 (Cycles, OptiX GPU)
+and need `blender` on the `PATH`; they take a few minutes. Skip them with
+`pytest -m "not blender"`.
+
+## Physical light-field screen model
+
+`tier1_lightfield/foveated_optics_study/scripts/` holds a Cycles model of the
+light-field screen: a real hex microlens array over the panel, optional
+remapper optics, and pinhole or 4 mm-aperture eye cameras at the schematic
+eye's pupil. `lf_evaluate.py <design_dir>` is the shared acceptance evaluator
+for remapper designs (contract in its docstring).
+
 ## Run Simulations
 
 ```bash

@@ -1,0 +1,67 @@
+{
+ "lenses_in_fov": 28466,
+ "coverage": 0.10573917146733254,
+ "throughput": 0.05161785737283303,
+ "ratio": {
+  "median": 0.6861713805213084,
+  "p5": 0.2524044808347658,
+  "p95": 3.0215076374369803
+ },
+ "blur_pitch": {
+  "median": 0.0,
+  "p90": 1.897737690650461,
+  "ideal": 0.37267799624996495
+ },
+ "fill": {
+  "p10": 0.36065573770491804,
+  "median": 0.5737704918032787
+ },
+ "ghost": {
+  "mean": 0.9614877433530421,
+  "p90": 0.9940476190476191
+ },
+ "geometry": {
+  "eye_relief_mm": 21.972449277477832,
+  "clearance_mm": 16.304671695811944
+ },
+ "design": {
+  "focal_um": 45.0,
+  "gap_um": 32.86767127573919,
+  "radius_um": 22.5,
+  "centre_thickness_um": 18.19849308639121,
+  "n_views": 61,
+  "panel_pixels": 2044,
+  "resolution": 2048
+ },
+ "accept": {
+  "checks": {
+   "coverage": false,
+   "ratio_median": false,
+   "ratio_spread": false,
+   "blur": false,
+   "fill": false,
+   "ghost": false,
+   "throughput": false,
+   "eye_relief": true,
+   "clearance": true
+  },
+  "passed": false,
+  "thresholds": {
+   "coverage_min": 0.98,
+   "ratio_median_range": [
+    0.8,
+    1.25
+   ],
+   "ratio_p5_p95_range": [
+    0.67,
+    1.5
+   ],
+   "blur_p90_max_pitch": 0.75,
+   "fill_p10_min": 0.8,
+   "ghost_mean_max": 0.05,
+   "throughput_min": 0.9,
+   "eye_relief_min_mm": 20.0,
+   "clearance_min_mm": 15.0
+  }
+ }
+}
