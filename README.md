@@ -69,7 +69,7 @@ cd tier1_lightfield/foveated_optics_study/remapper_designs
 python coaxial_dls/gpu_search.py <out> --elements 5
 python coaxial_dls/export_candidate.py <out>/best_el5_flat.json <design_dir>
 # folded: panel above the eye, freeform mirror, 1-2 freeform correctors
-python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or glass
+python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or glass; --ratio-weight 0 frees the mapping
 python freeform_mirror/export_fold.py <out>/best_fold_el1_resin.json <design_dir>
 blender -b --factory-startup --python freeform_mirror/view_fold_blender.py -- <design_dir> view.blend
 python ../scripts/lf_evaluate.py <design_dir> --pixels 2560
@@ -77,7 +77,13 @@ python ../scripts/lf_evaluate.py <design_dir> --pixels 2560
 # (the latter needs the lf_evaluate run above, it reuses <design_dir>/evaluation)
 python ../scripts/hmd_view.py <design_dir> <out_dir> --work <scratch> [--aperture-mm 4]
 python ../scripts/hmd_encoded.py <design_dir> <out_dir> --work <scratch>
+# foveal inset: the whole panel over +/- 10 deg through a moulded singlet or achromat (CPU)
+python foveal_inset/inset_study.py <out>
 ```
+
+Designs use the variable-focal lenslet array by default (`"lenslets": "variable_retina"`
+in design.json): each lens's focal length follows the retina-matched local focal length,
+so the lens vertices form a ~1.5 mm bowl, which is the searches' image surface.
 
 ## Run Simulations
 

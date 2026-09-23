@@ -584,3 +584,30 @@ must fit one lens pitch, so f / pitch <= F_edge / D = 1.35, whatever the lens
 size: 49 um focal for 36 um lenses, near-hemispherical. A variable-focal
 lenslet array (f following the local F) avoids it and gives every lens the
 same 5 x 5 views.
+
+## The Airy radius is not an RMS blur
+
+The first diffraction floor for the blur tolerance was the Airy radius
+1.22 lambda / D. The blur metric is an RMS radius, and the Airy pattern has no
+finite RMS radius (its 1/x^3 intensity tail makes the second moment diverge);
+1.22 lambda / D is an encircled-energy radius (84 %). The consistent floor is
+the RMS radius of the least-squares Gaussian fit, sqrt(2) * 0.42 lambda / D
+(0.28 arcmin for 4 mm at 550 nm), which never binds against the retina.
+Found by the adversarial review; the 0.42 is checked by a numerical fit in
+tests/test_foveation_target.py.
+
+## A tabulated radial surface must be indexed by r^2, not r
+
+Interpolating a sag table in r = sqrt(x^2 + y^2) gives an infinite derivative
+on the axis, and a chief ray landing exactly at r = 0 turned the whole
+gradient into NaN (the coaxial search failed loudly at step 0). Index the table
+by r^2 with grid points placed 1 um apart in r: same resolution, no square root.
+
+## Variable-focal lenslets put the lens vertices on a bowl, not a plane
+
+With a flat panel and one air gap, a plano-convex lens of focal length f needs
+glass height n (f - gap). For f from 48 um to 1.06 mm the vertices then lie
+on a ~1.5 mm deep bowl, and the remapper must focus the field onto that bowl
+(at the fovea the beam is ~f/30, so a 1.5 mm focus error is a ~50 um spot,
+more than a lens). A flat vertex plane over a flat panel can vary f only by
+the factor n (between an all-air and an all-glass gap), far short of 22.
