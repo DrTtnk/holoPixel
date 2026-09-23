@@ -1,0 +1,13 @@
+quantity,value
+Active panel size,8.176 mm x 8.176 mm
+Hex tile count,84688
+Hex side length,17.37 um
+Hex center spacing dx,26.06 um
+Hex center spacing dy,30.09 um
+Chief-ray theta_x range,-33.34 .. 34.02 deg
+Chief-ray theta_y range,-21.96 .. 21.74 deg
+Equivalent local normal tilt max,19.92 deg
+K=1 tile fraction,5.2 %
+K=7 tile fraction,14.7 %
+K=19 tile fraction,21.8 %
+K=29 tile fraction,58.3 %

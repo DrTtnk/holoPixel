@@ -1,0 +1,5 @@
+region,eccentricity_range_deg,active_pupil_views,approx_FWHM_arcmin_used_in_final_render
+fovea-ish,<1.5,1,0.6
+inner perif.,1.5-4,7,1.5874507866387544
+mid perif.,4-8,19,2.615339366124404
+outer perif.,>8,29,3.2310988842807022

@@ -1,0 +1,11 @@
+quantity,value
+Active panel width,8.176 mm
+Active panel height,8.176 mm
+Chief-ray angle theta_x range,-33.65 .. 34.52 deg
+Chief-ray angle theta_y range,-22.06 .. 22.19 deg
+Equivalent mirror normal tilt x range,-16.82 .. 17.26 deg
+Equivalent mirror normal tilt y range,-11.03 .. 11.09 deg
+Normal tilt magnitude min,0.01 deg
+Normal tilt magnitude median,4.93 deg
+Normal tilt magnitude max,19.91 deg
+Integrated sag range,0.581 mm

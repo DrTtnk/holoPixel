@@ -1,0 +1,6 @@
+numpy>=2.0
+scipy>=1.14
+pandas>=2.2
+matplotlib>=3.9
+sympy>=1.13
+pillow>=10.0

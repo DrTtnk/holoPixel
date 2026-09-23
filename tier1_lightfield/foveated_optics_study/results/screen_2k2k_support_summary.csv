@@ -1,0 +1,11 @@
+quantity,value
+Physical screen,2048 x 2048 px
+Active area used,2044 x 2044 px
+Lenslets per side,292 x 292
+Lenslet field samples,85264
+Target field samples for 70x45,337928
+Support ratio vs target,0.252
+Linear sampling ratio vs target,0.502
+Target foveal pitch,0.459 arcmin
+Achieved center pitch x,2.402 arcmin
+Achieved center pitch y,1.882 arcmin
