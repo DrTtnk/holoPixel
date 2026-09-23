@@ -60,7 +60,8 @@ def test_chart(n=spec.PANEL_PIXELS):
     return rgb
 
 
-def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, samples=64):
+def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, samples=64, panel_rgb=None):
+    """panel_rgb: (N, N, 3) panel image, row j along +v; default the raw test chart."""
     design_dir, out_dir = Path(design_dir), Path(out_dir)
     design = json.loads((design_dir / "design.json").read_text())
     remapper = (design_dir / design["remapper_npz"]).resolve()
@@ -72,7 +73,7 @@ def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, sam
                           min_thickness_um=spec.LENS_MIN_THICKNESS_UM, subdivisions=2)
     np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
              face_lens=mesh.face_lens)
-    np.save(work / "panel.npy", test_chart())
+    np.save(work / "panel.npy", test_chart() if panel_rgb is None else panel_rgb.astype(np.float32))
     blend = out_dir / f"{name}.blend"
     cfg = {"mode": "display", "mla_npz": str(work / "mla_mesh.npz"), "index": spec.LENS_INDEX,
            "panel_pose": design["panel_pose"], "gap_um": mla.back_focal_gap_um(radius, spec.LENS_INDEX,

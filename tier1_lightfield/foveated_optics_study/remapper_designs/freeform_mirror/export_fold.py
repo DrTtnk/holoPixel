@@ -1,6 +1,6 @@
 """Export one folded-remapper design to the shared evaluator contract (lf_evaluate.py).
 
-    python export_fold.py <best_fold_*.json> <out_dir> [--rank 0] [--focal-um 114]
+    python export_fold.py <best_fold_*.json> <out_dir> [--rank 0] [--focal-um F]
 
 The mirror becomes a freeform sheet, each corrector a closed freeform solid
 (the back surface is sampled along the front surface's local axis), both with
@@ -165,12 +165,12 @@ def baffle_geometry(hardware):
     return verts, faces
 
 
-def export(best_json, out_dir, rank=0, focal_um=114.0, device="cuda"):
+def export(best_json, out_dir, rank=0, focal_um=fs.LENSLET_FOCAL_UM, device="cuda"):
     entry = json.loads(Path(best_json).read_text())[rank]
     return export_entry(entry, out_dir, focal_um, device, source={"design": Path(best_json).name, "rank": rank})
 
 
-def export_entry(entry, out_dir, focal_um=114.0, device="cuda", source=None):
+def export_entry(entry, out_dir, focal_um=fs.LENSLET_FOCAL_UM, device="cuda", source={}):
     dev = torch.device(device)
     lay = fs.layout(entry["n_el"])
     x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
@@ -217,7 +217,7 @@ def export_entry(entry, out_dir, focal_um=114.0, device="cuda", source=None):
     origin = to_world(o) - thickness_um * 1e-3 * basis[2]
     design = {"focal_um": focal_um, "remapper_npz": "remapper.npz",
               "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
-              "source": {**(source or {}), "material": entry["material"]}}
+              "source": {**source, "material": entry["material"]}}
     (out / "design.json").write_text(json.dumps(design, indent=1))
     np.savez(out / "rays.npz", **fans(entry, dev))
     return out
@@ -247,7 +247,7 @@ def main():
     ap.add_argument("best_json")
     ap.add_argument("out_dir")
     ap.add_argument("--rank", type=int, default=0)
-    ap.add_argument("--focal-um", type=float, default=114.0)
+    ap.add_argument("--focal-um", type=float, default=fs.LENSLET_FOCAL_UM)
     args = ap.parse_args()
     print(export(args.best_json, args.out_dir, args.rank, args.focal_um))
 

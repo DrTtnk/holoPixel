@@ -73,6 +73,10 @@ python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or
 python freeform_mirror/export_fold.py <out>/best_fold_el1_resin.json <design_dir>
 blender -b --factory-startup --python freeform_mirror/view_fold_blender.py -- <design_dir> view.blend
 python ../scripts/lf_evaluate.py <design_dir> --pixels 2560
+# simulated headset from the pupil: raw chart on the panel, or pre-warped content
+# (the latter needs the lf_evaluate run above, it reuses <design_dir>/evaluation)
+python ../scripts/hmd_view.py <design_dir> <out_dir> --work <scratch> [--aperture-mm 4]
+python ../scripts/hmd_encoded.py <design_dir> <out_dir> --work <scratch>
 ```
 
 ## Run Simulations

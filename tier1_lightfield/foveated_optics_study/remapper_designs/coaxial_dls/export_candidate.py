@@ -1,13 +1,12 @@
 """Export one GPU-search candidate to the shared evaluator contract (lf_evaluate.py).
 
-    python export_candidate.py <best_*.json> <out_dir> [--rank 0] [--focal-um 114]
+    python export_candidate.py <best_*.json> <out_dir> [--rank 0] [--focal-um F]
 
 Each lens becomes a closed glass solid of revolution with exact loop normals.
 The lenslet array sits on the candidate's image surface (its vertex there, flat
 side to the panel), so the panel is one back focal gap behind it.
-Lenslet focal length default: the pupil cone at the field edge
-(F_edge = 12.7 mm, 4 mm pupil) just fills one 36 um lens pitch on the panel,
-f = pitch * F_edge / pupil = 114 um.
+Lenslet focal length default: foveation_target.lenslet_focal_um(), at which
+the pupil cone at the field edge just fills one lens pitch on the panel.
 """
 from __future__ import annotations
 
@@ -22,6 +21,7 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
+import foveation_target as ft  # noqa: E402
 import mla_design as mla  # noqa: E402
 import screen_spec as spec  # noqa: E402
 import show_candidates as sc  # noqa: E402
@@ -30,7 +30,7 @@ N_RADIAL, N_AZIMUTH = 256, 512   # a facet follows the true normal to half an az
 PANEL_BASIS = [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]   # panel faces the eye along -y
 
 
-def export(candidate_json, out_dir, rank=0, focal_um=114.0, device="cuda"):
+def export(candidate_json, out_dir, rank=0, focal_um=ft.lenslet_focal_um(), device="cuda"):
     entry = json.loads(Path(candidate_json).read_text())[rank]
     solids, batch = sc.candidate_solids(entry, torch.device(device), n_r=N_RADIAL, n_phi=N_AZIMUTH)
     out = Path(out_dir)
@@ -58,7 +58,7 @@ def main():
     ap.add_argument("candidate_json")
     ap.add_argument("out_dir")
     ap.add_argument("--rank", type=int, default=0)
-    ap.add_argument("--focal-um", type=float, default=114.0)
+    ap.add_argument("--focal-um", type=float, default=ft.lenslet_focal_um())
     args = ap.parse_args()
     print(export(args.candidate_json, args.out_dir, args.rank, args.focal_um))
 

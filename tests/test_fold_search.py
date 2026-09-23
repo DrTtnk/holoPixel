@@ -53,15 +53,18 @@ def test_merit_and_its_gradient_are_finite_on_random_seeds(designs, device):
 
 
 def test_pupil_cells_follow_the_pixel_footprint_on_the_pupil():
-    """Centre: F = 76 mm, footprint 7.2 um * 76 / 114 um = 4.8 mm > 4 mm pupil:
-    one cell. Field edge: F = 12.7 mm, footprint 0.80 mm: 5 x 5 squares, of
-    which those that hold hexagonal pupil points survive."""
+    """Centre: the pixel's footprint on the pupil, 7.2 um * F / f_lenslet, is far
+    larger than the 4 mm pupil: one cell. Field edge: the lenslet is chosen so
+    the pupil fills one lens pitch, 36 um = 5 pixels, so the footprint is 4/5 mm:
+    5 x 5 squares, of which those that hold hexagonal pupil points survive."""
     pupil = fs.pupil_samples()
     ids, _ = fs.pupil_cells(np.array([[0.0, 0.0], [35.0, 0.0]]), pupil)
     assert len(np.unique(ids[0])) == 1
-    side = 7.2 * 12.7347 / 114.0
+    side = 7.2 * float(fs.ft.local_focal_mm(np.radians(35.0))) / fs.LENSLET_FOCAL_UM
+    assert side == pytest.approx(4.0 / 5.0, rel=1e-9)
     uv = pupil * 2.0 + 2.0
-    expected = len({(int(u / side), int(v / side)) for u, v in uv})
+    n = math.ceil(4.0 / side - 1e-9)                         # points on the far rim belong to the last cell
+    expected = len({(min(int(u / side), n - 1), min(int(v / side), n - 1)) for u, v in uv})
     assert len(np.unique(ids[1])) == expected
 
 
