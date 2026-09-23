@@ -3,11 +3,13 @@
 Panel: 1.03 inch micro-OLED (OLEDoS), 2560 x 2560, active area 18.432 x 18.432 mm,
 7.2 um pixel pitch, up to 1800 cd/m^2 (displaymodule.com product page).
 
-Lenslets: flat-top hexagons 36 um flat to flat (5 pixels), so at the field
-edge, where the R = 6 target's local focal length is about 12.7 mm, one lens
-spans 36 um / 12.7 mm = 2.8 mrad = 9.7 arcmin, matching the Watson retinal
-pitch there (about 10 arcmin at 35 deg). About 300,000 lenses, against the
-~340,000 retina-matched samples for 70 x 45 deg.
+Lenslets: flat-top hexagons 36 um flat to flat (5 pixels). With the
+retina-matched foveation target (foveation_target) the display then samples
+the field at about 2x the retinal pitch everywhere (along the temporal
+meridian; the nasal, superior and inferior meridians are coarser, so the
+margin shrinks towards 1.07x in the nasal-inferior corner). About 300,000
+lenses tile the panel, of which ~70 % serve directions inside the 70 x 45 deg
+field (the radial map leaves the rest of the square panel unused).
 """
 import math
 

@@ -19,10 +19,10 @@ centre), its angular blur (RMS width of the beams of its pixels, what the eye
 perceives; the RMS spread over the whole pupil is kept as a diagnostic), its pupil fill
 (fraction of pupil points that see it) and its landing offset at the panel
 (the chief ray's tilt there). A ghost is a ray landing on a pixel that is also
-reached through a lens more than 3 pitches away. Pitches are the R = 6 target
-pitch at the lens's own field direction. Blur is reported in units of what the
-eye could see there (foveation_target.blur_tolerance_rad: the larger of the
-retinal pitch and the sampling pitch).
+reached through a lens more than 3 pitches away. Pitches are the foveation
+target's lens pitch at the lens's own field direction. Blur is reported in
+units of what the eye could see there (foveation_target.blur_tolerance_rad:
+the retinal pitch, clipped at the RMS diffraction blur of the 4 mm pupil).
 """
 from __future__ import annotations
 
