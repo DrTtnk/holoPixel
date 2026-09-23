@@ -568,3 +568,19 @@ export_fold sized the mirror and corrector meshes from those traced hits, so
 the other half of the optics was simply missing and Cycles saw light only
 from theta_x < ~7 deg (coverage 0.55). Any geometry derived from a
 symmetry-reduced trace must be re-symmetrised before it leaves the search.
+
+## zsh does not split an unquoted variable into words
+
+A chain like `for spec in "a b" "c d"; do set -- $spec; ...` works in bash but
+in zsh `$spec` stays one word, so `$1` and `$2` were empty and four renders
+failed at once (exit 2). This shell is zsh: write the commands out, or use
+`${=spec}` if splitting is really wanted.
+
+## Matching the retina fully forces fast lenslets at the field edge
+
+With the foveation matched to the Watson pitch (no cap) the local focal
+length at 35 deg drops to 5.4 mm. The pupil's image under a lenslet (f D / F)
+must fit one lens pitch, so f / pitch <= F_edge / D = 1.35, whatever the lens
+size: 49 um focal for 36 um lenses, near-hemispherical. A variable-focal
+lenslet array (f following the local F) avoids it and gives every lens the
+same 5 x 5 views.
