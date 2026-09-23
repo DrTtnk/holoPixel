@@ -23,7 +23,9 @@ sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
 import foveation_target as ft  # noqa: E402
 import mla_design as mla  # noqa: E402
+import mla_mesh  # noqa: E402
 import screen_spec as spec  # noqa: E402
+import gpu_search as gs  # noqa: E402
 import show_candidates as sc  # noqa: E402
 
 N_RADIAL, N_AZIMUTH = 256, 512   # a facet follows the true normal to half an azimuth step, 0.35 deg
@@ -41,11 +43,17 @@ def export(candidate_json, out_dir, rank=0, focal_um=ft.lenslet_focal_um(), devi
                      f"surf{k}_verts": sc.to_world(s["verts"], 0.0), f"surf{k}_faces": s["faces"],
                      f"surf{k}_normals": s["normals"] @ sc.TRACER_TO_WORLD})
     np.savez(out / "remapper.npz", **data)
-    radius = mla.radius_for_focal_length_um(focal_um, spec.LENS_INDEX)
-    centre_thickness_um = spec.LENS_MIN_THICKNESS_UM + float(mla.sag_um(spec.LENS_SIDE_UM, radius))
     vertex_y = sc.PUPIL_Y + float(batch.z[0, -1])
-    design = {"focal_um": focal_um, "remapper_npz": "remapper.npz",
-              "panel_pose": {"origin_mm": [0.0, vertex_y + centre_thickness_um * 1e-3, 0.0], "basis": PANEL_BASIS},
+    if entry["layout"]["lenslets"] == "variable_retina":
+        # the variable-focal array: the centre lens's vertex on the image surface, the bowl follows
+        centre_um = float(mla_mesh.variable_vertex_profile_um(0.0, **gs._PROFILE))
+        lenslets = {"lenslets": "variable_retina"}
+    else:
+        radius = mla.radius_for_focal_length_um(focal_um, spec.LENS_INDEX)
+        centre_um = spec.LENS_MIN_THICKNESS_UM + float(mla.sag_um(spec.LENS_SIDE_UM, radius))
+        lenslets = {"focal_um": focal_um}
+    design = {**lenslets, "remapper_npz": "remapper.npz",
+              "panel_pose": {"origin_mm": [0.0, vertex_y + centre_um * 1e-3, 0.0], "basis": PANEL_BASIS},
               "source": {"candidate": str(Path(candidate_json).name), "rank": rank,
                          "spot_in_tolerance_per_field": entry["spot_in_tolerance_per_field"],
                          "fields_deg": entry["fields_deg"]}}

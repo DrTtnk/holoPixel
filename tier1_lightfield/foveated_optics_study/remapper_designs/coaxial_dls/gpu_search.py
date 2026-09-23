@@ -7,9 +7,14 @@ Parameter vector per design (sags in mm at R0, as in fast_merit):
     [eye_relief, (t_glass, gap_after) per element, (s2, k, b4, b6, b8) per surface,
      (s2_img, k_img) if the image surface is curved (fibre-optic faceplate)]
 
+Image surface: the vertex bowl of the variable-focal lenslet array
+(mla_mesh.build_variable with foveation_target.lenslet_focal_of_radius_um).
+
 Merit, per design (all landing errors in units of the blur the eye tolerates
 there, foveation_target.blur_tolerance_rad times the local focal length):
-  land   every pupil ray's miss from its field's target point; a lost ray costs LOST
+  land   per-pixel blur: every pupil ray's miss from the centroid of its pupil
+         cell (the part of the pupil one pixel sees, 0.8 mm with these
+         lenslets, as in freeform_mirror/fold_search.py); a lost ray costs LOST
   chief  the chief ray's height miss (the mapping itself), weighted up
   tilt   chief-ray angle at the image above TILT_MAX_DEG
   shape  glass thinner than 1 mm or air thinner than 0.3 mm at the radius the rays use
@@ -32,6 +37,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import foveation_target as ft  # noqa: E402
+import mla_mesh  # noqa: E402
+import screen_spec as spec  # noqa: E402
 
 import gpu_tracer as gt  # noqa: E402
 
@@ -43,14 +50,48 @@ TRACK_MAX_MM = 80.0
 MIN_GLASS_MM, MIN_AIR_MM = 1.0, 0.3
 LOST = 100.0                  # squared residual of a lost ray, in tolerance units
 W_CHIEF, W_TILT, W_SHAPE, W_MARGIN, W_TRACK = 9.0, 1.0, 100.0, 50.0, 1.0
-PUPIL_RINGS = ((0.5, 6), (0.75, 9), (1.0, 12))
+PUPIL_SPACING_MM = 0.4
+_PROFILE = dict(panel_um=spec.PANEL_MM * 1e3, side_um=spec.LENS_SIDE_UM, focal_of_radius=ft.lenslet_focal_of_radius_um,
+                index=spec.LENS_INDEX, min_thickness_um=spec.LENS_MIN_THICKNESS_UM)
+BOWL_R_MM = np.linspace(0.0, 60.0, 60001)     # flat past the panel: an off-panel ray is penalised, not lost
+BOWL_SAG_MM = 1e-3 * (mla_mesh.variable_vertex_profile_um(0.0, **_PROFILE)
+                      - mla_mesh.variable_vertex_profile_um(BOWL_R_MM * 1e3, **_PROFILE))   # rays travel +z
 
 
-def pupil_samples():
-    pts = [(0.0, 0.0)]
-    for r, n in PUPIL_RINGS:
-        pts += [(r * math.cos(a), r * math.sin(a)) for a in np.linspace(0, 2 * math.pi, n, endpoint=False)]
-    return np.array(pts)
+def bowl(device):
+    t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
+    return t(BOWL_R_MM**2), t(BOWL_SAG_MM)
+
+
+def pupil_samples(spacing_mm=PUPIL_SPACING_MM):
+    """Hexagonal grid inside the pupil disc, normalised to its radius."""
+    r = spec.PUPIL_DIAMETER_MM / 2.0
+    n = int(math.ceil(r / spacing_mm)) + 1
+    pts = [(i * spacing_mm + (j % 2) * spacing_mm / 2, j * spacing_mm * math.sqrt(3) / 2)
+           for i in range(-n, n + 1) for j in range(-n, n + 1)]
+    return np.array([p for p in pts if math.hypot(*p) <= r + 1e-9]) / r
+
+
+def pupil_cells(fields_deg, pupil):
+    """(F, P, K) one-hot: the pupil cell each ray belongs to, per field; a cell is
+    a pixel's footprint on the pupil, pixel * F(theta) / f_lenslet(theta)."""
+    th = np.radians(fields_deg)
+    side = spec.PIXEL_UM * ft.local_focal_mm(th) / ft.lenslet_focal_of_radius_um(ft.panel_radius_mm(th) * 1e3)
+    uv = pupil * spec.PUPIL_DIAMETER_MM / 2.0 + spec.PUPIL_DIAMETER_MM / 2.0
+    ids = np.zeros((len(fields_deg), len(pupil)), dtype=np.int64)
+    for f, a in enumerate(side):
+        n = max(1, int(math.ceil(spec.PUPIL_DIAMETER_MM / a)))
+        cell = np.minimum((uv / a).astype(np.int64), n - 1)
+        _, ids[f] = np.unique(cell[:, 0] * n + cell[:, 1], return_inverse=True)
+    return np.eye(int(ids.max()) + 1)[ids]
+
+
+def cell_spread(land, alive, onehot):
+    """Each ray's landing offset from its pupil cell's centroid (B, F, P, 2), zero if lost."""
+    w = alive.double()
+    count = torch.einsum("bfp,fpk->bfk", w, onehot).clamp(min=1.0)
+    centroid = torch.einsum("bfpc,fpk->bfkc", land * w[..., None], onehot) / count[..., None]
+    return (land - torch.einsum("bfkc,fpk->bfpc", centroid, onehot)) * w[..., None]
 
 
 def field_grid(n=15):
@@ -62,9 +103,12 @@ def tolerance_mm(fields_deg):
     return ft.blur_tolerance_rad(th, np.zeros_like(th)) * ft.local_focal_mm(th)
 
 
-def layout(n_el, curved):
+def layout(n_el, curved, lenslets="variable_retina"):
+    """lenslets: "variable_retina" (image surface = the vertex bowl) or "uniform"
+    (a flat image surface, the earlier searches' candidates)."""
     n_shape = 2 * n_el * 5
-    return {"n_el": n_el, "curved": curved, "size": 1 + 2 * n_el + n_shape + (2 if curved else 0)}
+    return {"n_el": n_el, "curved": curved, "lenslets": lenslets,
+            "size": 1 + 2 * n_el + n_shape + (2 if curved else 0)}
 
 
 def bounds(lay, device):
@@ -114,14 +158,19 @@ def to_batch(x, indices, lay):
     else:
         c_img = torch.zeros(B, 1, dtype=x.dtype, device=x.device)
         k_img = torch.zeros(B, 1, dtype=x.dtype, device=x.device)
+    if lay["lenslets"] == "variable_retina" and lay["curved"]:
+        raise ValueError("the image surface is the lenslet bowl; a fitted curved image is not supported")
+    if lay["lenslets"] not in ("variable_retina", "uniform"):
+        raise ValueError(f"unknown lenslets {lay['lenslets']!r}")
     zeros3 = torch.zeros(B, 1, 3, dtype=x.dtype, device=x.device)
     n_after = torch.stack([indices, torch.ones_like(indices)], -1).reshape(B, 2 * n)
     return gt.Batch(z=z, c=torch.cat([c, c_img], 1), k=torch.cat([k, k_img], 1),
                     a=torch.cat([a, zeros3], 1), n=torch.cat([n_after, torch.ones(B, 1, dtype=x.dtype,
-                                                                                    device=x.device)], 1))
+                                                                                    device=x.device)], 1),
+                    image_sag=bowl(x.device) if lay["lenslets"] == "variable_retina" else ())
 
 
-def merit(x, indices, lay, fields, pupil, tol, target):
+def merit(x, indices, lay, fields, pupil, tol, target, onehot):
     batch = to_batch(x, indices, lay)
     land, d, alive, diag = gt.trace(batch, fields, pupil, diagnostics=True)
     B = x.shape[0]
@@ -129,7 +178,7 @@ def merit(x, indices, lay, fields, pupil, tol, target):
     sign = torch.sign(chief_y[:, -3].detach())
     sign = torch.where(sign == 0, torch.ones_like(sign), sign)
     ty = sign[:, None] * target[None, :]                           # (B, F)
-    err2 = (land[..., 0] ** 2 + (land[..., 1] - ty[:, :, None]) ** 2) / tol[None, :, None] ** 2
+    err2 = (cell_spread(land, alive, onehot) ** 2).sum(-1) / tol[None, :, None] ** 2
     err2 = torch.where(alive, err2, torch.full_like(err2, LOST))
     land_term = err2.mean(dim=(1, 2))
     chief_err = torch.where(alive[:, :, 0], (chief_y - ty) / tol[None, :], torch.full_like(chief_y, 10.0))
@@ -158,16 +207,14 @@ def merit(x, indices, lay, fields, pupil, tol, target):
                    "shape": shape_term, "tilt_max": tilt.amax(1)}
 
 
-def spot_in_tolerance(x, indices, lay, fields, pupil, tol):
-    """RMS spot radius about its own centroid, per field, in tolerance units."""
+def spot_in_tolerance(x, indices, lay, fields, pupil, tol, onehot):
+    """Worst pupil cell's RMS spot radius (per-pixel blur), per field, in tolerance units."""
     with torch.no_grad():
         land, _, alive = gt.trace(to_batch(x, indices, lay), fields, pupil)
-        w = alive.double()
-        n = w.sum(2).clamp(min=1)
-        cx = (land[..., 0] * w).sum(2) / n
-        cy = (land[..., 1] * w).sum(2) / n
-        r2 = ((land[..., 0] - cx[..., None]) ** 2 + (land[..., 1] - cy[..., None]) ** 2) * w
-        return torch.sqrt(r2.sum(2) / n) / tol[None, :]
+        sq = torch.einsum("bfp,fpk->bfk", (cell_spread(land, alive, onehot) ** 2).sum(-1), onehot)
+        count = torch.einsum("bfp,fpk->bfk", alive.double(), onehot)
+        rms = torch.sqrt(sq / count.clamp(min=1.0))
+        return torch.where(count > 0, rms, torch.zeros_like(rms)).amax(-1) / tol[None, :]
 
 
 def run(out_dir, n_el, curved, count, steps, seed, device):
@@ -179,6 +226,7 @@ def run(out_dir, n_el, curved, count, steps, seed, device):
     fields_np = field_grid()
     fields = torch.tensor(fields_np, dtype=torch.float64, device=device)
     pupil = torch.tensor(pupil_samples(), dtype=torch.float64, device=device)
+    onehot = torch.tensor(pupil_cells(fields_np, pupil_samples()), dtype=torch.float64, device=device)
     tol = torch.tensor(tolerance_mm(fields_np), dtype=torch.float64, device=device)
     target = torch.tensor(ft.panel_radius_mm(np.radians(fields_np)), dtype=torch.float64, device=device)
     asph = torch.zeros(lay["size"], dtype=torch.bool, device=device)
@@ -188,7 +236,7 @@ def run(out_dir, n_el, curved, count, steps, seed, device):
     t0 = time.time()
     for it in range(steps):
         opt.zero_grad()
-        loss, info = merit(x, indices, lay, fields, pupil, tol, target)
+        loss, info = merit(x, indices, lay, fields, pupil, tol, target, onehot)
         loss.sum().backward()
         if it < steps // 3:
             x.grad[:, asph] = 0.0                                  # spheres + conics first
@@ -206,8 +254,8 @@ def run(out_dir, n_el, curved, count, steps, seed, device):
                   f"median {float(ld.median()):10.3f}  alive(best) {float(info['alive'][best]):.2f}  "
                   f"{time.time() - t0:6.0f} s", flush=True)
     with torch.no_grad():
-        loss, info = merit(x, indices, lay, fields, pupil, tol, target)
-    spot = spot_in_tolerance(x.detach(), indices, lay, fields, pupil, tol)
+        loss, info = merit(x, indices, lay, fields, pupil, tol, target, onehot)
+    spot = spot_in_tolerance(x.detach(), indices, lay, fields, pupil, tol, onehot)
     order = torch.argsort(loss)[:20]
     out = []
     for rank, b in enumerate(order.tolist()):

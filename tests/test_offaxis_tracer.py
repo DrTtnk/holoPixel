@@ -143,7 +143,7 @@ def test_a_tabulated_image_surface_lands_rays_like_the_analytic_one(device):
     grid = torch.linspace(0.0, 25.0, 25001, dtype=torch.float64, device=device)
     c = 1.0 / radius
     table = c * grid**2 / (1.0 + torch.sqrt(1.0 - c * c * grid**2))
-    tabulated = flat._replace(image_sag=(grid, table))
+    tabulated = flat._replace(image_sag=(grid**2, table))
     fields, pupil = torch.tensor(FIELDS, device=device), torch.tensor(PUPIL, device=device)
     ref, _, ok_ref = ot.trace(ot.pack([sphere], device), fields, pupil)
     got, _, ok = ot.trace(tabulated, fields, pupil)

@@ -190,7 +190,7 @@ def bowl(device):
     """The image surface: the vertex bowl of the variable-focal lenslet array, as
     a radial table in the image surface's local frame (rays arrive along -z)."""
     t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
-    return t(BOWL_R_MM), t(BOWL_SAG_MM)
+    return t(BOWL_R_MM**2), t(BOWL_SAG_MM)
 
 
 def pack(prescriptions, device):
@@ -242,7 +242,7 @@ def pupil_cells(fields_deg, pupil):
     return ids, int(ids.max()) + 1
 
 
-def context(device):
+def context(device, weights=W):
     fields = field_grid()
     pupil = pupil_samples()
     ids, n_cells = pupil_cells(fields, pupil)
@@ -250,7 +250,7 @@ def context(device):
     t = lambda a, dt=torch.float64: torch.tensor(a, dtype=dt, device=device)  # noqa: E731
     onehot = torch.nn.functional.one_hot(t(ids, torch.int64), n_cells).double()   # (F, P, K)
     fd = np.concatenate([fields, fields + [FD_DEG, 0.0], fields + [0.0, FD_DEG]])
-    return {"fields": t(fields), "fd_fields": t(fd), "pupil": t(pupil), "onehot": onehot,
+    return {"weights": dict(weights), "fields": t(fields), "fd_fields": t(fd), "pupil": t(pupil), "onehot": onehot,
             "tol": t(ft.blur_tolerance_rad(np.radians(fields[:, 0]), np.radians(fields[:, 1]))),
             "focal": t(ft.local_focal_mm(ecc)), "n_fields": len(fields)}
 
@@ -302,11 +302,11 @@ def residuals(x, indices, lay, ctx):
     used_cell = (count >= 2).double()                                  # (B, F, K)
     used_ray = torch.einsum("bfk,fpk->bfp", used_cell, ctx["onehot"])
     n_used = used_ray.sum((1, 2)).clamp(min=1.0)
-    r_blur = (ang / ctx["tol"][None, :, None, None] * torch.sqrt(W["blur"] * used_ray / n_used[:, None, None])[..., None])
+    r_blur = (ang / ctx["tol"][None, :, None, None] * torch.sqrt(ctx["weights"]["blur"] * used_ray / n_used[:, None, None])[..., None])
     b2 = torch.einsum("bfp,fpk->bfk", (ang**2).sum(-1), ctx["onehot"]) / count.clamp(min=1.0)
     b2 = b2 / ctx["tol"][None, :, None] ** 2
     n_cells = used_cell.sum((1, 2)).clamp(min=1.0)
-    r_hinge = torch.relu(torch.sqrt(b2 + 1e-18) - 0.6) * torch.sqrt(W["hinge"] * used_cell / n_cells[:, None, None])
+    r_hinge = torch.relu(torch.sqrt(b2 + 1e-18) - 0.6) * torch.sqrt(ctx["weights"]["hinge"] * used_cell / n_cells[:, None, None])
 
     A = jac / ctx["focal"][None, :, None, None]
     T = (A**2).sum((-1, -2))
@@ -314,13 +314,13 @@ def residuals(x, indices, lay, ctx):
     disc = torch.sqrt(torch.clamp(T**2 - 4 * D, min=0.0))
     log_s = 0.5 * torch.log(torch.clamp(torch.stack([(T + disc) / 2, (T - disc) / 2], -1), min=1e-12))
     lo, hi = math.log(RATIO_BAND[0]), math.log(RATIO_BAND[1])
-    r_ratio = torch.cat([torch.relu(lo - log_s), torch.relu(log_s - hi)], -1) * torch.sqrt(W["ratio"] * okd / F)[..., None]
+    r_ratio = torch.cat([torch.relu(lo - log_s), torch.relu(log_s - hi)], -1) * torch.sqrt(ctx["weights"]["ratio"] * okd / F)[..., None]
 
     h0 = land_fd[:, :F, 0]
-    r_panel = torch.relu(h0.abs() - PANEL_HALF_MM) * torch.sqrt(W["panel"] * okd / F)[..., None]
+    r_panel = torch.relu(h0.abs() - PANEL_HALF_MM) * torch.sqrt(ctx["weights"]["panel"] * okd / F)[..., None]
     cos_t = dir_fd[:, :F, 0, 2].abs()
     r_tilt = (torch.relu(torch.rad2deg(torch.acos(torch.clamp(cos_t, max=1.0 - 1e-12))) - TILT_MAX_DEG)
-              * torch.sqrt(W["tilt"] * okd / F))
+              * torch.sqrt(ctx["weights"]["tilt"] * okd / F))
 
     pts = diag["points"]                                               # (B, S, F, P, 3)
     live = alive[:, None].double()
@@ -350,11 +350,11 @@ def residuals(x, indices, lay, ctx):
     barrier = barrier + (torch.relu(DOMAIN_MIN - diag["domain"]) ** 2 * alive[:, None].double()).sum((1, 2, 3))
     norm = lambda v: torch.sqrt(v + 1e-30)  # noqa: E731
     r = torch.cat([r_blur.reshape(B, -1), r_hinge.reshape(B, -1), r_ratio.reshape(B, -1), r_panel.reshape(B, -1),
-                   r_tilt, norm(W["space"] * space)[:, None], norm(W["barrier"] * barrier)[:, None]], 1)
+                   r_tilt, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
     alive_all = (alive.double().sum((1, 2)) + okd.sum(1)) / (alive[0].numel() + ok_c.shape[1])
     sq = lambda t: (t**2).reshape(B, -1).sum(1)  # noqa: E731
     return r, {"blur": sq(r_blur), "hinge": sq(r_hinge), "ratio": sq(r_ratio), "panel": sq(r_panel),
-               "tilt": sq(r_tilt), "space": W["space"] * space, "barrier": W["barrier"] * barrier,
+               "tilt": sq(r_tilt), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
                "alive_all": alive_all}
 
 
@@ -432,7 +432,7 @@ def fd_jacobian(x, indices, lay, ctx, r0, free, lo, hi, h=1e-5):
     return J
 
 
-def run(out_dir, n_el, material, count, iters, seed, device):
+def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["ratio"], tag_suffix=""):
     """Batched Levenberg-Marquardt (damped least squares), one damping per
     design. Each iteration tries four dampings and keeps the best step that
     lowers the merit and loses no ray. High-order terms are frozen for the
@@ -440,7 +440,7 @@ def run(out_dir, n_el, material, count, iters, seed, device):
     lay = layout(n_el)
     rng = np.random.default_rng(seed)
     lo, hi = bounds(lay, device)
-    ctx = context(device)
+    ctx = context(device, {**W, "ratio": ratio_weight})
     with torch.no_grad():
         x, indices, tried = live_seeds(lay, count, material, rng, device, ctx, lo, hi)
         print(f"{count} live seeds from {tried} random designs", flush=True)
@@ -492,7 +492,7 @@ def run(out_dir, n_el, material, count, iters, seed, device):
                     "worst_cell_blur_per_field": worst[b].tolist(), "fields_deg": ctx["fields"].tolist(),
                     "indices": indices[b].tolist(), "x": x[b].detach().tolist(), "n_el": n_el,
                     "material": material, "prescription": to_prescription(x[b].detach(), indices[b], lay)})
-    tag = f"fold_el{n_el}_{material}"
+    tag = f"fold_el{n_el}_{material}{tag_suffix}"
     (Path(out_dir) / f"best_{tag}.json").write_text(json.dumps(out, indent=1))
     top = out[0]
     print(f"TOP {tag}: loss {top['loss']:.3f} blur {top['blur']:.3f} alive {top['alive_all']:.3f} "
@@ -507,10 +507,14 @@ def main():
     ap.add_argument("--designs", type=int, default=256)
     ap.add_argument("--iters", type=int, default=90)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ratio-weight", type=float, default=W["ratio"],
+                    help="weight of the magnification target; 0 leaves the mapping free (diagnostic)")
+    ap.add_argument("--tag", default="", help="suffix of the output file name")
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
-    run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"))
+    run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"),
+        ratio_weight=args.ratio_weight, tag_suffix=args.tag)
 
 
 if __name__ == "__main__":

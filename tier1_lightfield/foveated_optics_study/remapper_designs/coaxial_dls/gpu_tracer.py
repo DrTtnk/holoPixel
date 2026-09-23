@@ -32,6 +32,7 @@ class Batch(NamedTuple):
     k: torch.Tensor      # (B, S) conics
     a: torch.Tensor      # (B, S, 3) r^4, r^6, r^8 coefficients
     n: torch.Tensor      # (B, S) index AFTER each surface (last = medium at the image)
+    image_sag: tuple = ()  # optional (r^2 grid mm^2, sag mm): a radial tabulated image surface
 
 
 def pack(prescriptions, device, image=None):
@@ -77,6 +78,22 @@ def dsag_dr2(r2, c, k, a):
     return c / (2.0 * root) + 2 * a[..., 0] * r2 + 3 * a[..., 1] * r2**2 + 4 * a[..., 2] * r2**3
 
 
+def table_sag(r2, grid_r2, table):
+    """Radial tabulated sag, linear in r^2 between grid points (no square root:
+    finite derivatives on the axis): sag, d(sag)/d(r^2), and the domain mask."""
+    ok = r2 <= grid_r2[-1]
+    i = torch.clamp(torch.searchsorted(grid_r2, r2.detach().contiguous()) - 1, 0, len(grid_r2) - 2)
+    slope = (table[i + 1] - table[i]) / (grid_r2[i + 1] - grid_r2[i])
+    return table[i] + (r2 - grid_r2[i]) * slope, slope, ok
+
+
+def _newton_table(o, d, zv, grid, table, t):
+    p = o + t[..., None] * d
+    r2 = p[..., 0] ** 2 + p[..., 1] ** 2
+    f, g, _ = table_sag(r2, grid, table)
+    return t - (p[..., 2] - zv - f) / (d[..., 2] - g * 2.0 * (p[..., 0] * d[..., 0] + p[..., 1] * d[..., 1]))
+
+
 def _newton(o, d, zv, c, k, a, t):
     p = o + t[..., None] * d
     r2 = p[..., 0] ** 2 + p[..., 1] ** 2
@@ -108,21 +125,27 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
         c, k = batch.c[:, s, None, None], batch.k[:, s, None, None]
         a = batch.a[:, s, None, None, :]
         t = (zv - o[..., 2]) / d[..., 2]
+        tabulated = s == S - 1 and len(batch.image_sag) == 2
         with torch.no_grad():
             t_free = t.detach()
             for _ in range(NEWTON_STEPS - GRAD_STEPS):
-                t_free = _newton(o.detach(), d.detach(), zv.detach(), c.detach(), k.detach(), a.detach(), t_free)
+                t_free = (_newton_table(o.detach(), d.detach(), zv.detach(), *batch.image_sag, t_free) if tabulated
+                          else _newton(o.detach(), d.detach(), zv.detach(), c.detach(), k.detach(), a.detach(),
+                                       t_free))
         t = t_free
         for _ in range(GRAD_STEPS):
-            t = _newton(o, d, zv, c, k, a, t)
+            t = _newton_table(o, d, zv, *batch.image_sag, t) if tabulated else _newton(o, d, zv, c, k, a, t)
         p = o + t[..., None] * d
         r2 = p[..., 0] ** 2 + p[..., 1] ** 2
-        f, in_domain = sag(r2, c, k, a)
+        if tabulated:
+            f, g_tab, in_domain = table_sag(r2, *batch.image_sag)
+        else:
+            f, in_domain = sag(r2, c, k, a)
         if diagnostics:
             radius.append(torch.sqrt(r2))
             domain.append(1.0 - (1.0 + k) * c * c * r2)
             points.append(p.detach())
-        g = dsag_dr2(r2, c, k, a)
+        g = g_tab if tabulated else dsag_dr2(r2, c, k, a)
         normal = torch.stack([-2.0 * g * p[..., 0], -2.0 * g * p[..., 1], torch.ones_like(g)], dim=-1)
         normal = normal / torch.linalg.norm(normal, dim=-1, keepdim=True)
         converged = (p[..., 2] - zv - f).abs() < 1e-9

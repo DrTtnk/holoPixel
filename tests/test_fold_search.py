@@ -120,6 +120,6 @@ def test_the_image_surface_is_the_lens_vertex_bowl(designs, device):
     z = p[..., 2] - batch.z[:, -1, None, None]
     local = torch.stack([p[..., 0], y * torch.cos(a) + z * torch.sin(a), -y * torch.sin(a) + z * torch.cos(a)], -1)
     r = torch.linalg.norm(local[..., :2], dim=-1)[alive].cpu().numpy()
-    expected = np.interp(r, fs.BOWL_R_MM, fs.BOWL_SAG_MM)
+    expected = np.interp(r**2, fs.BOWL_R_MM**2, fs.BOWL_SAG_MM)
     assert local[..., 2][alive].cpu().numpy() == pytest.approx(expected, abs=1e-9)
     assert fs.BOWL_SAG_MM[0] == 0.0 and fs.BOWL_SAG_MM[-1] < -1.0          # ~1.5 mm deep

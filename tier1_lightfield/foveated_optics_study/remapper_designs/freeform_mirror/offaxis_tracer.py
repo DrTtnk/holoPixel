@@ -32,7 +32,7 @@ class Batch(NamedTuple):
     xy: torch.Tensor      # (B, S, I, J) coefficient of x^i y^j
     n: torch.Tensor       # (B, S) index after each surface
     mirror: tuple         # (S,) static: which surfaces reflect
-    image_sag: tuple = () # optional (r_grid, sag) mm: a radial tabulated image surface
+    image_sag: tuple = () # optional (r^2 grid mm^2, sag mm): a radial tabulated image surface
                           # (shared by the batch), replacing the last surface's shape
 
 
@@ -115,17 +115,14 @@ def _newton(o, d, c, k, C, t):
 _newton_fused = torch.compile(_newton, dynamic=True)
 
 
-def table_sag(x, y, grid, table):
-    """Radial tabulated sag, linear in r between grid points: sag, gradient and
-    the domain mask (r inside the table)."""
-    r = torch.sqrt(x**2 + y**2)
-    ok = r <= grid[-1]
-    i = torch.clamp(torch.searchsorted(grid, r.detach().contiguous()) - 1, 0, len(grid) - 2)
-    g0, g1, s0, s1 = grid[i], grid[i + 1], table[i], table[i + 1]
-    slope = (s1 - s0) / (g1 - g0)
-    s = s0 + (r - g0) * slope
-    rr = torch.clamp(r, min=1e-12)
-    return s, slope * x / rr, slope * y / rr, ok
+def table_sag(x, y, grid_r2, table):
+    """Radial tabulated sag, linear in r^2 between grid points (no square root:
+    finite derivatives on the axis): sag, gradient and the domain mask."""
+    r2 = x**2 + y**2
+    ok = r2 <= grid_r2[-1]
+    i = torch.clamp(torch.searchsorted(grid_r2, r2.detach().contiguous()) - 1, 0, len(grid_r2) - 2)
+    slope = (table[i + 1] - table[i]) / (grid_r2[i + 1] - grid_r2[i])          # d(sag)/d(r^2)
+    return table[i] + (r2 - grid_r2[i]) * slope, 2.0 * slope * x, 2.0 * slope * y, ok
 
 
 def _newton_table(o, d, grid, table, t):

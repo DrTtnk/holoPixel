@@ -112,7 +112,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -228,7 +229,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -344,7 +346,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -460,7 +463,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -576,7 +580,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -692,7 +697,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -808,7 +814,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -924,7 +931,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1040,7 +1048,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1156,7 +1165,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1272,7 +1282,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1388,7 +1399,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1504,7 +1516,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1620,7 +1633,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1736,7 +1750,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1852,7 +1867,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -1968,7 +1984,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -2084,7 +2101,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -2200,7 +2218,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  },
  {
@@ -2316,7 +2335,8 @@
   "layout": {
    "n_el": 5,
    "curved": false,
-   "size": 61
+   "size": 61,
+   "lenslets": "uniform"
   }
  }
 ]
