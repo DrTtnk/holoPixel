@@ -16,6 +16,9 @@ numba
 torch
 lion-pytorch
 
+# Sequential lens design (remapper optics)
+optiland
+
 # Tests
 pytest
 sympy

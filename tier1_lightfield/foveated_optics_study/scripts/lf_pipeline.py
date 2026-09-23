@@ -14,6 +14,7 @@ import numpy as np
 
 import mla_design as mla
 import mla_mesh
+import screen_spec as spec
 
 HERE = Path(__file__).resolve().parent
 BLENDER_SCRIPT = HERE / "lf_blender.py"
@@ -23,12 +24,12 @@ PUPIL_Y_MM = -3.6
 @dataclass(frozen=True)
 class Screen:
     panel_pixels: int
-    pixel_um: float = 4.0
-    side_um: float = 17.37
+    pixel_um: float = spec.PIXEL_UM
+    side_um: float = spec.LENS_SIDE_UM
     focal_um: float = 150.0
-    index: float = 1.5
-    min_thickness_um: float = 10.0
-    subdivisions: int = 3
+    index: float = spec.LENS_INDEX
+    min_thickness_um: float = spec.LENS_MIN_THICKNESS_UM
+    subdivisions: int = 2
     eye_relief_mm: float = 20.0
     gap_scale: float = 1.0
 

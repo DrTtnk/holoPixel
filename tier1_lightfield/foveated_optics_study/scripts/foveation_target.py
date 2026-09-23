@@ -4,19 +4,20 @@ A lens at panel radius r must appear at field eccentricity theta, with
 dr/dtheta = F(theta), the local focal length. F follows the Watson (temporal
 meridian) midget-RGC pitch, F = F0 * p(0) / p(theta), capped at F0 / R, and F0
 is set so that theta = 35 deg (the horizontal field edge) lands on the panel
-edge at 4.088 mm. The mapping is radial about the optical axis and keeps the
+edge (screen_spec). The mapping is radial about the optical axis and keeps the
 azimuth, so the 70 x 45 deg field fits on the square panel.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from retina_model import one_mosaic_spacing_deg
+import screen_spec as spec
+from retina_model import one_mosaic_spacing_deg, square_equivalent_pitch_deg
 
 RATIO = 6.0
-HALF_PANEL_MM = 4.088
+HALF_PANEL_MM = spec.PANEL_MM / 2.0
 EDGE_RAD = np.radians(35.0)
-LENS_NEIGHBOUR_MM = np.sqrt(3.0) * 17.37e-3
+LENS_NEIGHBOUR_MM = spec.LENS_PITCH_UM * 1e-3
 
 _TH = np.linspace(0.0, np.radians(60.0), 60001)
 _P0 = one_mosaic_spacing_deg(0.0, "temporal")
@@ -42,6 +43,18 @@ def eccentricity_rad(radius_mm):
 def target_pitch_rad(theta_rad):
     """Angular spacing between neighbouring lens centres at this eccentricity."""
     return LENS_NEIGHBOUR_MM / local_focal_mm(theta_rad)
+
+
+def retina_pitch_rad(theta_x_rad, theta_z_rad):
+    """Watson square-equivalent midget-RGC pitch in the direction (theta_x, theta_z)."""
+    return np.radians(square_equivalent_pitch_deg(np.degrees(theta_x_rad), np.degrees(theta_z_rad)))
+
+
+def blur_tolerance_rad(theta_x_rad, theta_z_rad):
+    """Blur the eye cannot see: the larger of the retina's own pitch there and
+    the display's sampling pitch there (detail finer than either is gone anyway)."""
+    ecc = np.arctan(np.hypot(np.tan(theta_x_rad), np.tan(theta_z_rad)))
+    return np.maximum(retina_pitch_rad(theta_x_rad, theta_z_rad), target_pitch_rad(ecc))
 
 
 def field_to_panel_mm(theta_x, theta_y):

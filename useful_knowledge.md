@@ -185,6 +185,9 @@
   `--index-strategy unsafe-best-match`.
 - `uv pip install` defaults to a 30s HTTP timeout, which is not enough for the
   ~500MB cuDNN wheel. Set `UV_HTTP_TIMEOUT=300`.
+- The venv has no pip of its own: with it activated, `pip` is still the
+  system miniforge Python 3.14 and would install there. Always
+  `VIRTUAL_ENV=.venv uv pip install ...`, and dry-run first.
 
 ## Session 2026-09-18 (continued)
 
@@ -489,6 +492,34 @@ instancing, never one object per element.
 - A hand-wound glass solid came out wound inwards, and Cycles then refracts with
   the index inverted, silently. The evaluator now rejects open or inward glass.
 
+### Wrong: ghosts are rays that land under the wrong lens
+
+The first evaluator grouped every ray by the lens above the pixel it landed
+on, and called rays far from that lens's direction ghosts. With a tilted chief
+ray at the panel, a lens's pupil cone correctly lands under its neighbour, and
+the metric booked it as the neighbour's ghost. The coaxial and mirror designs
+scored ghost fractions of 0.98 and 0.96; grouped by the lens each ray actually
+ENTERS (a second Cycles render with the MLA emitting its own lens id), they are
+0.54 and 0.085. A real ghost is a pixel reached through two lenses whose field
+directions are more than a few pitches apart: that pixel must show two things.
+Consequence for design: strict image-side telecentricity is not required, only
+a smooth tilt.
+
+### Wrong: the earlier remapper designs were physical
+
+At the radii their rays actually used, the coaxial designs had lens front and
+back surfaces crossing (negative edge thickness, -8.7 mm on one element), and
+rays wandering past 200 mm. Optiland and the agents' tracers have no
+apertures, so rays passed through "negative glass"; the Cycles export hid it by
+clipping the solids. The DLS merit now scores edge thickness and air gaps at
+the used radius.
+
+### Test isolation: an imported module changed torch globally
+
+remapper_designs/coaxial/src/design_opt.py calls torch.set_default_dtype(float64)
+at import. Importing it in one test module made a later, unrelated test fail
+(ComplexDouble vs ComplexFloat). Restore the default right after such imports.
+
 ### Wrong: a pinhole view proves a light-field screen
 
 With the panel at the lenslet focal plane every pixel is one collimated beam,
@@ -514,3 +545,26 @@ Vertices at 30 + 60*i degrees give a POINTY-TOP hexagon. Its tiling is
 dx = sqrt(3)*R within a row and dy = 1.5*R between rows, with odd rows offset
 by dx/2. The original script used the flat-top formulas (dx = 1.5*R,
 dy = sqrt(3)*R), which overlapped neighbours horizontally.
+
+## A frame change that swaps two axes is a mirror, and it turns solids inside out
+
+show_candidates.to_world first mapped tracer (x, y, z) to world (x, z, y). That
+matrix has determinant -1: a reflection. For the eyeball scene nothing looked
+wrong, but every exported lens would have had inverted winding, and Cycles
+refracts an inward-wound solid with the index inverted. Use a proper rotation
+(world = (x, z, -y)) and check det = +1 whenever you permute axes.
+
+## Per-pixel blur, not per-lens pupil spread, is what the eye sees
+
+The first evaluator scored blur as the RMS spread of all pupil rays through a
+lens. Each pixel's beam crosses only part of the pupil, so the eye sees the
+spread of the rays that reach ONE pixel. On the direct view (f = 150 um, L = 20 mm) the old
+number was 4.1x the new one near the axis (72 mrad against 17.7 mrad).
+
+## A plane-symmetric search traces half the field; the export must not
+
+fold_search traces only theta_x >= 0 (the system is symmetric in x). The first
+export_fold sized the mirror and corrector meshes from those traced hits, so
+the other half of the optics was simply missing and Cycles saw light only
+from theta_x < ~7 deg (coverage 0.55). Any geometry derived from a
+symmetry-reduced trace must be re-symmetrised before it leaves the search.

@@ -1,0 +1,256 @@
+"""Export one folded-remapper design to the shared evaluator contract (lf_evaluate.py).
+
+    python export_fold.py <best_fold_*.json> <out_dir> [--rank 0] [--focal-um 114]
+
+The mirror becomes a freeform sheet, each corrector a closed freeform solid
+(the back surface is sampled along the front surface's local axis), both with
+exact loop normals and sized to the traced footprint plus MARGIN_MM. The
+lenslet array's vertex sits on the design's image surface, facing the light.
+World frame (lf_blender.py): +Y forward, +Z up, pupil at y = PUPIL_Y_MM; the
+tracer frame (z forward, y up) maps by the proper rotation (x, y, z) ->
+(-x, PUPIL_Y_MM + z, y).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1] / "scripts"))
+
+import fold_search as fs  # noqa: E402
+import lf_pipeline as lp  # noqa: E402
+import mla_design as mla  # noqa: E402
+import offaxis_tracer as ot  # noqa: E402
+import screen_spec as spec  # noqa: E402
+
+MARGIN_MM = 1.0
+GRID = 161
+TRACER_TO_WORLD = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])   # rows: tracer x, y, z
+
+
+def to_world(p):
+    return np.asarray(p) @ TRACER_TO_WORLD + np.array([0.0, lp.PUPIL_Y_MM, 0.0])
+
+
+def _frame(batch, s):
+    """Origin and local axes (rows) of surface s in the tracer frame."""
+    a = float(batch.rx[0, s])
+    o = np.array([0.0, float(batch.y[0, s]), float(batch.z[0, s])])
+    axes = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(a), np.sin(a)], [0.0, -np.sin(a), np.cos(a)]])
+    return o, axes
+
+
+def _sag(batch, s, x, y):
+    t = lambda v: torch.as_tensor(v, dtype=torch.float64)  # noqa: E731
+    f, sx, sy, ok = ot.sag(t(x), t(y), batch.c[0, s].cpu(), batch.k[0, s].cpu(), batch.xy[0, s].cpu())
+    if not bool(ok.all()):
+        raise ValueError(f"surface {s}: the exported region leaves the sag domain")
+    return f.numpy(), sx.numpy(), sy.numpy()
+
+
+def _local(batch, s, p):
+    o, axes = _frame(batch, s)
+    return (p - o) @ axes.T
+
+
+def _global(batch, s, p):
+    o, axes = _frame(batch, s)
+    return p @ axes + o
+
+
+def _grid(batch, s, hits):
+    """Rectangle over the footprint (+ margin) in surface s's local x, y. The
+    search traces only the theta_x >= 0 half field (plane symmetry), so the
+    rectangle is made symmetric in x."""
+    loc = _local(batch, s, hits)
+    lo, hi = loc[:, :2].min(0) - MARGIN_MM, loc[:, :2].max(0) + MARGIN_MM
+    half_x = max(-lo[0], hi[0])
+    lo[0], hi[0] = -half_x, half_x
+    gx, gy = np.meshgrid(np.linspace(lo[0], hi[0], GRID), np.linspace(lo[1], hi[1], GRID), indexing="ij")
+    return gx, gy
+
+
+def _surface(batch, s, gx, gy):
+    f, sx, sy = _sag(batch, s, gx, gy)
+    loc = np.stack([gx, gy, f], -1)
+    n = np.stack([-sx, -sy, np.ones_like(sx)], -1)
+    n /= np.linalg.norm(n, axis=-1, keepdims=True)
+    _, axes = _frame(batch, s)
+    return _global(batch, s, loc.reshape(-1, 3)), (n.reshape(-1, 3) @ axes)
+
+
+def _quads(n0, n1, base=0):
+    idx = np.arange(n0 * n1).reshape(n0, n1) + base
+    a, b, c, d = idx[:-1, :-1], idx[1:, :-1], idx[1:, 1:], idx[:-1, 1:]
+    return np.concatenate([np.stack([a, b, c], -1).reshape(-1, 3), np.stack([a, c, d], -1).reshape(-1, 3)])
+
+
+def _orient(verts, faces, vertex_normals):
+    """Loop normals that agree with the face winding (flip the analytic ones if needed)."""
+    geo = np.cross(verts[faces[:, 1]] - verts[faces[:, 0]], verts[faces[:, 2]] - verts[faces[:, 0]])
+    n = vertex_normals[faces]                                            # (M, 3, 3)
+    sign = np.sign(np.einsum("mc,mkc->m", geo, n).sum())
+    return (sign * n).reshape(-1, 3)
+
+
+def _back_along_front_axis(batch, s_front, s_back, gx, gy):
+    """Points of the back surface on the lines through the front grid along the
+    front's local z axis, as local (x, y) of the back surface."""
+    f, _, _ = _sag(batch, s_front, gx, gy)
+    start = _global(batch, s_front, np.stack([gx, gy, f], -1).reshape(-1, 3))
+    _, axes_f = _frame(batch, s_front)
+    o = torch.as_tensor(_local(batch, s_back, start))
+    _, axes_b = _frame(batch, s_back)
+    d = torch.as_tensor(np.broadcast_to(axes_f[2] @ axes_b.T, o.shape).copy())
+    c, k, C = batch.c[0, s_back].cpu(), batch.k[0, s_back].cpu(), batch.xy[0, s_back].cpu()
+    t = -o[:, 2] / d[:, 2]
+    for _ in range(ot.NEWTON_STEPS):
+        t = ot._newton(o, d, c, k, C, t)
+    p = o + t[:, None] * d
+    f_b, _, _ = _sag(batch, s_back, p[:, 0].numpy(), p[:, 1].numpy())
+    if np.max(np.abs(p[:, 2].numpy() - f_b)) > 1e-9:
+        raise ValueError(f"surface {s_back}: back surface not reached along the front axis")
+    return p[:, 0].numpy().reshape(gx.shape), p[:, 1].numpy().reshape(gx.shape)
+
+
+def _solid(batch, s_front, s_back, hits_front, hits_back):
+    # the rectangle must hold both footprints (rays cross the glass obliquely),
+    # so project the back hits onto the front's local x, y along its axis
+    gx, gy = _grid(batch, s_front, np.concatenate([hits_front, hits_back]))
+    vf, nf = _surface(batch, s_front, gx, gy)
+    bx, by = _back_along_front_axis(batch, s_front, s_back, gx, gy)
+    vb, nb = _surface(batch, s_back, bx, by)
+    N = GRID * GRID
+    ff, fb = _quads(GRID, GRID), _quads(GRID, GRID, N)[:, ::-1]
+    ring = np.concatenate([np.arange(GRID) * GRID, (GRID - 1) * GRID + np.arange(GRID),
+                           (np.arange(GRID) * GRID + GRID - 1)[::-1], (np.arange(GRID))[::-1]])
+    ring = np.array([r for i, r in enumerate(ring) if i == 0 or r != ring[i - 1]])
+    ring = ring[:-1] if ring[-1] == ring[0] else ring
+    a, b = ring, np.roll(ring, -1)
+    # the front grid's boundary edges run a -> b along the ring, so the walls use b -> a
+    side = np.concatenate([np.stack([b, a, a + N], -1), np.stack([b, a + N, b + N], -1)])
+    verts = np.concatenate([vf, vb])
+    faces = np.concatenate([ff, fb, side])
+    vol = np.einsum("ij,ij->i", verts[faces[:, 0]], np.cross(verts[faces[:, 1]], verts[faces[:, 2]])).sum()
+    if vol < 0:
+        faces = faces[:, ::-1]
+    n_opt = len(ff) + len(fb)
+    loops_f = _orient(verts, faces[:len(ff)], np.concatenate([nf, nb]))
+    loops_b = _orient(verts, faces[len(ff):n_opt], np.concatenate([nf, nb]))
+    geo = np.cross(verts[faces[n_opt:, 1]] - verts[faces[n_opt:, 0]], verts[faces[n_opt:, 2]] - verts[faces[n_opt:, 0]])
+    geo /= np.linalg.norm(geo, axis=1, keepdims=True)
+    loops = np.concatenate([loops_f, loops_b, np.repeat(geo, 3, axis=0)])
+    return verts, faces, loops
+
+
+def baffle_geometry(hardware):
+    """L-shaped black shield in the tracer frame (fold_search's baffle): a plate
+    on the baffle plane from the face plane to just beyond the hardware's far
+    edge, and a wall in the face plane up to above the hardware. Every line of
+    sight from the pupil to hardware above the plane crosses one of them."""
+    tan = np.tan(np.radians(fs.TOP_FIELD_DEG))
+    height = lambda z: z * tan + fs.spec.PUPIL_DIAMETER_MM / 2 + fs.BAFFLE_OFFSET_MM  # noqa: E731
+    z0, z1 = fs.MIN_Z_MM, hardware[:, 2].max() + fs.BAFFLE_CLEAR_MM / 2
+    y_top = hardware[:, 1].max() + 1.0
+    w = np.abs(hardware[:, 0]).max() + 3.0
+    verts = np.array([[-w, height(z0), z0], [w, height(z0), z0], [w, height(z1), z1], [-w, height(z1), z1],
+                      [-w, y_top, z0], [w, y_top, z0]])
+    faces = np.array([[0, 1, 2], [0, 2, 3], [0, 4, 5], [0, 5, 1]])
+    return verts, faces
+
+
+def export(best_json, out_dir, rank=0, focal_um=114.0, device="cuda"):
+    entry = json.loads(Path(best_json).read_text())[rank]
+    return export_entry(entry, out_dir, focal_um, device, source={"design": Path(best_json).name, "rank": rank})
+
+
+def export_entry(entry, out_dir, focal_um=114.0, device="cuda", source=None):
+    dev = torch.device(device)
+    lay = fs.layout(entry["n_el"])
+    x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
+    idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
+    batch = fs.to_batch(x, idx, lay)
+    ctx = fs.context(dev)
+    with torch.no_grad():
+        _, d_img, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+    if not bool(alive.all()):
+        raise ValueError("the design loses rays; it cannot be exported")
+    pts = diag["points"][0].cpu().numpy().reshape(batch.z.shape[1], -1, 3)
+    batch = ot.Batch(*(t.detach().cpu() for t in batch[:7]), mirror=batch.mirror)
+    data = {}
+    gx, gy = _grid(batch, 0, pts[0])
+    vm, nm = _surface(batch, 0, gx, gy)
+    fm = _quads(GRID, GRID)
+    surfaces = [("mirror", vm, fm, _orient(vm, fm, nm), None)]
+    for e in range(entry["n_el"]):
+        v, f, n = _solid(batch, 1 + 2 * e, 2 + 2 * e, pts[1 + 2 * e], pts[2 + 2 * e])
+        surfaces.append(("glass", v, f, n, entry["indices"][e]))
+    for k, (kind, v, f, n, index) in enumerate(surfaces):
+        data.update({f"surf{k}_kind": kind, f"surf{k}_verts": to_world(v), f"surf{k}_faces": f,
+                     f"surf{k}_normals": n @ TRACER_TO_WORLD})
+        if index is not None:
+            data[f"surf{k}_index"] = index
+    hardware = np.concatenate([np.concatenate([s[1] for s in surfaces[1:]]),
+                               fs.panel_corners(batch)[0].numpy()])
+    bv, bf = baffle_geometry(hardware)
+    k = len(surfaces)
+    data.update({f"surf{k}_kind": "absorber", f"surf{k}_verts": to_world(bv), f"surf{k}_faces": bf})
+    data["n_surfaces"] = k + 1
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    np.savez(out / "remapper.npz", **data)
+
+    s_img = batch.z.shape[1] - 1
+    o, axes = _frame(batch, s_img)
+    toward_light = -np.sign(float(d_img[0, ..., 2].mean())) * axes[2]
+    u = axes[0]
+    v = np.cross(toward_light, u)
+    basis = np.stack([u, v, toward_light]) @ TRACER_TO_WORLD
+    radius = mla.radius_for_focal_length_um(focal_um, spec.LENS_INDEX)
+    thickness_um = spec.LENS_MIN_THICKNESS_UM + float(mla.sag_um(spec.LENS_SIDE_UM, radius))
+    origin = to_world(o) - thickness_um * 1e-3 * basis[2]
+    design = {"focal_um": focal_um, "remapper_npz": "remapper.npz",
+              "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
+              "source": {**(source or {}), "material": entry["material"]}}
+    (out / "design.json").write_text(json.dumps(design, indent=1))
+    np.savez(out / "rays.npz", **fans(entry, dev))
+    return out
+
+
+FAN_FIELDS = ((0.0, 0.0), (0.0, 22.5), (0.0, -22.5), (35.0, 0.0), (35.0, 22.5), (35.0, -22.5), (17.0, 0.0))
+FAN_PUPIL = tuple((0.0, py) for py in (-1.0, -0.5, 0.0, 0.5, 1.0))
+
+
+def fans(entry, dev):
+    """World-frame polylines (pupil -> every surface) for a few fields, for viewing."""
+    lay = fs.layout(entry["n_el"])
+    x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
+    idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
+    t = lambda a: torch.tensor(a, dtype=torch.float64, device=dev)  # noqa: E731
+    with torch.no_grad():
+        _, _, alive, diag = ot.trace(fs.to_batch(x, idx, lay), t(FAN_FIELDS), t(FAN_PUPIL), diagnostics=True)
+    pts = diag["points"][0].cpu().numpy()                               # (S, F, P, 3)
+    start = np.array([[0.0, py * 2.0, 0.0] for _, py in FAN_PUPIL])
+    paths = np.concatenate([np.broadcast_to(start, (len(FAN_FIELDS),) + start.shape)[None], pts], 0)
+    return {"paths": to_world(np.moveaxis(paths, 0, 2)), "alive": alive[0].cpu().numpy(),
+            "fields": np.array(FAN_FIELDS)}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("best_json")
+    ap.add_argument("out_dir")
+    ap.add_argument("--rank", type=int, default=0)
+    ap.add_argument("--focal-um", type=float, default=114.0)
+    args = ap.parse_args()
+    print(export(args.best_json, args.out_dir, args.rank, args.focal_um))
+
+
+if __name__ == "__main__":
+    main()

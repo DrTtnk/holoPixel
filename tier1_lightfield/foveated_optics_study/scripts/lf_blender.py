@@ -25,9 +25,11 @@ Modes:
   calibrate  panel emits its pixel index (R = i, G = j, B = 1); per view, the
              panel pixel each camera ray lands on, plus each view's world ray
              directions. Cameras use a lens shift to frame the panel.
-  evaluate   panel emits (lens + 1, i + 1, j + 1); per view, the owning lens of
-             the pixel each camera ray lands on, saved to disk. Cameras keep a
-             fixed orientation, so one direction render serves every view.
+  evaluate   per view, saved to disk: the panel pixel each camera ray reaches
+             (panel emits (1, i + 1, j + 1)), and the lens it enters (second
+             render, MLA opaque, emitting lens + 1 from its face attribute).
+             Cameras keep a fixed orientation, so one direction render serves
+             every view.
   display    panel emits the given image; renders each view.
   build      panel emits the given image; saves the scene (save_blend), no render.
   target     no screen: renders the virtual 3D `content` through the same pupil
@@ -188,8 +190,29 @@ def absorber(name):
 def add_mla(cfg):
     m = np.load(cfg["mla_npz"])
     _, basis = pose_matrix(cfg)
-    return link("MLA", panel_to_world(m["verts"], cfg), m["faces"], m["loop_normals"] @ basis,
-                glass("MLA_glass", cfg["index"]))
+    obj = link("MLA", panel_to_world(m["verts"], cfg), m["faces"], m["loop_normals"] @ basis,
+               glass("MLA_glass", cfg["index"]))
+    if "face_lens" in m:
+        attr = obj.data.attributes.new("lens", "FLOAT", "FACE")
+        attr.data.foreach_set("value", m["face_lens"].astype(np.float32))
+    return obj
+
+
+def lens_id_material():
+    """Opaque: emits (lens + 1) of the face hit, 0 on walls and floor (lens -1)."""
+    def build(nt):
+        a = nt.nodes.new("ShaderNodeAttribute")
+        a.attribute_type = "GEOMETRY"
+        a.attribute_name = "lens"
+        add = nt.nodes.new("ShaderNodeMath")
+        add.operation = "ADD"
+        add.inputs[1].default_value = 1.0
+        em = nt.nodes.new("ShaderNodeEmission")
+        em.inputs["Strength"].default_value = 1.0
+        nt.links.new(a.outputs["Fac"], add.inputs[0])
+        nt.links.new(add.outputs["Value"], em.inputs["Color"])
+        return em.outputs["Emission"]
+    return node_material("MLA_lens_id", build)
 
 
 def add_remapper(cfg):
@@ -391,19 +414,33 @@ def calibrate(cfg, cam, tmp):
     return {"ids": np.stack(ids), "direction": np.stack(directions)}
 
 
+def _decode(channel, what, k):
+    valid = channel > 0.5
+    worst = float(np.max(np.abs(channel[valid] - np.rint(channel[valid])))) if valid.any() else 0.0
+    if worst > 1e-3:
+        raise RuntimeError(f"view {k}: {what} ids are not integers (worst {worst}); radiance was scaled")
+    return np.where(valid, np.rint(channel) - 1, -1).astype(np.int32)
+
+
 def evaluate(cfg, cam, out_dir):
+    """Per view: the panel pixel each camera ray reaches (pix_k, flat j*N+i), and
+    the lens it enters (entered_k), read from a second render in which the MLA
+    is opaque and emits its own lens id."""
     sc = bpy.context.scene
     sc.cycles.samples = 1
     sc.cycles.filter_width = 0.01
+    n = cfg["panel_pixels"]
+    mla = bpy.data.objects["MLA"]
+    glass_mat, id_mat = mla.data.materials[0], lens_id_material()
     for k, view in enumerate(cfg["views_mm"]):
         place(cam, view, None)
         a = render(out_dir / f"eval_{k}.exr")
-        raw = a[:, :, 0]
-        valid = raw > 0.5
-        worst = float(np.max(np.abs(raw[valid] - np.rint(raw[valid])))) if valid.any() else 0.0
-        if worst > 1e-3:
-            raise RuntimeError(f"view {k}: lens ids are not integers (worst {worst}); radiance was scaled")
-        np.save(out_dir / f"lens_{k}.npy", np.where(valid, np.rint(raw) - 1, -1).astype(np.int32))
+        i, j = _decode(a[:, :, 1], "pixel column", k), _decode(a[:, :, 2], "pixel row", k)
+        np.save(out_dir / f"pix_{k}.npy", np.where((i >= 0) & (j >= 0), j * n + i, -1).astype(np.int32))
+        mla.data.materials[0] = id_mat
+        a = render(out_dir / f"entered_{k}.exr")
+        np.save(out_dir / f"entered_{k}.npy", _decode(a[:, :, 0], "entered lens", k))
+        mla.data.materials[0] = glass_mat
     hide_all_meshes()
     direction_world()
     place(cam, cfg["views_mm"][0], None)
@@ -449,8 +486,7 @@ def main():
     if cfg["mode"] == "calibrate":
         rgb = np.stack([i, j, np.ones_like(i)], axis=-1).astype(np.float32)
     elif cfg["mode"] == "evaluate":
-        owner = np.load(cfg["pixel_owner_npy"]).astype(np.float32)
-        rgb = np.stack([owner + 1, i + 1, j + 1], axis=-1).astype(np.float32)
+        rgb = np.stack([np.ones_like(i), i + 1, j + 1], axis=-1).astype(np.float32)
     else:  # display, build
         rgb = np.load(cfg["panel_image_npy"])
     add_panel(cfg, rgb)

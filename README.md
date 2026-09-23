@@ -58,7 +58,22 @@ and need `blender` on the `PATH`; they take a few minutes. Skip them with
 light-field screen: a real hex microlens array over the panel, optional
 remapper optics, and pinhole or 4 mm-aperture eye cameras at the schematic
 eye's pupil. `lf_evaluate.py <design_dir>` is the shared acceptance evaluator
-for remapper designs (contract in its docstring).
+for remapper designs (contract in its docstring); its blur is the per-pixel
+beam width at the eye.
+
+Remapper design searches (GPU, float64), under `remapper_designs/`:
+
+```bash
+cd tier1_lightfield/foveated_optics_study/remapper_designs
+# coaxial lenses: search, export a candidate, score it in Cycles
+python coaxial_dls/gpu_search.py <out> --elements 5
+python coaxial_dls/export_candidate.py <out>/best_el5_flat.json <design_dir>
+# folded: panel above the eye, freeform mirror, 1-2 freeform correctors
+python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or glass
+python freeform_mirror/export_fold.py <out>/best_fold_el1_resin.json <design_dir>
+blender -b --factory-startup --python freeform_mirror/view_fold_blender.py -- <design_dir> view.blend
+python ../scripts/lf_evaluate.py <design_dir> --pixels 2560
+```
 
 ## Run Simulations
 

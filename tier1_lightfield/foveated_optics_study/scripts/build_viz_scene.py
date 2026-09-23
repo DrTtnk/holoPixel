@@ -3,7 +3,8 @@
     python build_viz_scene.py --work <scratch dir> --content chart --out ../blender/direct_view_lightfield.blend
     python build_viz_scene.py --work <scratch dir> --content 3d    --out ../blender/direct_view_parallax.blend
 
-Full scale: 2044^2 px of 4 um under 85k hex lenses (f = 150 um), 20 mm in front
+Full scale: the screen_spec micro-OLED (2560^2 px of 7.2 um) under ~300k hex lenses
+(f = 150 um), 20 mm in front
 of the schematic eye's pupil. The panel shows content encoded through a Cycles
 calibration from a 0.5 mm hex grid of pupil points, so the saved scene's pupil
 camera sees it through the real lenses.
@@ -28,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 import lf_pipeline as lp
+import screen_spec as spec
 
 HERE = Path(__file__).resolve().parent
 SQUARE_DEG = 4.0
@@ -96,7 +98,7 @@ def main():
     renders = out.parent.parent / "renders"
     renders.mkdir(exist_ok=True)
 
-    screen = lp.Screen(panel_pixels=2044)
+    screen = lp.Screen(panel_pixels=spec.PANEL_PIXELS)
     fov = math.degrees(2 * math.atan(screen.panel_um * 1e-3 / 2 * 1.1 / screen.eye_relief_mm))
     res = 1024
     cal_views = lp.hex_views_mm(0.5, 2.0)

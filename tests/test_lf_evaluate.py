@@ -129,17 +129,87 @@ def test_direct_view_blur_is_the_pupil_spread_plus_the_lens_aperture(direct):
     pupil_rms = math.sqrt(np.mean(np.sum(views**2, axis=1))) / RELIEF
     aperture_rms = ev.HEX_RMS_PITCH * math.sqrt(3.0) * ev.SIDE_UM * 1e-3 / RELIEF
     expected = math.hypot(pupil_rms, aperture_rms)
-    measured = np.median(pl["spread_all_rad"][_central(pl)])
+    measured = np.median(pl["lens_spread_rad"][_central(pl)])
     assert measured == pytest.approx(expected, rel=0.05)
 
 
-def test_direct_view_pupil_spread_is_mostly_ghosts_for_the_acceptance_metric(direct):
-    """The whole-pupil spread (~70 mrad) dwarfs 3 target pitches (~2.7 mrad), so
-    the acceptance metric must call almost all of it ghosts: a direct-view
-    screen is not a foveated remapper and must fail."""
+def _predicted_pixel_blur_rad(centre_um):
+    """Paraxial prediction for one direct-view lens: a ray from pupil point v
+    enters the lens at c with direction (c - v) / L and lands at c + f (c - v) / L,
+    so every pupil point picks one pixel. A pixel's beam width is the spread of
+    the directions of the pupil points that pick it, plus the lens aperture seen
+    from each point. Ray-weighted RMS over the lens's pixels, every view equal."""
+    views = lp.hex_views_mm(0.5, 2.0)
+    c_mm = centre_um * 1e-3
+    direction = (c_mm[None] - views) / RELIEF
+    land = centre_um[None] + FOCAL * direction
+    half = PIXELS * ev.PIXEL_UM / 2
+    pixel = np.floor((land + half) / ev.PIXEL_UM).astype(int)
+    key = pixel[:, 0] + PIXELS * pixel[:, 1]
+    aperture2 = (ev.HEX_RMS_PITCH * math.sqrt(3.0) * ev.SIDE_UM * 1e-3 / RELIEF) ** 2
+    sq = [np.sum((direction[key == u] - direction[key == u].mean(0)) ** 2) + np.sum(key == u) * aperture2
+          for u in np.unique(key)]
+    return math.sqrt(sum(sq) / len(views))
+
+
+def test_direct_view_blur_is_the_spread_of_each_pixels_own_pupil_points(direct):
+    """Per pixel, not per lens: the eye sees each pixel's beam, which crosses
+    only the part of the pupil whose pupil points land on that pixel."""
+    _, pl = direct
+    central = _central(pl)
+    lenses = pl["lens"][central]
+    predicted = np.array([_predicted_pixel_blur_rad(pl["centres"][i]) for i in lenses])
+    ratio = pl["blur_rad"][central] / predicted
+    assert np.median(ratio) == pytest.approx(1.0, abs=0.05)
+    assert np.percentile(ratio, 10) > 0.85 and np.percentile(ratio, 90) < 1.15
+    assert np.median(pl["blur_rad"][central]) < 0.5 * np.median(pl["lens_spread_rad"][central])
+
+
+def test_direct_view_fails_on_blur_not_on_ghosts(direct):
+    """Each pixel of a direct-view screen is seen through one lens only, so
+    there are almost no ghosts; but each pixel's beam spans its whole direction
+    bin (pixel / focal = 48 mrad), many times the tolerance, so it must fail on blur."""
     rep, pl = direct
-    assert np.median(pl["ghost"][_central(pl)]) > 0.9
+    assert np.median(pl["ghost"][_central(pl)]) < 0.05
+    assert rep["blur_pitch"]["median"] > 5    # measured 8.5; the pixel-by-pixel value is checked above
+    assert not rep["accept"]["checks"]["blur"]
     assert not rep["accept"]["passed"]
+
+
+WEDGE_DEG = 16.0
+
+
+@pytest.fixture(scope="module")
+def wedge(tmp_path_factory):
+    """Direct view through a thin glass wedge just in front of the MLA: every
+    ray is deviated by ~(n-1)*16 deg = 8 deg right before the lenses, so each
+    lens's pupil cone arrives ~7.5 deg off axis and lands ~f*tan(7.5 deg) = 20 um
+    off its own centre, under its neighbour. (A wedge near the eye would not do:
+    the incidence at a lens is set by the straight path from the wedge exit to
+    that lens, so a distant wedge mostly just shifts which field sees it.)"""
+    base = tmp_path_factory.mktemp("eval_wedge")
+    t0, half = 3.0, 6.0
+    y0 = lp.PUPIL_Y_MM + RELIEF - 6.0
+    slope = math.tan(math.radians(WEDGE_DEG))
+    front = [(x, y0, z) for x, z in ((-half, -half), (half, -half), (half, half), (-half, half))]
+    back = [(x, y0 + t0 + slope * x, z) for x, _, z in front]
+    verts = np.array(front + back)
+    faces = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+                      [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]])[:, ::-1]
+    y_vertex = lp.PUPIL_Y_MM + RELIEF
+    pose = {"origin_mm": [0.0, y_vertex + T_C * 1e-3, 0.0],
+            "basis": [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]}
+    path = write_design(base / "design", pose, [("glass", verts, faces, {"index": 1.5})])
+    rep = ev.evaluate(path, base / "work", panel_pixels=PIXELS, resolution=1536, fov_deg=40.0)
+    return rep, np.load(base / "work" / "per_lens.npz")
+
+
+def test_a_tilted_chief_ray_lands_under_the_neighbour_without_ghosts(wedge):
+    """The regression the lens-entered grouping fixes: grouping by the lens
+    above the landing pixel would call these rays ghosts of the neighbour."""
+    rep, pl = wedge
+    assert rep["landing_offset_um"]["median"] > math.sqrt(3.0) * ev.SIDE_UM / 2
+    assert rep["ghost"]["mean"] < 0.05
 
 
 def test_direct_view_is_seen_from_the_whole_pupil(direct):
@@ -166,7 +236,7 @@ def test_direct_view_eye_relief_is_measured_to_the_lens_vertex(direct):
 def test_a_flat_mirror_fold_changes_no_optical_metric(direct, folded):
     (rd, pd), (rf, pf) = direct, folded
     assert rf["lenses_in_fov"] == pytest.approx(rd["lenses_in_fov"], rel=0.02)
-    for key in ("spread_all_rad", "fill"):
+    for key in ("lens_spread_rad", "fill"):
         assert np.median(pf[key]) == pytest.approx(np.median(pd[key]), rel=0.02), key
     assert np.median(pf["ratio"]) == pytest.approx(np.median(pd["ratio"]), rel=0.02)
     assert rf["geometry"]["eye_relief_mm"] == pytest.approx(8.0, abs=0.01)
@@ -179,15 +249,21 @@ def test_a_coated_glass_prism_fold_matches_the_unfolded_screen(direct, coated_fo
     L = a + t/n + b = 20 mm, seen from the same pupil."""
     (rd, pd), (rf, pf) = direct, coated_fold
     assert rf["lenses_in_fov"] == pytest.approx(rd["lenses_in_fov"], rel=0.02)
-    assert np.median(pf["spread_all_rad"]) == pytest.approx(np.median(pd["spread_all_rad"]), rel=0.02)
+    assert np.median(pf["lens_spread_rad"]) == pytest.approx(np.median(pd["lens_spread_rad"]), rel=0.02)
     assert np.median(pf["ratio"]) == pytest.approx(np.median(pd["ratio"]), rel=0.02)
     assert np.median(pf["fill"]) == pytest.approx(np.median(pd["fill"]), abs=1.5 / 61)
     assert rf["geometry"]["eye_relief_mm"] == pytest.approx(PRISM_ENTRY, abs=0.01)
 
 
 def _visible_from_each_view(work, lens):
+    """Pupil points from which some ray enters `lens` and reaches the panel."""
     views = lp.hex_views_mm(0.5, 2.0)
-    return np.array([lens in np.load(work / "views" / f"lens_{k}.npy") for k in range(len(views))])
+    seen = []
+    for k in range(len(views)):
+        ent = np.load(work / "views" / f"entered_{k}.npy")
+        pix = np.load(work / "views" / f"pix_{k}.npy")
+        seen.append(bool(np.any((ent == lens) & (pix >= 0))))
+    return np.array(seen)
 
 
 def test_the_tir_fold_loses_exactly_the_pupil_points_below_the_critical_angle(direct, tir_fold, tmp_path_factory):
