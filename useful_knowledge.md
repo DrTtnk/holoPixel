@@ -611,3 +611,18 @@ on a ~1.5 mm deep bowl, and the remapper must focus the field onto that bowl
 (at the fovea the beam is ~f/30, so a 1.5 mm focus error is a ~50 um spot,
 more than a lens). A flat vertex plane over a flat panel can vary f only by
 the factor n (between an all-air and an all-glass gap), far short of 22.
+
+## Views cost resolution: a light field's sub-apertures are diffraction-limited
+
+Each view of a light field is formed through a piece of the pupil. A view
+through a sub-aperture d is blurred to an RMS radius of ~0.59 lambda / d:
+5 x 5 views over a 4 mm pupil (d = 0.8 mm) give 1.40 arcmin, three times the
+foveal retinal pitch; the fovea needs d >= 2.4 mm, i.e. one view (the whole
+pupil); at 10 deg the retina allows ~15 views across. This holds wherever the
+lens array sits (at the panel or at the eye). The variable-focal lenslet array
+built on 2026-09-24 gives 5 x 5 views everywhere and is therefore wrong at the
+fovea; the number of views per lens must follow the retina (1 at the fovea,
+growing outwards). The study's wave-optics table
+(foveated_optics_study/results/hex_pupil_packing_waveoptics.csv) points the
+same way from another side: crosstalk between hex-packed views grows from 5 %
+at 7 views to 37 % at 61. The Cycles evaluator is ray optics and shows neither.
