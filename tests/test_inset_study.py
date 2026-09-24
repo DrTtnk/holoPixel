@@ -32,7 +32,7 @@ def test_a_thick_plano_convex_singlet_has_its_paraxial_focal_length():
     f = radius / (n_g - 1.0)
     x[0], x[1], x[2] = 18.0, 4.0, f - 4.0 / n_g
     x[3] = ins.R0_MM**2 / (2 * radius)                                   # front s2
-    _, info = ins.residuals(torch.tensor(x, dtype=torch.float64), lay)
+    _, info = ins.residuals(torch.tensor(x, dtype=torch.float64), lay, track_max_mm=200.0)
     assert float(info["focal"][0]) == pytest.approx(f, rel=1e-4)
 
 

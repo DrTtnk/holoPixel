@@ -58,7 +58,8 @@ def test_chart(n=spec.PANEL_PIXELS):
     return rgb
 
 
-def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, samples=64, panel_rgb=None):
+def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, samples=64, panel_rgb=None,
+          fov_deg=FOV_DEG):
     """panel_rgb: (N, N, 3) panel image, row j along +v; default the raw test chart."""
     design_dir, out_dir = Path(design_dir), Path(out_dir)
     design = json.loads((design_dir / "design.json").read_text())
@@ -66,19 +67,23 @@ def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, sam
     ev.validate_surfaces(remapper)
     work = Path(work) / name
     work.mkdir(parents=True, exist_ok=True)
-    mesh, gap, _ = ev.lenslet_array(design, spec.PANEL_MM * 1e3, 2)
-    np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
-             face_lens=mesh.face_lens)
+    plain = design.get("lenslets") == "none"       # a plain display: the panel itself is the image
+    if not plain:
+        mesh, gap, _ = ev.lenslet_array(design, spec.PANEL_MM * 1e3, 2)
+        np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
+                 face_lens=mesh.face_lens)
     np.save(work / "panel.npy", test_chart() if panel_rgb is None else panel_rgb.astype(np.float32))
     blend = out_dir / f"{name}.blend"
-    cfg = {"mode": "display", "mla_npz": str(work / "mla_mesh.npz"), "index": spec.LENS_INDEX,
-           "panel_pose": design["panel_pose"], "gap_um": gap,
+    cfg = {"mode": "display", "index": spec.LENS_INDEX,
+           "panel_pose": design["panel_pose"], "gap_um": 0.0 if plain else gap,
            "panel_pixels": spec.PANEL_PIXELS, "pixel_um": spec.PIXEL_UM,
-           "camera": {"resolution": resolution, "fov_deg": FOV_DEG}, "views_mm": [[0.0, 0.0]],
+           "camera": {"resolution": resolution, "fov_deg": fov_deg}, "views_mm": [[0.0, 0.0]],
            "tmp_dir": str(work / "exr"), "remapper_npz": str(remapper), "panel_image_npy": str(work / "panel.npy"),
            "save_blend": str(blend.resolve()), "out_npz": str(work / "display.npz"),
            "display": {"samples": samples, "filter_width_px": 1.0, "aperture_radius_mm": aperture_mm / 2.0,
                        "focus_distance_mm": 1e6}}
+    if not plain:
+        cfg["mla_npz"] = str(work / "mla_mesh.npz")
     image = lp.run_blender(cfg, work)["images"][0]
     png = out_dir / f"{name}_{'pinhole' if aperture_mm == 0 else f'pupil{aperture_mm:g}mm'}.png"
     plt.imsave(png, np.clip(image[::-1] ** (1 / 2.2), 0, 1))
@@ -93,8 +98,10 @@ def main():
     ap.add_argument("--name", default="hmd")
     ap.add_argument("--aperture-mm", type=float, default=0.0)
     ap.add_argument("--resolution", type=int, default=1024)
+    ap.add_argument("--fov-deg", type=float, default=FOV_DEG)
     args = ap.parse_args()
-    print(*build(args.design_dir, args.out_dir, args.work, args.name, args.aperture_mm, args.resolution))
+    print(*build(args.design_dir, args.out_dir, args.work, args.name, args.aperture_mm, args.resolution,
+                 fov_deg=args.fov_deg))
 
 
 if __name__ == "__main__":

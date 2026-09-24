@@ -479,7 +479,8 @@ def main():
         print(f"LF_BLENDER_DONE {cfg['mode']} {cfg['out_npz']}")
         return
     add_eye_reference()
-    add_mla(cfg)
+    if "mla_npz" in cfg:                  # a plain display (no lenslets) has none
+        add_mla(cfg)
     add_remapper(cfg)
     n = cfg["panel_pixels"]
     i, j = np.meshgrid(np.arange(n), np.arange(n))

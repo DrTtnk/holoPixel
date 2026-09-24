@@ -39,6 +39,8 @@ HALF_FIELD_DEG = 10.0                                           # the panel's ha
 FIELDS_DEG = np.array([0.0, 1.0, 2.0, 3.5, 5.0, 6.5, 8.0, 9.0, 10.0, 11.5, 13.0, 14.14])   # to the corner
 EYE_RELIEF_MIN_MM = 15.0
 MIN_GLASS_MM, MIN_AIR_MM = 1.0, 0.3
+MAX_GLASS_MM = 8.0              # a moulded element, not a rod
+CONIC_MAX = 20.0
 R0_MM = 10.0
 W_MAP, W_SHAPE = 30.0, 100.0
 
@@ -89,7 +91,7 @@ TOL = torch.tensor(ft.blur_tolerance_rad(np.radians(FIELDS_DEG), np.zeros_like(F
 FD = 0.05
 
 
-def residuals(x, lay):
+def residuals(x, lay, track_max_mm):
     pupil = pupil_samples()
     fields = torch.tensor(FIELDS_DEG, dtype=torch.float64)
     res, info = [], {}
@@ -118,6 +120,9 @@ def residuals(x, lay):
     n_el = len(lay["materials"])
     zs = batches[1].z[0]
     res.append(math.sqrt(W_SHAPE) * torch.relu(EYE_RELIEF_MIN_MM - zs[0])[None])
+    res.append(math.sqrt(W_SHAPE) * torch.relu(zs[-1] - track_max_mm)[None])          # pupil to panel
+    res.append(math.sqrt(W_SHAPE) * torch.relu(batches[1].k[0, :-1].abs() - CONIC_MAX))
+    res.append(math.sqrt(W_SHAPE) * torch.relu(zs[1:-1:2] - zs[0:-1:2] - MAX_GLASS_MM))
     used = 1.2 * (2.0 + zs[-1] * math.tan(math.radians(FIELDS_DEG[-1])))            # generous aperture
     for s in range(2 * n_el):
         c0, k0, a0 = batches[1].c[0, s], batches[1].k[0, s], batches[1].a[0, s]
@@ -150,16 +155,16 @@ def seed_radii(materials, focal_mm=52.3):
     return [r1, -r1, r3, r4]
 
 
-def fit(lay, rng, starts):
+def fit(lay, rng, starts, track_max_mm):
     """Multi-start least squares; returns the best result."""
     n = len(lay["materials"])
 
     def fun(v):
         with torch.no_grad():
-            return residuals(torch.tensor(v, dtype=torch.float64), lay)[0].numpy()
+            return residuals(torch.tensor(v, dtype=torch.float64), lay, track_max_mm)[0].numpy()
 
     def jac(v):
-        return torch.autograd.functional.jacobian(lambda t: residuals(t, lay)[0], torch.tensor(v, dtype=torch.float64),
+        return torch.autograd.functional.jacobian(lambda t: residuals(t, lay, track_max_mm)[0], torch.tensor(v, dtype=torch.float64),
                                                   vectorize=True, strategy="forward-mode").numpy()
 
     results = []
@@ -167,8 +172,8 @@ def fit(lay, rng, starts):
         x0 = np.zeros(lay["size"])
         x0[0] = rng.uniform(16.0, 22.0)
         for e in range(n):
-            x0[1 + 2 * e] = rng.uniform(3.0, 9.0)
-            x0[2 + 2 * e] = rng.uniform(0.5, 3.0) if e < n - 1 else rng.uniform(35.0, 55.0)
+            x0[1 + 2 * e] = rng.uniform(2.0, MAX_GLASS_MM)
+            x0[2 + 2 * e] = rng.uniform(0.5, 3.0) if e < n - 1 else rng.uniform(20.0, track_max_mm - 25.0)
         sh = rng.normal(0.0, 0.1, (2 * n, 5))
         sh[:, 1] = rng.normal(0.0, 0.3, 2 * n)
         sh[:, 0] = [R0_MM**2 / (2 * r) * rng.uniform(0.8, 1.2) for r in seed_radii(lay["materials"])]
@@ -181,26 +186,28 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
     ap.add_argument("--starts", type=int, default=40)
+    ap.add_argument("--track-max-mm", type=float, default=65.0, help="pupil to panel")
     args = ap.parse_args()
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(8)
     report = {}
-    for name, mats in (("singlet_PMMA", ["PMMA"]), ("doublet_PMMA_PC", ["PMMA", "PC"]),
-                       ("doublet_PC_PMMA", ["PC", "PMMA"])):
+    for name, mats in (("singlet_PMMA", ["PMMA"]), ("doublet_PC_PMMA", ["PC", "PMMA"])):
         lay = layout(mats)
-        best = fit(lay, np.random.default_rng(0), args.starts)
+        best = fit(lay, np.random.default_rng(0), args.starts, args.track_max_mm)
         with torch.no_grad():
-            _, info = residuals(torch.tensor(best.x, dtype=torch.float64), lay)
+            _, info = residuals(torch.tensor(best.x, dtype=torch.float64), lay, args.track_max_mm)
         blur = info["blur"].numpy()
-        report[name] = {"cost": float(best.cost), "x": best.x.tolist(), "alive": info["alive"],
+        z = to_batches(torch.tensor(best.x, dtype=torch.float64), lay)[1].z[0].tolist()
+        report[name] = {"cost": float(best.cost), "x": best.x.tolist(), "alive": info["alive"], "surface_z_mm": z,
                         "fields_deg": FIELDS_DEG.tolist(), "local_focal_mm": info["focal"].numpy().tolist(),
                         "blur_over_tolerance_BGR": blur.tolist(),
                         "worst_channel_blur": blur.max(0).tolist()}
         print(name, "cost", round(float(best.cost), 3), "worst-channel blur/tolerance per field:",
               " ".join(f"{b:.2f}" for b in blur.max(0)), "focal(0) mm", round(float(info["focal"][0]), 2),
+              "pupil-to-panel mm", round(z[-1], 1), "eye relief mm", round(z[0], 1),
               flush=True)
-    (out / "inset_report.json").write_text(json.dumps(report, indent=1))
+    (out / f"inset_report_track{args.track_max_mm:g}.json").write_text(json.dumps(report, indent=1))
 
 
 if __name__ == "__main__":
