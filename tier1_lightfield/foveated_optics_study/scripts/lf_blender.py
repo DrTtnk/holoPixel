@@ -20,6 +20,7 @@ Optional remapper surfaces (world mm) sit between the MLA and the eye:
             surf{k}_half_mirror_faces makes those faces an ideal pancake
             half-mirror: a mirror on the ray's first specular event, the glass
             from then on.
+            surf{k}_absorber_faces blackens those faces (a lens's edge).
   mirror    perfect specular reflector (both sides)
   polariser ideal pancake reflective polariser: transparent, except a mirror
             on the ray's second specular event (after the half-mirror).
@@ -280,16 +281,20 @@ def add_remapper(cfg):
             raise ValueError(f"surface {k}: unknown kind {kind!r}")
         normals = r[f"surf{k}_normals"] if f"surf{k}_normals" in r else None
         obj = link(f"REMAP{k}_{kind}", r[f"surf{k}_verts"], r[f"surf{k}_faces"], normals, mat)
+        slot = np.zeros(len(obj.data.polygons), dtype=np.int32)
         for key, coating in (("mirror_faces", lambda: mirror(f"REMAP{k}_coating")),
                              ("half_mirror_faces", lambda: half_mirror(f"REMAP{k}_half_mirror",
-                                                                       float(r[f"surf{k}_index"])))):
+                                                                       float(r[f"surf{k}_index"]))),
+                             ("absorber_faces", lambda: absorber(f"REMAP{k}_blackened"))):
             if f"surf{k}_{key}" not in r:
                 continue
             coated = np.asarray(r[f"surf{k}_{key}"], dtype=bool)
-            if kind != "glass" or len(coated) != len(obj.data.polygons) or len(obj.data.materials) != 1:
-                raise ValueError(f"surface {k}: {key} needs a glass solid, one flag per face, one coating kind")
+            if kind != "glass" or len(coated) != len(obj.data.polygons) or np.any(slot[coated] != 0):
+                raise ValueError(f"surface {k}: {key} needs a glass solid and one flag per face, "
+                                 "and a face takes one coating")
             obj.data.materials.append(coating())
-            obj.data.polygons.foreach_set("material_index", coated.astype(np.int32))
+            slot[coated] = len(obj.data.materials) - 1
+        obj.data.polygons.foreach_set("material_index", slot)
         objs.append(obj)
     return objs
 

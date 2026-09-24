@@ -22,6 +22,11 @@ Merit, in the units the acceptance evaluator (lf_evaluate.py) uses:
           target F(theta) must stay in RATIO_BAND, isotropically.
   panel   the whole field lands on the 18.4 mm panel.
   tilt    chief rays reach the lenslet array within TILT_MAX_DEG of its normal.
+  fold    the map is one-to-one: on a dense chief-ray grid every cell keeps the
+          target's orientation and at least Q_MIN of its area (the 117 sampled
+          fields cannot see a fold between them).
+  outside directions beyond the field of view land off the panel (or are lost):
+          a pixel must not be seen from two directions.
   space   no hardware (corrector hits, panel corners) inside the eye's view
           cone to the mirror, nearer the pupil than CLEARANCE_MM, or behind
           the face plane MIN_Z_MM; glass at least MIN_GLASS_MM along every ray.
@@ -69,8 +74,12 @@ LOW_ORDER = 4                   # (0,2) (2,0) (0,3) (2,1): free from the first s
 N_SHAPE = 2 + len(TERMS)        # base sag at R0, conic, polynomial sags at R0
 POLY = 7
 MAP_SCALE_MM = 0.1               # chief landing vs the target map's panel point
+DENSE_STEP_DEG = 1.25           # chief-ray grid for the fold term
+Q_MIN = 0.2                     # a grid cell's signed area over the target's, at least
+RING_BEYOND_DEG = (1.0, 3.0, 6.0, 9.0)   # rings of directions beyond the field of view
+OUT_MARGIN_MM = 0.2             # they land at least this far beyond the panel edge
 W = {"blur": 1.0, "hinge": 10.0, "ratio": 30.0, "panel": 30.0, "tilt": 1.0, "space": 3.0, "barrier": 30.0,
-     "map": 10.0}
+     "map": 10.0, "fold": 3000.0, "outside": 3000.0}    # a folded map or a stray direction is a failure, not a trade
 
 
 def fold_layout(n_el, flip_u=1, flip_v=1):
@@ -197,15 +206,80 @@ def layout(n_el, flip_u=1, flip_v=1, family="fold"):
 
 
 def bounds(lay, device):
-    return FAMILIES[lay["family"]]["bounds"](lay, device)
+    lo, hi = FAMILIES[lay["family"]]["bounds"](dict(lay, size=lay["spline"]["slice"].start)
+                                                if "spline" in lay else lay, device)
+    if "spline" not in lay:
+        return lo, hi
+    n = lay["size"] - len(lo)
+    pad = torch.full((n,), SPLINE_BOUND_MM, dtype=lo.dtype, device=device)
+    return torch.cat([lo, -pad]), torch.cat([hi, pad])
 
 
 def random_designs(lay, count, rng, device):
-    return FAMILIES[lay["family"]]["random_designs"](lay, count, rng, device)
+    if "spline" not in lay:
+        return FAMILIES[lay["family"]]["random_designs"](lay, count, rng, device)
+    x = FAMILIES[lay["family"]]["random_designs"](dict(lay, size=lay["spline"]["slice"].start), count, rng, device)
+    return torch.cat([x, torch.zeros(count, lay["size"] - x.shape[1], dtype=x.dtype, device=device)], 1)
 
 
 def to_batch(x, indices, lay):
-    return FAMILIES[lay["family"]]["to_batch"](x, indices, lay)
+    batch = FAMILIES[lay["family"]]["to_batch"](x, indices, lay)
+    if "spline" not in lay:
+        return batch
+    sp = lay["spline"]
+    half = x[:, sp["slice"]].reshape(x.shape[0], -1, sp["shape"][1])            # (B, ceil(nx / 2), ny)
+    nx = sp["shape"][0]
+    ctrl = half[:, [min(j, nx - 1 - j) for j in range(nx)]]                      # mirror symmetric in x
+    return batch._replace(spline=(sp["surfaces"], sp["grid"], ctrl))
+
+
+SPLINE_BOUND_MM = 0.5
+
+
+SPLINE_SURFACES = {"fold": (0,), "pancake": (0, 2)}   # the mirror; the half-mirror met twice
+
+
+def mirror_spline_grid(entry, device, cells, family="fold"):
+    """B-spline grid over a stored design's mirror footprint (all its passes) in
+    the mirror's local frame: `cells` square cells across the (symmetric) x
+    extent, controls one cell beyond the footprint on every side, x0 centred."""
+    lay = layout(entry["n_el"], entry["flip_u"], entry["flip_v"], family=family)
+    x = torch.tensor([entry["x"]], dtype=torch.float64, device=device)
+    idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=device)
+    batch = to_batch(x, idx, lay)
+    ctx = context(device)
+    with torch.no_grad():
+        _, _, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+    p = torch.cat([diag["points"][0, s][alive[0]] for s in SPLINE_SURFACES[family]])
+    a = batch.rx[0, 0]
+    loc_x = p[:, 0]
+    loc_y = (p[:, 1] - batch.y[0, 0]) * torch.cos(a) + (p[:, 2] - batch.z[0, 0]) * torch.sin(a)
+    half_x = float(loc_x.abs().max())
+    h = 2.0 * half_x / cells
+    nx = cells + 3                                   # one control beyond each side, plus the end points
+    y_lo, y_hi = float(loc_y.min()), float(loc_y.max())
+    ny = int(math.ceil((y_hi - y_lo) / h)) + 3
+    y0 = 0.5 * (y_lo + y_hi) - (ny - 1) / 2 * h
+    return (-(nx - 1) / 2 * h, y0, h), (nx, ny)
+
+
+def entry_layout(entry, family="fold"):
+    """The layout of a stored design (a best_*.json entry), its mirror spline
+    included: entry["spline"] is {} for a smooth mirror."""
+    lay = layout(entry["n_el"], entry["flip_u"], entry["flip_v"], family=family)
+    sp = entry["spline"]
+    return with_mirror_spline(lay, sp["grid"], sp["shape"]) if sp else lay
+
+
+def with_mirror_spline(lay, grid, shape):
+    """A copy of the layout whose mirror (surface 0) carries a B-spline over grid,
+    its controls (the x half, mirrored) appended to the parameter vector."""
+    n = (shape[0] + 1) // 2 * shape[1]
+    out = dict(lay)
+    out["spline"] = {"slice": slice(lay["size"], lay["size"] + n), "grid": tuple(float(g) for g in grid),
+                     "shape": tuple(int(k) for k in shape), "surfaces": SPLINE_SURFACES[lay["family"]]}
+    out["size"] = lay["size"] + n
+    return out
 
 
 _BOWLS = {}
@@ -277,6 +351,44 @@ def pupil_cells(fields_deg, pupil):
     return ids, int(ids.max()) + 1
 
 
+def dense_grid():
+    """Chief-ray field grid over the searched half field, (nx, ny) in degrees."""
+    tx = np.arange(0.0, FIELDS_X_DEG[-1] + 1e-9, DENSE_STEP_DEG)
+    tz = np.arange(FIELDS_Y_DEG[0], FIELDS_Y_DEG[-1] + 1e-9, DENSE_STEP_DEG)
+    return np.stack(np.meshgrid(tx, tz, indexing="ij"), -1)
+
+
+def ring_fields():
+    """Directions beyond the field of view (half field, degrees)."""
+    out = []
+    for d in RING_BEYOND_DEG:
+        x, y = FIELDS_X_DEG[-1] + d, FIELDS_Y_DEG[-1] + d
+        top = np.linspace(0.0, x, 15)
+        side = np.linspace(-y, y, 19)
+        out += [np.column_stack([top, np.full(15, y)]), np.column_stack([top, np.full(15, -y)]),
+                np.column_stack([np.full(19, x), side])]
+    return np.concatenate(out)
+
+
+def cell_det(land):
+    """Signed area of each grid cell's corner parallelogram, (B, nx-1, ny-1)."""
+    a = land[:, 1:, :-1] - land[:, :-1, :-1]
+    b = land[:, :-1, 1:] - land[:, :-1, :-1]
+    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+
+def fold_violation(land, alive, det_target, sign):
+    """relu(Q_MIN - signed area over the target's) per cell whose corners live."""
+    q = sign * cell_det(land) / det_target
+    ok = alive[:, :-1, :-1] & alive[:, 1:, :-1] & alive[:, :-1, 1:]
+    return torch.relu(Q_MIN - q) * ok.double()
+
+
+def outside_violation(land, alive):
+    """How deep inside the panel (plus margin) an out-of-field ray lands, mm."""
+    return torch.relu(PANEL_HALF_MM + OUT_MARGIN_MM - land.abs().amax(-1)) * alive.double()
+
+
 def context(device, weights=W):
     fields = field_grid()
     pupil = pupil_samples()
@@ -287,10 +399,18 @@ def context(device, weights=W):
     t = lambda a, dt=torch.float64: torch.tensor(a, dtype=dt, device=device)  # noqa: E731
     onehot = torch.nn.functional.one_hot(t(ids, torch.int64), n_cells).double()   # (F, P, K)
     fd = np.concatenate([fields, fields + [FD_DEG, 0.0], fields + [0.0, FD_DEG]])
+    dense = dense_grid()
+    rd = np.radians(dense)
+    det_t = cell_det(np.stack(ft.field_to_panel_mm(rd[..., 0], rd[..., 1]), -1)[None])[0]
+    if not (np.all(det_t > 0) or np.all(det_t < 0)):
+        raise ValueError("the target map folds on the dense grid")
     return {"weights": dict(weights), "fields": t(fields), "fd_fields": t(fd), "pupil": t(pupil), "onehot": onehot,
             "tol": t(ft.blur_tolerance_rad(np.radians(fields[:, 0]), np.radians(fields[:, 1]))),
             "jac_target": t(jac_t), "sv_target": t(np.linalg.svd(jac_t, compute_uv=False)),
-            "panel_target": t(panel_t), "n_fields": len(fields)}
+            "panel_target": t(panel_t), "n_fields": len(fields),
+            "dense_fields": t(dense.reshape(-1, 2)), "dense_shape": dense.shape[:2],
+            "dense_det": t(np.abs(det_t)), "dense_sign": float(np.sign(det_t[0, 0])),
+            "ring_fields": t(ring_fields())}
 
 
 def jacobian(land_fd, n_fields):
@@ -364,16 +484,29 @@ def residuals(x, indices, lay, ctx):
     r_tilt = (torch.relu(torch.rad2deg(torch.acos(torch.clamp(cos_t, max=1.0 - 1e-12))) - TILT_MAX_DEG)
               * torch.sqrt(ctx["weights"]["tilt"] * okd / F))
 
+    nd = ctx["dense_fields"].shape[0]
+    land_c, _, alive_c = ot.trace(batch, torch.cat([ctx["dense_fields"], ctx["ring_fields"]]), chief)
+    dense_ok = alive_c[:, :nd, 0]
+    sign = lay["flip_u"] * lay["flip_v"] * ctx["dense_sign"]
+    fold = fold_violation(land_c[:, :nd, 0].reshape(B, *ctx["dense_shape"], 2),
+                          dense_ok.reshape(B, *ctx["dense_shape"]), ctx["dense_det"], sign)
+    r_fold = fold.reshape(B, -1) * math.sqrt(ctx["weights"]["fold"] / fold[0].numel())
+    out = outside_violation(land_c[:, nd:, 0], alive_c[:, nd:, 0])
+    r_out = out * math.sqrt(ctx["weights"]["outside"] / out.shape[1])
+
     space, barrier = FAMILIES[lay["family"]]["constraints"](batch, diag, alive, lay, x)
     norm = lambda v: torch.sqrt(v + 1e-30)  # noqa: E731
     r = torch.cat([r_blur.reshape(B, -1), r_hinge.reshape(B, -1), r_ratio.reshape(B, -1), r_panel.reshape(B, -1),
                    r_map.reshape(B, -1),
-                   r_tilt, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
-    alive_all = (alive.double().sum((1, 2)) + okd.sum(1)) / (alive[0].numel() + ok_c.shape[1])
+                   r_tilt, r_fold, r_out, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
+    # exactly 1.0 when every ray lives: CUDA divides by a scalar through its
+    # reciprocal, so n / n alone can come out as 0.9999999999999999
+    n_live, n_all = alive.sum((1, 2)) + ok_c.sum(1) + dense_ok.sum(1), alive[0].numel() + ok_c.shape[1] + nd
+    alive_all = torch.where(n_live == n_all, 1.0, n_live.double() / n_all)
     sq = lambda t: (t**2).reshape(B, -1).sum(1)  # noqa: E731
     return r, {"blur": sq(r_blur), "hinge": sq(r_hinge), "ratio": sq(r_ratio), "panel": sq(r_panel),
                "map": sq(r_map),
-               "tilt": sq(r_tilt), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
+               "tilt": sq(r_tilt), "fold": sq(r_fold), "outside": sq(r_out), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
                "alive_all": alive_all}
 
 
@@ -491,6 +624,33 @@ def live_seeds(lay, count, material, rng, device, ctx, lo, hi, chunk=512):
     return torch.cat(xs)[:count], torch.cat(idxs)[:count], tried
 
 
+def stored_seeds(paths, lay, material, device, ctx):
+    """Every design of earlier best_*.json files, as seeds: they must match the
+    layout's element count, orientation and material, and be alive under the
+    current merit."""
+    xs, idxs = [], []
+    for path in paths:
+        for e in json.loads(Path(path).read_text()):
+            if (e["n_el"], e["flip_u"], e["flip_v"], e["material"]) != (lay["n_el"], lay["flip_u"], lay["flip_v"],
+                                                                       material):
+                raise ValueError(f"{path}: rank {e.get('rank', 0)} is not a {lay['n_el']}-element {material} design "
+                                 f"with flips ({lay['flip_u']}, {lay['flip_v']})")
+            missing = lay["size"] - len(e["x"])
+            spline_n = lay["size"] - lay["spline"]["slice"].start if "spline" in lay else 0
+            if missing not in (0, spline_n):
+                raise ValueError(f"{path}: a design of {len(e['x'])} parameters does not fit a layout of "
+                                 f"{lay['size']}")
+            xs.append(e["x"] + [0.0] * missing)                             # a smooth design: zero spline
+            idxs.append(e["indices"])
+    x = torch.tensor(xs, dtype=torch.float64, device=device)
+    idx = torch.tensor(idxs, dtype=torch.float64, device=device)
+    with torch.no_grad():
+        _, info = merit(x, idx, lay, ctx)
+    if not bool((info["alive_all"] == 1.0).all()):
+        raise ValueError("a stored seed loses rays under the current merit")
+    return x, idx
+
+
 def fd_jacobian(x, indices, lay, ctx, r0, free, lo, hi, h=1e-5):
     """Forward-difference Jacobian of the residuals, (B, R, D); zero columns for
     frozen parameters. The step points inwards at a bound."""
@@ -504,7 +664,8 @@ def fd_jacobian(x, indices, lay, ctx, r0, free, lo, hi, h=1e-5):
     return J
 
 
-def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["ratio"], tag_suffix="", family="fold"):
+def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["ratio"], tag_suffix="", family="fold",
+        seed_from=(), spline_cells=0):
     """Batched Levenberg-Marquardt (damped least squares), one damping per
     design. Each iteration tries four dampings and keeps the best step that
     lowers the merit and loses no ray. High-order terms are frozen for the
@@ -514,10 +675,23 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
     flip_u, flip_v = family_orientation(n_el, material, rng, device, lo, hi, family=family)
     lay = layout(n_el, flip_u, flip_v, family=family)
     print(f"image orientation of this layout: flip_u {flip_u}, flip_v {flip_v}", flush=True)
+    if spline_cells:
+        if not seed_from:
+            raise ValueError("a mirror spline is laid over a stored design's footprint: give --seed-from")
+        first = json.loads(Path(seed_from[0]).read_text())[0]
+        lay = with_mirror_spline(lay, *mirror_spline_grid(first, device, spline_cells, family))
+        lo, hi = bounds(lay, device)
+        print(f"mirror spline: grid {lay['spline']['grid']}, controls {lay['spline']['shape']}", flush=True)
     ctx = context(device, {**W, "ratio": ratio_weight})
     with torch.no_grad():
-        x, indices, tried = live_seeds(lay, count, material, rng, device, ctx, lo, hi)
-        print(f"{count} live seeds from {tried} random designs", flush=True)
+        if seed_from:
+            x_s, idx_s = stored_seeds(seed_from, lay, material, device, ctx)
+        else:
+            x_s = torch.zeros(0, lay["size"], dtype=torch.float64, device=device)
+            idx_s = torch.zeros(0, n_el, dtype=torch.float64, device=device)
+        x, indices, tried = live_seeds(lay, count - len(x_s), material, rng, device, ctx, lo, hi)
+        x, indices = torch.cat([x_s, x]), torch.cat([idx_s, indices])
+        print(f"{len(x_s)} stored seeds, {count - len(x_s)} live seeds from {tried} random designs", flush=True)
         high = torch.zeros(lay["size"], dtype=torch.bool, device=device)
         for s in lay["shapes"]:
             high[s.start + 2 + LOW_ORDER:s.stop] = True
@@ -566,6 +740,8 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
                     "worst_cell_blur_per_field": worst[b].tolist(), "fields_deg": ctx["fields"].tolist(),
                     "indices": indices[b].tolist(), "x": x[b].detach().tolist(), "n_el": n_el,
                     "flip_u": lay["flip_u"], "flip_v": lay["flip_v"],
+                    "spline": ({"grid": lay["spline"]["grid"], "shape": lay["spline"]["shape"]}
+                               if "spline" in lay else {}),
                     "material": material, "prescription": to_prescription(x[b].detach(), indices[b], lay)})
     tag = f"{family}_el{n_el}_{material}{tag_suffix}"
     (Path(out_dir) / f"best_{tag}.json").write_text(json.dumps(out, indent=1))
@@ -589,11 +765,14 @@ def main():
     ap.add_argument("--ratio-weight", type=float, default=W["ratio"],
                     help="weight of the magnification target; 0 leaves the mapping free (diagnostic)")
     ap.add_argument("--tag", default="", help="suffix of the output file name")
+    ap.add_argument("--seed-from", nargs="*", default=[], help="best_*.json files whose designs join the seeds")
+    ap.add_argument("--spline-cells", type=int, default=0,
+                    help="add a B-spline of this many cells across to the mirror (needs --seed-from)")
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"),
-        ratio_weight=args.ratio_weight, tag_suffix=args.tag)
+        ratio_weight=args.ratio_weight, tag_suffix=args.tag, seed_from=args.seed_from, spline_cells=args.spline_cells)
 
 
 if __name__ == "__main__":

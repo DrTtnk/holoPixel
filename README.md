@@ -70,14 +70,17 @@ python coaxial_dls/gpu_search.py <out> --elements 5
 python coaxial_dls/export_candidate.py <out>/best_el5_flat.json <design_dir>
 # folded: panel above the eye, freeform mirror, 1-2 freeform correctors
 python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or glass; --ratio-weight 0 frees the mapping
-python freeform_mirror/pancake_search.py <out> --elements 1 --material resin   # pancake (tracer only)
+# seeded from earlier designs, and with a B-spline of K cells on the (half-)mirror (fold and pancake alike)
+python freeform_mirror/fold_search.py <out> --elements 1 --material glass --seed-from freeform_mirror/results_fold/best_fold_el1_glass.json --spline-cells 4
+python freeform_mirror/pancake_search.py <out> --elements 1 --material resin   # pancake: polarisation fold, round lens
 python freeform_mirror/export_fold.py <out>/best_fold_el1_resin.json <design_dir>
+python freeform_mirror/export_pancake.py <out>/best_pancake_el1_resin.json <design_dir>
 blender -b --factory-startup --python freeform_mirror/view_fold_blender.py -- <design_dir> view.blend
 python ../scripts/lf_evaluate.py <design_dir> --pixels 2560
 # simulated headset from the pupil: raw chart on the panel, or pre-warped content
 # (the latter needs the lf_evaluate run above, it reuses <design_dir>/evaluation)
 python ../scripts/hmd_view.py <design_dir> <out_dir> --work <scratch> [--aperture-mm 4]
-python ../scripts/hmd_encoded.py <design_dir> <out_dir> --work <scratch>
+python ../scripts/hmd_encoded.py <design_dir> <out_dir> --work <scratch>   # --fovea: true-size +/-5 deg crop, bar chart
 # foveal inset: the whole panel over +/- 10 deg through a moulded singlet or achromat (CPU)
 python foveal_inset/inset_study.py <out>
 ```
@@ -85,7 +88,9 @@ python foveal_inset/inset_study.py <out>
 Fold designs use the variable-focal lenslet array (`"lenslets": "variable_retina"` in
 design.json, `scripts/variable_lenslets.py`): each lens's focal length is set so its number
 of views follows the retina and diffraction (about one at the fovea, up to 5 x 5 outside),
-so the lens vertices form a 2D surface that is the fold search's image surface. Coaxial
+so the lens vertices form a 2D surface that is the fold search's image surface. The search
+also keeps the map one-to-one on a dense chief-ray grid and sends directions beyond the
+field of view off the panel: a folded map shows in Cycles as ghosts. Coaxial
 designs are round and keep the round map (`foveation_target_radial.py`) with a uniform array.
 
 ## Run Simulations

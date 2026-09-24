@@ -42,8 +42,14 @@ DIFFRACTION_RMS_RAD = np.sqrt(2.0) * 0.42 * WAVELENGTH_MM / spec.PUPIL_DIAMETER_
 # The steepest usable plano-convex lenslet: its sphere must reach past the hex
 # corner (and past the panel-border lattice triangles, up to ~1.1 x side).
 LENSLET_MIN_RADIUS_OVER_SIDE = 1.15
-LENSLET_FLOOR_UM = LENSLET_MIN_RADIUS_OVER_SIDE * spec.LENS_SIDE_UM / (spec.LENS_INDEX - 1.0)
-PIXELS_PER_LENS = spec.LENS_PITCH_UM / spec.PIXEL_UM
+
+
+def lenslet_floor_um(pitch_um):
+    """Focal length of the steepest usable lens of a hex array of this pitch."""
+    return LENSLET_MIN_RADIUS_OVER_SIDE * pitch_um / np.sqrt(3.0) / (spec.LENS_INDEX - 1.0)
+
+
+LENSLET_FLOOR_UM = lenslet_floor_um(spec.LENS_PITCH_UM)
 
 
 def _square_pitch_deg(x_deg, y_deg, horizontal):
@@ -188,14 +194,16 @@ def mapped(u_mm, v_mm):
     return r <= 0.999 * np.minimum(_R[np.clip(i - 1, 0, len(_PHI) - 1), -1], _R[np.clip(i + 1, 0, len(_PHI) - 1), -1])
 
 
-def lenslet_focal_um(u_um, v_um):
+def lenslet_focal_um(u_um, v_um, pitch_um=spec.LENS_PITCH_UM):
     """Variable-focal lenslet array: the focal length of the lens at panel (u, v),
     set so its views follow the retina (module docstring), floored at the
     steepest usable lens. A lens beyond the mapped field serves no direction
-    and is a floor lens."""
+    and is a floor lens. pitch_um: the array's lens pitch (pitch / pixel pixels
+    per lens)."""
     u, v = np.asarray(u_um, float) * 1e-3, np.asarray(v_um, float) * 1e-3
     ok = mapped(u, v)
-    f = np.full(np.broadcast(u, v).shape, LENSLET_FLOOR_UM)
+    floor = lenslet_floor_um(pitch_um)
+    f = np.full(np.broadcast(u, v).shape, floor)
     if np.any(ok):
         uu, vv = np.broadcast_to(u, f.shape)[ok], np.broadcast_to(v, f.shape)[ok]
         tx, tz = panel_to_field_rad(uu, vv)
@@ -203,9 +211,9 @@ def lenslet_focal_um(u_um, v_um):
         F = np.sqrt(np.abs(np.linalg.det(J)))
         s_min = np.linalg.svd(J, compute_uv=False)[..., -1]
         d_diff = DIFFRACTION_RMS_RAD * spec.PUPIL_DIAMETER_MM / design_retina_pitch_rad(tx, tz)
-        d_lens = spec.PUPIL_DIAMETER_MM * F / (PIXELS_PER_LENS * s_min)
+        d_lens = spec.PUPIL_DIAMETER_MM * F / (pitch_um / spec.PIXEL_UM * s_min)
         d = np.minimum(spec.PUPIL_DIAMETER_MM, np.maximum(d_diff, d_lens))
-        f[ok] = np.maximum(spec.PIXEL_UM * F / d, LENSLET_FLOOR_UM)
+        f[ok] = np.maximum(spec.PIXEL_UM * F / d, floor)
     return f[()] if f.ndim == 0 else f
 
 

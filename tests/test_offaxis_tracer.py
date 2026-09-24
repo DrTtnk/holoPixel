@@ -154,3 +154,62 @@ def test_a_tabulated_image_surface_lands_rays_like_the_analytic_one(device):
     assert got.cpu().numpy() == pytest.approx(ref.cpu().numpy(), abs=1e-5)
     flat_land, _, _ = ot.trace(flat, fields, pupil)
     assert float((flat_land - got).abs().max()) > 0.1                    # the table is really used
+
+
+def _centred_cubic(t):
+    a = np.abs(t)
+    return np.where(a < 1, 2.0 / 3.0 - a**2 + a**3 / 2.0, np.where(a < 2, (2.0 - a) ** 3 / 6.0, 0.0))
+
+
+def test_the_bspline_sag_is_the_sum_of_centred_cubics_and_its_slopes_are_exact():
+    rng = np.random.default_rng(3)
+    grid = (-7.5, -4.0, 2.5)
+    ctrl = rng.normal(0.0, 0.05, (2, 7, 5))
+    x = rng.uniform(-14.0, 14.0, (2, 400))
+    y = rng.uniform(-10.0, 12.0, (2, 400))                                # also outside the control region
+    ref = np.zeros_like(x)
+    for j in range(7):
+        for k in range(5):
+            ref += ctrl[:, j, k, None] * _centred_cubic((x - grid[0]) / grid[2] - j) \
+                * _centred_cubic((y - grid[1]) / grid[2] - k)
+    t = lambda a: torch.tensor(a, dtype=torch.float64)  # noqa: E731
+    v, vx, vy = ot.bspline_sag(t(x), t(y), grid, t(ctrl))
+    assert v.numpy() == pytest.approx(ref, abs=1e-13)
+    e = 1e-6
+    fx = (ot.bspline_sag(t(x + e), t(y), grid, t(ctrl))[0] - ot.bspline_sag(t(x - e), t(y), grid, t(ctrl))[0]) / (2 * e)
+    fy = (ot.bspline_sag(t(x), t(y + e), grid, t(ctrl))[0] - ot.bspline_sag(t(x), t(y - e), grid, t(ctrl))[0]) / (2 * e)
+    assert vx.numpy() == pytest.approx(fx.numpy(), abs=1e-8) and vy.numpy() == pytest.approx(fy.numpy(), abs=1e-8)
+
+
+def _spline_twin(rng, device):
+    """A fold whose mirror carries alpha x^2 + beta y^2 as polynomial terms, and its
+    twin carrying the same quadratic as a B-spline (exact reproduction inside the
+    fully supported region)."""
+    rx = _fold(rng)
+    alpha, beta = 2e-3, -1.5e-3
+    rx["surfaces"][0]["xy"] = [[0.0, 0.0, beta], [0.0], [alpha]]
+    poly = ot.pack([rx], device)
+    h, n = 3.0, 14
+    x0 = y0 = -(n - 1) / 2 * h
+    xj = x0 + h * np.arange(n)
+    ctrl = alpha * xj[:, None] ** 2 + beta * xj[None, :] ** 2 - (alpha + beta) * h**2 / 3.0
+    rx["surfaces"][0]["xy"] = [[0.0]]
+    base = ot.pack([rx], device)
+    twin = base._replace(spline=((0,), (x0, y0, h), torch.tensor(ctrl[None], dtype=torch.float64, device=device)))
+    return poly, base, twin
+
+
+def test_a_spline_mirror_lands_rays_like_the_polynomial_it_reproduces(device):
+    poly, _, twin = _spline_twin(np.random.default_rng(5), device)
+    f, p = torch.tensor(FIELDS, device=device), torch.tensor(PUPIL, device=device)
+    a, _, ok_a = ot.trace(poly, f, p)
+    b, _, ok_b = ot.trace(twin, f, p)
+    assert bool(ok_a.all()) and bool(ok_b.all())
+    assert b.cpu().numpy() == pytest.approx(a.cpu().numpy(), abs=1e-9)
+
+
+def test_zero_spline_controls_change_nothing(device):
+    _, base, twin = _spline_twin(np.random.default_rng(6), device)
+    twin = twin._replace(spline=((0,), twin.spline[1], torch.zeros_like(twin.spline[2])))
+    f, p = torch.tensor(FIELDS, device=device), torch.tensor(PUPIL, device=device)
+    assert ot.trace(twin, f, p)[0].cpu().numpy() == pytest.approx(ot.trace(base, f, p)[0].cpu().numpy(), abs=1e-12)

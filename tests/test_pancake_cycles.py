@@ -34,7 +34,7 @@ def rendered(tmp_path_factory):
     x, idx, _ = fs.live_seeds(lay, 1, "resin", rng, dev, fs.context(dev), lo, hi, chunk=256)
     base = tmp_path_factory.mktemp("pancake_cycles")
     entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin",
-             "flip_u": flips[0], "flip_v": flips[1]}
+             "flip_u": flips[0], "flip_v": flips[1], "spline": {}}
     (base / "best.json").write_text(json.dumps([entry]))
     design = ep.export(base / "best.json", base / "design", device=str(dev))
     work = base / "work"

@@ -52,7 +52,17 @@ def _sag(batch, s, x, y):
     f, sx, sy, ok = ot.sag(t(x), t(y), batch.c[0, s].cpu(), batch.k[0, s].cpu(), batch.xy[0, s].cpu())
     if not bool(ok.all()):
         raise ValueError(f"surface {s}: the exported region leaves the sag domain")
+    if len(batch.spline) == 3 and s in batch.spline[0]:
+        shape = f.shape
+        e, ex, ey = ot.bspline_sag(t(x).reshape(1, -1), t(y).reshape(1, -1), batch.spline[1], batch.spline[2][:1].cpu())
+        f, sx, sy = f + e.reshape(shape), sx + ex.reshape(shape), sy + ey.reshape(shape)
     return f.numpy(), sx.numpy(), sy.numpy()
+
+
+def cpu_batch(batch):
+    """A detached CPU copy of a one-design batch, its spline included."""
+    spline = (batch.spline[0], batch.spline[1], batch.spline[2].detach().cpu()) if batch.spline else ()
+    return ot.Batch(*(t.detach().cpu() for t in batch[:7]), mirror=batch.mirror, spline=spline)
 
 
 def _local(batch, s, p):
@@ -65,25 +75,37 @@ def _global(batch, s, p):
     return p @ axes + o
 
 
-def _grid(batch, s, hits):
+def _grid(batch, s, hits, disc=False):
     """Rectangle over the footprint (+ margin) in surface s's local x, y. The
     search traces only the theta_x >= 0 half field (plane symmetry), so the
-    rectangle is made symmetric in x."""
+    rectangle is made symmetric in x. With disc, the outline is the circle
+    about the rectangle's centre that holds the footprint: the square grid is
+    mapped onto it (elliptical grid mapping), so the topology stays."""
     loc = _local(batch, s, hits)
     lo, hi = loc[:, :2].min(0) - MARGIN_MM, loc[:, :2].max(0) + MARGIN_MM
     half_x = max(-lo[0], hi[0])
     lo[0], hi[0] = -half_x, half_x
-    gx, gy = np.meshgrid(np.linspace(lo[0], hi[0], GRID), np.linspace(lo[1], hi[1], GRID), indexing="ij")
-    return gx, gy
+    if not disc:
+        return np.meshgrid(np.linspace(lo[0], hi[0], GRID), np.linspace(lo[1], hi[1], GRID), indexing="ij")
+    cy = 0.5 * (lo[1] + hi[1])
+    radius = np.hypot(loc[:, 0], loc[:, 1] - cy).max() + MARGIN_MM
+    a, b = np.meshgrid(np.linspace(-1.0, 1.0, GRID), np.linspace(-1.0, 1.0, GRID), indexing="ij")
+    return radius * a * np.sqrt(1.0 - b**2 / 2.0), cy + radius * b * np.sqrt(1.0 - a**2 / 2.0)
 
 
-def _surface(batch, s, gx, gy):
+def _surface(batch, s, gx, gy, sag_limits=(-np.inf, np.inf)):
+    """Mesh points, normals and the clamped-vertex mask of surface s over the
+    grid. sag_limits (local sag, mm) clamps it flat outside its optical zone,
+    where its polynomial would otherwise run away."""
     f, sx, sy = _sag(batch, s, gx, gy)
+    clamped = (f < sag_limits[0]) | (f > sag_limits[1])
+    f = np.clip(f, *sag_limits)
+    sx, sy = np.where(clamped, 0.0, sx), np.where(clamped, 0.0, sy)
     loc = np.stack([gx, gy, f], -1)
     n = np.stack([-sx, -sy, np.ones_like(sx)], -1)
     n /= np.linalg.norm(n, axis=-1, keepdims=True)
     _, axes = _frame(batch, s)
-    return _global(batch, s, loc.reshape(-1, 3)), (n.reshape(-1, 3) @ axes)
+    return _global(batch, s, loc.reshape(-1, 3)), (n.reshape(-1, 3) @ axes), clamped.reshape(-1)
 
 
 def _quads(n0, n1, base=0):
@@ -120,13 +142,28 @@ def _back_along_front_axis(batch, s_front, s_back, gx, gy):
     return p[:, 0].numpy().reshape(gx.shape), p[:, 1].numpy().reshape(gx.shape)
 
 
-def _solid(batch, s_front, s_back, hits_front, hits_back):
-    # the rectangle must hold both footprints (rays cross the glass obliquely),
-    # so project the back hits onto the front's local x, y along its axis
-    gx, gy = _grid(batch, s_front, np.concatenate([hits_front, hits_back]))
-    vf, nf = _surface(batch, s_front, gx, gy)
+def _sag_range(batch, s, hits):
+    """The local sag range of a surface's traced hits, plus MARGIN_MM each way:
+    beyond it the exported surface is flat."""
+    z = _local(batch, s, hits)[:, 2]
+    return float(z.min()) - MARGIN_MM, float(z.max()) + MARGIN_MM
+
+
+def _solid(batch, s_front, s_back, hits_front, hits_back, disc=False, front_floor=-np.inf):
+    # the outline must hold both footprints (rays cross the glass obliquely),
+    # so project the back hits onto the front's local x, y along its axis; each
+    # surface is flat beyond its own hits' sag range (its polynomial would run
+    # away over the rim and can cross the other surface); front_floor, a local
+    # sag, keeps the front off something just before it (a pancake's polariser)
+    gx, gy = _grid(batch, s_front, np.concatenate([hits_front, hits_back]), disc)
+    lo, hi = _sag_range(batch, s_front, hits_front)
+    vf, nf, cf = _surface(batch, s_front, gx, gy, (max(lo, front_floor), hi))
     bx, by = _back_along_front_axis(batch, s_front, s_back, gx, gy)
-    vb, nb = _surface(batch, s_back, bx, by)
+    vb, nb, cb = _surface(batch, s_back, bx, by, _sag_range(batch, s_back, hits_back))
+    _, axes_f = _frame(batch, s_front)
+    thickness = (vb - vf) @ axes_f[2]                                  # one sign: the light may run either way
+    if not (thickness.min() > 0.0 or thickness.max() < 0.0):
+        raise ValueError(f"surfaces {s_front}, {s_back}: the back crosses the front")
     N = GRID * GRID
     ff, fb = _quads(GRID, GRID), _quads(GRID, GRID, N)[:, ::-1]
     ring = np.concatenate([np.arange(GRID) * GRID, (GRID - 1) * GRID + np.arange(GRID),
@@ -146,7 +183,14 @@ def _solid(batch, s_front, s_back, hits_front, hits_back):
     loops_b = _orient(verts, faces[len(ff):n_opt], np.concatenate([nf, nb]))
     geo = np.cross(verts[faces[n_opt:, 1]] - verts[faces[n_opt:, 0]], verts[faces[n_opt:, 2]] - verts[faces[n_opt:, 0]])
     geo /= np.linalg.norm(geo, axis=1, keepdims=True)
-    loops = np.concatenate([loops_f, loops_b, np.repeat(geo, 3, axis=0)])
+    # a face touching a clamped vertex is a flat facet across the kink: its own normal
+    opt = faces[:n_opt]
+    geo_opt = np.cross(verts[opt[:, 1]] - verts[opt[:, 0]], verts[opt[:, 2]] - verts[opt[:, 0]])
+    geo_opt /= np.linalg.norm(geo_opt, axis=1, keepdims=True)
+    loops_opt = np.concatenate([loops_f, loops_b]).reshape(n_opt, 3, 3)
+    kink = np.concatenate([cf, cb])[opt].any(1)
+    loops_opt[kink] = geo_opt[kink][:, None, :]
+    loops = np.concatenate([loops_opt.reshape(-1, 3), np.repeat(geo, 3, axis=0)])
     return verts, faces, loops
 
 
@@ -173,7 +217,7 @@ def export(best_json, out_dir, rank=0, device="cuda"):
 
 def export_entry(entry, out_dir, device="cuda", source={}):
     dev = torch.device(device)
-    lay = fs.layout(entry["n_el"], entry["flip_u"], entry["flip_v"])
+    lay = fs.entry_layout(entry)
     x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
     idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
     batch = fs.to_batch(x, idx, lay)
@@ -183,10 +227,10 @@ def export_entry(entry, out_dir, device="cuda", source={}):
     if not bool(alive.all()):
         raise ValueError("the design loses rays; it cannot be exported")
     pts = diag["points"][0].cpu().numpy().reshape(batch.z.shape[1], -1, 3)
-    batch = ot.Batch(*(t.detach().cpu() for t in batch[:7]), mirror=batch.mirror)
+    batch = cpu_batch(batch)
     data = {}
     gx, gy = _grid(batch, 0, pts[0])
-    vm, nm = _surface(batch, 0, gx, gy)
+    vm, nm, _ = _surface(batch, 0, gx, gy)
     fm = _quads(GRID, GRID)
     surfaces = [("mirror", vm, fm, _orient(vm, fm, nm), None)]
     for e in range(entry["n_el"]):
@@ -230,9 +274,9 @@ FAN_FIELDS = ((0.0, 0.0), (0.0, 22.5), (0.0, -22.5), (35.0, 0.0), (35.0, 22.5), 
 FAN_PUPIL = tuple((0.0, py) for py in (-1.0, -0.5, 0.0, 0.5, 1.0))
 
 
-def fans(entry, dev):
+def fans(entry, dev, family="fold"):
     """World-frame polylines (pupil -> every surface) for a few fields, for viewing."""
-    lay = fs.layout(entry["n_el"], entry["flip_u"], entry["flip_v"])
+    lay = fs.entry_layout(entry, family)
     x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
     idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
     t = lambda a: torch.tensor(a, dtype=torch.float64, device=dev)  # noqa: E731

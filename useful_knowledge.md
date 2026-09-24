@@ -644,3 +644,113 @@ The fold's light reaches the panel along -z, so the table is +(h - h0); the
 pancake reused it unchanged although its light travels along +z, which mirrors
 a ~0.7 mm deep surface in z. Caught by reading the code before a Cycles export,
 after one partial run; fold_search.bowl now takes the light direction.
+
+## The pancake's Cycles blur is chief-ray walk in the tall lenses, not shift gradient
+
+The Cycles score of the best resin pancake (blur median 50x, ghosts 0.37) was
+first blamed on a fast lens-to-lens change of the pupil-image shift f*tan(theta).
+The tracer rejects that: the change is at most 2 um per 36 um pitch. The shift
+itself is large (58 um at the fovea, 61 um at 3-10 deg) and matches the Cycles
+landing offsets (52 / 65 um). The chief rays reach the lenslets tilted 7-17 deg
+inside 10 deg of the fovea, and inside the tall variable lenses (h = n (f - gap),
+657 um at the fovea) they move 47-54 um sideways: 93-98 % of them cross a lens
+column boundary there, 10-18 % beyond 10 deg. The search has no term for the
+chief-ray angle at the image surface; long-focal lenslets need one.
+
+## A lens's pupil image is f D / s_min of the design's own Jacobian, not of the target's
+
+The lenslet focal lengths follow the target map's local F. If the remapper
+misses that magnification, each lens images the pupil larger than planned: at
+fixed landing the pupil-to-angle Jacobian M satisfies det(M) det(X_theta) = 1
+(the ray transfer matrix is symplectic), and in practice the pupil image is
+f D / s_min(X_theta) to 1 %. The best resin pancake reaches 59 x 44 mm/rad at
+the fovea against a target of 162 x 116, so its pupil images there are ~37-45
+um, one pitch or more, against 12 um planned. The search's blur proxy sizes the
+pupil cells from the target F and cannot see this.
+
+The first computation came out 2x too large because fold_search.pupil_samples
+is normalised to the pupil radius, not in mm; the symplectic check
+(det(M) det(X_theta) = 4 instead of 1) found it.
+
+## The lens-column walk is not the pancake's problem either
+
+A controlled Cycles sweep (uniform lenslets, no remapper, f 50-470 um, chief
+tilt 0-17 deg, thin versus 657 um tall columns) showed the landing offset is
+f tan(theta) for thin and tall lenses alike: a paraxially matched lens images
+the same whatever its glass height, and walk = n (f - gap) tan(theta_glass)
+mis-predicts it by 3-60x. Tall columns add at most ~35 % more ghosting. The
+dominant defect is a pupil image wider than the pitch: uniform f = 470 um at
+20 mm eye relief (pupil image f D / L = 94 um) ghosts 0.48 even at zero tilt.
+The walk term added to fold_search was sized on the wrong mechanism.
+
+## The resin pancake fails because its map folds, not because of its lenslets
+
+Resin and glass pancakes have nearly the same pupil images (42-45 um at the
+fovea), yet in Cycles the resin one ghosts 0.37 and the glass one 0.044. So the
+pupil-image size (entry above) does not explain the resin result. A dense
+chief-ray grid does: the resin landing map changes the sign of det J (folds
+over itself) in 5.4 % of the searched field, between the 117 sampled fields,
+and 34 % of the directions beyond the field of view still land on the panel.
+Where two directions share lenses, Cycles shows the bow-tie of ghosts and
+sampling ratios above 10x. Glass: 0 % folded inside the field, 18 % out-of-field
+on the panel, and its ghosts sit exactly in those corners. The search needs an
+injective-map term over a dense grid and a term that sends out-of-field
+directions off the panel.
+
+## On CUDA, a tensor divided by a Python scalar is not correctly rounded
+
+fold_search tested `alive_all == 1.0`, with alive_all = live count / total
+count. PyTorch on CUDA divides by a scalar as a multiplication by its
+reciprocal, so n / n gave 0.9999999999999999 once the dense fold grid changed
+the total: no design was "all alive", and seeding found 0 of 1024. The old
+total passed only by chance. alive_all is now exactly 1.0 when the integer
+counts are equal.
+
+## A pancake lens exported beyond its footprint is not a lens
+
+The round outline of lens 1 is sized by the half-mirror's wide footprint (r ~22
+mm); the back surface's polynomial, evaluated out there, ran away to 107 mm
+(wrapping the lens round the panel) or through the front (an inside-out rim).
+Cycles scored the glass design the same either way, because no ray uses the
+rim, but the solid was not manufacturable and the side view showed it at once.
+Each surface is now clamped flat to the z range of its own hits plus the margin,
+and the export fails loud if the back crosses the front. My first test of it
+compared world-frame vertices with tracer-frame hits without removing the pupil
+offset PUPIL_Y_MM; its upper bound passed only through slack.
+
+## A lenslet light field on this panel cannot sample at the retina's Nyquist limit
+
+A pitch study under the target map (scratch pitch_study, 2026-09-24) found the
+best hex pitch p ~ 2 x retina pitch x s_min, nearly constant (40-60 um): the
+foveated map already compresses by the factor the retina coarsens, so a growing
+pitch buys nothing and the current 36 um is right at the fovea. At strict 1x
+retina Nyquist no pitch is feasible anywhere (the diffraction, crosstalk and
+fabrication limits close the window). Decision: the designs sample at about 2x
+the retina pitch, which the target map already gives; blur stays judged against
+the retina itself. My first guess (larger lenses outwards, plain at the fovea)
+was wrong under the target map; plain wins only in the field corners.
+
+## An uncompiled Newton step makes a surface term 6x slower
+
+The B-spline mirror term first ran through a plain (eager) Newton step: one
+fold residuals() call on 256 designs took 2.67 s against 0.43 s for the smooth
+mirror, and a 90-iteration search would have taken ~4 h. torch.compile on the
+spline Newton step, as for the smooth one, brought it to 0.60 s. Any new sag
+term in offaxis_tracer needs its Newton step compiled, and a timing check.
+
+## Fold exports had inside-out corrector rims too
+
+After the pancake fix, the new "back crosses front" check also failed the
+stored fold design: its corrector's polynomial runs through the other surface
+beyond the traced footprint. Every lens surface is now clamped flat to its own
+hits' local sag range (plus MARGIN_MM), in its own frame, so tilted fold
+correctors are covered; the pancake adds a floor on the front so the lens stays
+behind the polariser (its nearest hit is only 0.35 mm behind it, closer than
+the margin). A face that touches a clamped vertex gets its own geometric normal:
+an analytic normal there is up to 25 deg off the real facet.
+
+## pkill -f matches the shell that runs it
+
+`pkill -f "pytest tests -q"` inside a Bash tool call killed that call's own
+shell (its command line contains the pattern), so the edits after it never ran.
+Stop background work with its task id, or pgrep first and kill by PID.

@@ -129,3 +129,19 @@ def test_sampling_over_retina_is_reported_over_the_field():
     tx, tz = _field_grid(61)
     ratio = ft.target_pitch_rad(tx, tz) / ft.retina_pitch_rad(tx, tz)
     assert ft.SAMPLING_OVER_RETINA_RANGE == pytest.approx((ratio.min(), ratio.max()), rel=1e-2)
+
+
+def test_the_lens_rule_scales_with_the_lens_pitch():
+    """d_lens = D F / ((pitch / pixel) s_min): where it binds, f = pixel F / d grows
+    with the pitch; where diffraction binds (the fovea), f does not depend on it;
+    the floor is proportional to the lens side."""
+    u = np.linspace(-9000.0, 9000.0, 61)
+    U, V = np.meshgrid(u, u)
+    f36, f72 = ft.lenslet_focal_um(U, V), ft.lenslet_focal_um(U, V, pitch_um=72.0)
+    assert ft.lenslet_focal_um(0.0, 0.0, pitch_um=72.0) == pytest.approx(ft.lenslet_focal_um(0.0, 0.0), rel=1e-12)
+    floor36, floor72 = ft.lenslet_floor_um(36.0), ft.lenslet_floor_um(72.0)
+    assert floor72 == pytest.approx(2.0 * floor36, rel=1e-12) and floor36 == pytest.approx(ft.LENSLET_FLOOR_UM)
+    free = (f36 > 1.01 * floor36) & (f72 > 1.01 * floor72)
+    ratio = f72[free] / f36[free]
+    assert np.all((ratio > 1.0 - 1e-9) & (ratio < 2.0 + 1e-9))
+    assert np.any(np.abs(ratio - 2.0) < 1e-9) and np.any(np.abs(ratio - 1.0) < 1e-9)

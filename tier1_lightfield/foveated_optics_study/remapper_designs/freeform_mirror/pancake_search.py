@@ -161,11 +161,15 @@ def main():
     ap.add_argument("--designs", type=int, default=128)
     ap.add_argument("--iters", type=int, default=90)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed-from", nargs="*", default=[], help="best_*.json files whose designs join the seeds")
+    ap.add_argument("--tag", default="", help="suffix of the output file name")
+    ap.add_argument("--spline-cells", type=int, default=0,
+                    help="add a B-spline of this many cells across to the half-mirror (needs --seed-from)")
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     fs.run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"),
-           family="pancake")
+           family="pancake", seed_from=args.seed_from, tag_suffix=args.tag, spline_cells=args.spline_cells)
 
 
 if __name__ == "__main__":

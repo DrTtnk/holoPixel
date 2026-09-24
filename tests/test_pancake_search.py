@@ -10,6 +10,7 @@ import torch
 HERE = (Path(__file__).resolve().parent.parent / "tier1_lightfield" / "foveated_optics_study"
         / "remapper_designs" / "freeform_mirror")
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
 import fold_search as fs  # noqa: E402
 import offaxis_optiland as oo  # noqa: E402
@@ -87,3 +88,49 @@ def test_the_lens_vertices_stand_up_towards_the_light(designs, device):
     inside = (np.abs(p[:, 0]) < gu[-1]) & (np.abs(p[:, 1]) < gv[-1])
     expected = -RegularGridInterpolator((gu, gv), h)(p[inside, :2])
     assert (p[inside, 2] - z_img[inside]) == pytest.approx(expected, abs=1e-9)
+
+
+
+STORED = HERE / "results_pancake" / "best_pancake_el1_glass.json"
+
+
+def test_stored_designs_seed_the_search_exactly(device):
+    import json
+    entry = json.loads(STORED.read_text())[0]
+    lay = fs.layout(1, entry["flip_u"], entry["flip_v"], family="pancake")
+    x, idx = fs.stored_seeds([STORED], lay, "glass", device, fs.context(device))
+    assert x[0].tolist() == entry["x"] and idx[0].tolist() == entry["indices"]
+
+
+@pytest.mark.parametrize("material, flip_v", [("resin", 1), ("glass", -1)])
+def test_a_stored_design_of_another_material_or_orientation_is_refused(device, material, flip_v):
+    import json
+    entry = json.loads(STORED.read_text())[0]
+    lay = fs.layout(1, entry["flip_u"], flip_v * entry["flip_v"], family="pancake")
+    with pytest.raises(ValueError):
+        fs.stored_seeds([STORED], lay, material, device, fs.context(device))
+
+
+def test_one_spline_shapes_both_passes_of_the_half_mirror(device):
+    """The half-mirror is met twice (reflect, then transmit into lens 1): its
+    spline must be the same on both slots, and zero controls change nothing."""
+    import json
+    entry = json.loads(STORED.read_text())[0]
+    base = fs.entry_layout(entry, "pancake")
+    lay = fs.with_mirror_spline(base, *fs.mirror_spline_grid(entry, device, cells=4, family="pancake"))
+    ctx = fs.context(device)
+    x0, idx = fs.stored_seeds([STORED], base, "glass", device, ctx)
+    x, _ = fs.stored_seeds([STORED], lay, "glass", device, ctx)
+    r0, _ = fs.residuals(x0, idx, base, ctx)
+    r1, _ = fs.residuals(x, idx, lay, ctx)
+    assert r1.cpu().numpy() == pytest.approx(r0.cpu().numpy(), abs=1e-9)
+    x[0, lay["spline"]["slice"]] = 0.01
+    batch = fs.to_batch(x, idx, lay)
+    assert batch.spline[0] == (0, 2)
+    _, _, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+    for s in (0, 2):                                                      # both hits lie on the splined sag
+        p = diag["points"][0, s][alive[0]]
+        c, k, C = batch.c[:1, s], batch.k[:1, s], batch.xy[:1, s]
+        f, _, _, _ = ot.sag(p[None, :, 0], p[None, :, 1], c[:, None], k[:, None], C[:, None])
+        e, _, _ = ot.bspline_sag(p[None, :, 0], p[None, :, 1], batch.spline[1], batch.spline[2])
+        assert (p[:, 2] - batch.z[0, s]).cpu().numpy() == pytest.approx((f + e)[0].cpu().numpy(), abs=1e-8)

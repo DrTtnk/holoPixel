@@ -20,16 +20,28 @@ import lf_evaluate as ev  # noqa: E402
 import offaxis_tracer as ot  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def exported(tmp_path_factory):
+@pytest.fixture(scope="module", params=["random_seed", "spline_mirror"])
+def exported(request, tmp_path_factory):
+    """A random live seed, and a stored design whose mirror carries a B-spline
+    with random 0.02 mm controls: the exported mirror must include it."""
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    rng = np.random.default_rng(4)
-    lo, hi = fs.bounds(fs.layout(1), dev)
-    flip_u, flip_v = fs.family_orientation(1, "resin", rng, dev, lo, hi)
-    lay = fs.layout(1, flip_u, flip_v)
-    x, idx, _ = fs.live_seeds(lay, 1, "resin", rng, dev, fs.context(dev), lo, hi, chunk=64)
-    entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin",
-             "flip_u": flip_u, "flip_v": flip_v}
+    if request.param == "random_seed":
+        rng = np.random.default_rng(4)
+        lo, hi = fs.bounds(fs.layout(1), dev)
+        flip_u, flip_v = fs.family_orientation(1, "resin", rng, dev, lo, hi)
+        lay = fs.layout(1, flip_u, flip_v)
+        x, idx, _ = fs.live_seeds(lay, 1, "resin", rng, dev, fs.context(dev), lo, hi, chunk=64)
+        entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin",
+                 "flip_u": flip_u, "flip_v": flip_v, "spline": {}}
+    else:
+        entry = json.loads((HERE / "results_fold" / "best_fold_el1_glass.json").read_text())[0]
+        grid, shape = fs.mirror_spline_grid(entry, dev, cells=4)
+        lay = fs.with_mirror_spline(fs.entry_layout(entry), grid, shape)
+        n = lay["size"] - len(entry["x"])
+        entry = {**entry, "x": entry["x"] + np.random.default_rng(7).normal(0.0, 0.02, n).tolist(),
+                 "spline": {"grid": list(grid), "shape": list(shape)}}
+        x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
+        idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
     out = ef.export_entry(entry, tmp_path_factory.mktemp("fold"), device=str(dev))
     batch = fs.to_batch(x, idx, lay)
     ctx = fs.context(dev)

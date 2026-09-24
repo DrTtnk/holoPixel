@@ -1,14 +1,16 @@
 """Pre-warp content onto the panel for a remapper design, then view it through
 the whole simulated headset (hmd_view.py).
 
-    python hmd_encoded.py <design_dir> <out_dir> --work <scratch_dir> [--name NAME]
+    python hmd_encoded.py <design_dir> <out_dir> --work <scratch_dir> [--name NAME] [--fovea]
 
 Uses the Cycles evaluation of the design (<design_dir>/evaluation/views, from
 lf_evaluate.py): for every pupil point, which panel pixel each camera ray
 reaches. Every panel pixel is set to the mean colour of the content in the
 directions of the rays that reach it, over all pupil points (the light-field
 encoding). Content: an angle chart, a 5 deg labelled grid with eccentricity
-circles every 5 deg and fine rings every 0.5 deg inside 3 deg.
+circles every 5 deg and fine rings every 0.5 deg inside 3 deg. With --fovea: a
+true-size crop of +/- 5 deg, from its own pupil views at 0.6 arcmin per pixel,
+with square-wave gratings of 1-16 arcmin period (the blur ruler).
 """
 from __future__ import annotations
 
@@ -22,11 +24,19 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 import hmd_view  # noqa: E402
+import lf_evaluate as ev  # noqa: E402
 import lf_pipeline as lp  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
 HALF_DEG = 45.0
 CHART_PX = 2700
+FOVEAL_HALF_DEG = 5.0
+FOVEAL_PX = 3600                 # 1/6 arcmin per chart pixel
+PATCH_DEG = 1.2
+FOVEA_VIEW_PX, FOVEA_VIEW_FOV_DEG = 1200, 12.0     # 0.6 arcmin per view pixel
+# (period arcmin, axis the bars vary along, centre (theta_x, theta_z) deg)
+FOVEAL_PATCHES = tuple((p, axis, (x, z)) for p, x in zip((1, 2, 4, 8, 16), (-3.0, -1.5, 0.0, 1.5, 3.0))
+                       for axis, z in (("x", 1.0), ("z", -1.0)))
 
 
 def angle_chart():
@@ -56,14 +66,33 @@ def angle_chart():
     return rgb
 
 
-def encode(design_dir, chart):
-    views_dir = Path(design_dir) / "evaluation" / "views"
+def foveal_chart():
+    """RGB image over theta_x, theta_z in [-FOVEAL_HALF_DEG, FOVEAL_HALF_DEG] (row 0
+    at -FOVEAL_HALF_DEG): square-wave gratings of FOVEAL_PATCHES on grey, red
+    rings every 1 deg, a white cross through the fovea."""
+    g = (np.arange(FOVEAL_PX) + 0.5) / FOVEAL_PX * 2 * FOVEAL_HALF_DEG - FOVEAL_HALF_DEG
+    X, Z = np.meshgrid(g, g)
+    rgb = np.full((FOVEAL_PX, FOVEAL_PX, 3), 0.35, dtype=np.float32)
+    for period, axis, (cx, cz) in FOVEAL_PATCHES:
+        inside = (np.abs(X - cx) < PATCH_DEG / 2) & (np.abs(Z - cz) < PATCH_DEG / 2)
+        t = (X if axis == "x" else Z) * 60.0 / period
+        rgb[inside] = np.where((t[inside] % 1.0) < 0.5, 1.0, 0.0)[:, None]
+    r = np.hypot(X, Z)
+    step = 2 * FOVEAL_HALF_DEG / FOVEAL_PX
+    ring = (np.abs(r - np.round(r)) < step) & (np.round(r) > 0)
+    rgb[ring] = (1.0, 0.3, 0.3)
+    rgb[(np.abs(X) < step) | (np.abs(Z) < step)] = 1.0
+    return rgb
+
+
+def encode(views_dir, chart, half_deg=HALF_DEG):
+    views_dir = Path(views_dir)
     d = np.load(views_dir / "direction.npy").astype(np.float64).reshape(-1, 3)
     d /= np.linalg.norm(d, axis=1, keepdims=True)
     tx, tz = (np.degrees(a) for a in lp.field_angles(d))
     n = chart.shape[0]
-    col = np.clip(((tx + HALF_DEG) / (2 * HALF_DEG) * n).astype(int), 0, n - 1)
-    row = np.clip(((tz + HALF_DEG) / (2 * HALF_DEG) * n).astype(int), 0, n - 1)
+    col = np.clip(((tx + half_deg) / (2 * half_deg) * n).astype(int), 0, n - 1)
+    row = np.clip(((tz + half_deg) / (2 * half_deg) * n).astype(int), 0, n - 1)
     colour = chart[row, col]
     N = spec.PANEL_PIXELS
     total, count = np.zeros((N * N, 3)), np.zeros(N * N)
@@ -87,14 +116,24 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("--work", required=True)
     ap.add_argument("--name", default="hmd")
+    ap.add_argument("--fovea", action="store_true",
+                    help="true-size foveal crop: its own pupil views over the fovea, a grating chart")
     args = ap.parse_args()
     out = Path(args.out_dir)
-    chart = angle_chart()
-    panel, n_views = encode(args.design_dir, chart)
+    if args.fovea:
+        views = Path(args.work) / "fovea_views"
+        ev.render_views(args.design_dir, views, resolution=FOVEA_VIEW_PX, fov_deg=FOVEA_VIEW_FOV_DEG)
+        chart, half, fov = foveal_chart(), FOVEAL_HALF_DEG, 2 * FOVEAL_HALF_DEG
+        views = views / "views"
+    else:
+        views = Path(args.design_dir) / "evaluation" / "views"
+        chart, half, fov = angle_chart(), HALF_DEG, hmd_view.FOV_DEG
+    panel, n_views = encode(views, chart, half)
     plt.imsave(out / f"{args.name}_encoded_panel.png", panel[::-1])
     plt.imsave(out / f"{args.name}_target.png", chart[::-1])
     for aperture in (0.0, 4.0):
-        print(*hmd_view.build(args.design_dir, out, args.work, f"{args.name}_encoded", aperture, panel_rgb=panel))
+        print(*hmd_view.build(args.design_dir, out, args.work, f"{args.name}_encoded", aperture, panel_rgb=panel,
+                              fov_deg=fov))
     print(f"encoded from {n_views} pupil views")
 
 

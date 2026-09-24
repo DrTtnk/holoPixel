@@ -34,6 +34,9 @@ class Batch(NamedTuple):
     mirror: tuple         # (S,) static: which surfaces reflect
     image_sag: tuple = () # optional (x grid mm, y grid mm, sag (Nx, Ny) mm): a tabulated image surface
                           # (shared by the batch), replacing the last surface's shape
+    spline: tuple = ()    # optional (surfaces (tuple), (x0, y0, h) mm, controls (B, Nx, Ny) mm): a bicubic
+                          # B-spline added to the sag of each listed surface (one physical surface
+                          # met several times, e.g. a pancake's half-mirror) (bspline_sag)
 
 
 def pack(prescriptions, device):
@@ -97,6 +100,52 @@ def sag(x, y, c, k, C):
     g = c / (2.0 * root)                         # d/d(r^2) of c r^2 / (1 + root)
     val, ddx, ddy = _poly(x, y, C)
     return c * r2 / (1.0 + root) + val, 2.0 * g * x + ddx, 2.0 * g * y + ddy, ok
+
+
+def _cubic(t):
+    """Centred cubic B-spline (support |t| < 2) and its derivative."""
+    a = t.abs()
+    inner = 2.0 / 3.0 - a**2 + a**3 / 2.0
+    outer = (2.0 - a) ** 3 / 6.0
+    val = torch.where(a < 1.0, inner, torch.where(a < 2.0, outer, torch.zeros_like(a)))
+    der = torch.where(a < 1.0, -2.0 * a + 1.5 * a**2, torch.where(a < 2.0, -0.5 * (2.0 - a) ** 2, torch.zeros_like(a)))
+    return val, der * torch.sign(t)
+
+
+def bspline_sag(x, y, grid, ctrl):
+    """sum_jk ctrl[b, j, k] N((x - x0) / h - j) N((y - y0) / h - k) and its x, y
+    slopes, N the centred cubic B-spline: control (j, k) sits at (x0 + j h,
+    y0 + k h); the surface falls smoothly to zero within 2 h outside the grid.
+    x, y (B, ...) and ctrl (B, Nx, Ny)."""
+    x0, y0, h = grid
+    B, Nx, Ny = ctrl.shape
+    u, v = (x - x0) / h, (y - y0) / h
+    iu, iv = torch.floor(u.detach()).long(), torch.floor(v.detach()).long()
+    b = torch.arange(B, device=x.device).view((B,) + (1,) * (x.dim() - 1))
+    flat = ctrl.reshape(B * Nx * Ny)
+    val, dx, dy = torch.zeros_like(x), torch.zeros_like(x), torch.zeros_like(x)
+    for dj in (-1, 0, 1, 2):
+        j = iu + dj
+        nx, dnx = _cubic(u - j)
+        for dk in (-1, 0, 1, 2):
+            k = iv + dk
+            ny, dny = _cubic(v - k)
+            inside = (j >= 0) & (j < Nx) & (k >= 0) & (k < Ny)
+            c = flat[(b * Nx + j.clamp(0, Nx - 1)) * Ny + k.clamp(0, Ny - 1)] * inside
+            val = val + c * nx * ny
+            dx = dx + c * dnx * ny
+            dy = dy + c * nx * dny
+    return val, dx / h, dy / h
+
+
+def _newton_spline(o, d, c, k, C, grid, ctrl, t):
+    p = o + t[..., None] * d
+    s, sx, sy, _ = sag(p[..., 0], p[..., 1], c, k, C)
+    e, ex, ey = bspline_sag(p[..., 0], p[..., 1], grid, ctrl)
+    return t - (p[..., 2] - s - e) / (d[..., 2] - (sx + ex) * d[..., 0] - (sy + ey) * d[..., 1])
+
+
+_newton_spline_fused = torch.compile(_newton_spline, dynamic=True)
 
 
 def _rot_x(v, a):
@@ -165,13 +214,25 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
         c, k, C = batch.c[:, s, None, None], batch.k[:, s, None, None], batch.xy[:, s, None, None]
         ol, dl = _rot_x(o - origin, -a), _rot_x(d, -a)                    # local frame
         tabulated = s == S - 1 and len(batch.image_sag) == 3
-        step = (lambda o_, d_, t_: _newton_table(o_, d_, *batch.image_sag, t_)) if tabulated else \
-            (lambda o_, d_, t_: _newton_fused(o_, d_, c, k, C, t_))  # noqa: E731
+        splined = len(batch.spline) == 3 and s in batch.spline[0]
+        if tabulated and splined:
+            raise ValueError("the tabulated image surface cannot also carry a spline")
+        if tabulated:
+            step = lambda o_, d_, t_: _newton_table(o_, d_, *batch.image_sag, t_)  # noqa: E731
+        elif splined:
+            step = lambda o_, d_, t_: _newton_spline_fused(o_, d_, c, k, C, *batch.spline[1:], t_)  # noqa: E731
+        else:
+            step = lambda o_, d_, t_: _newton_fused(o_, d_, c, k, C, t_)  # noqa: E731
         with torch.no_grad():
             t = -ol[..., 2] / dl[..., 2]
             for _ in range(NEWTON_STEPS - GRAD_STEPS):
-                t = step(ol.detach(), dl.detach(), t) if tabulated else \
-                    _newton_fused(ol.detach(), dl.detach(), c.detach(), k.detach(), C.detach(), t)
+                if tabulated:
+                    t = step(ol.detach(), dl.detach(), t)
+                elif splined:
+                    t = _newton_spline_fused(ol.detach(), dl.detach(), c.detach(), k.detach(), C.detach(),
+                                             batch.spline[1], batch.spline[2].detach(), t)
+                else:
+                    t = _newton_fused(ol.detach(), dl.detach(), c.detach(), k.detach(), C.detach(), t)
             # every forward value stays finite, so the backward pass is finite too
             finite = torch.isfinite(t)
             t = torch.where(finite, t, torch.zeros_like(t))
@@ -181,6 +242,9 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
         p = ol + t[..., None] * dl
         f, sx, sy, in_domain = (table_sag(p[..., 0], p[..., 1], *batch.image_sag) if tabulated
                                 else sag(p[..., 0], p[..., 1], c, k, C))
+        if splined:
+            e, ex, ey = bspline_sag(p[..., 0], p[..., 1], *batch.spline[1:])
+            f, sx, sy = f + e, sx + ex, sy + ey
         if diagnostics:
             domain.append(1.0 - (1.0 + k) * c * c * (p[..., 0] ** 2 + p[..., 1] ** 2))
         converged = (p[..., 2] - f).abs() < 1e-9

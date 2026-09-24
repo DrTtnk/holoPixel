@@ -38,3 +38,11 @@ def test_every_lens_vertex_lies_on_the_vertex_surface():
     k = rng.choice(len(arr.mesh.centres), 2000, replace=False)
     c = arr.mesh.centres[k]
     assert arr.centre_height_um[k] == pytest.approx(vl.vertex_height_um(c[:, 0], c[:, 1], 1), abs=1e-9)
+
+
+def test_a_72_um_array_has_a_quarter_of_the_lenses_on_its_own_vertex_surface():
+    a36, a72 = vl.build(1), vl.build(1, pitch_um=72.0)
+    assert len(a72.mesh.centres) == pytest.approx(len(a36.mesh.centres) / 4.0, rel=0.03)
+    c = a72.mesh.centres
+    assert a72.centre_height_um == pytest.approx(vl.vertex_height_um(c[:, 0], c[:, 1], 1, pitch_um=72.0), abs=1e-9)
+    assert a72.focal_um == pytest.approx(vl.focal_of_position(1, pitch_um=72.0)(c[:, 0], c[:, 1]), rel=1e-12)

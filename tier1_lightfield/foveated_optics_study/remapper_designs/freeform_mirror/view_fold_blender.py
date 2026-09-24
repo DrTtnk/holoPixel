@@ -1,5 +1,5 @@
-"""Blender side of view_fold: eye, mirror, corrector, panel and ray fans of one
-exported fold design, for eyeballing. Run with
+"""Eye, remapper optics, panel and ray fans of one exported fold or pancake
+design, for eyeballing; the side view is framed on the optics. Run with
     blender -b --factory-startup --python view_fold_blender.py -- <design_dir> <out.blend>
 """
 import json
@@ -45,19 +45,24 @@ def polyline(name, pts, mat, radius=0.05):
     bpy.context.scene.collection.objects.link(ob)
 
 
-def side_view(png):
-    """Orthographic side view (from -X, looking along +X) with Workbench, for a quick look."""
+def side_view(png, points):
+    """Orthographic side view (from -X, looking along +X) with Workbench, framed on
+    the points (world y, z) with a 10 % margin."""
+    lo, hi = points[:, 1:].min(0), points[:, 1:].max(0)
+    centre, size = 0.5 * (lo + hi), hi - lo
     cam = bpy.data.objects.new("SIDE", bpy.data.cameras.new("SIDE"))
     cam.data.type = "ORTHO"
-    cam.data.ortho_scale = 90.0
+    cam.data.ortho_scale = 1.1 * max(size[0], size[1] * 4.0 / 3.0)
     cam.data.clip_end = 1000.0
-    cam.location = (-200.0, 22.0, 12.0)
+    cam.location = (-200.0, centre[0], centre[1])
     cam.rotation_euler = (1.5708, 0.0, -1.5708)
     bpy.context.scene.collection.objects.link(cam)
     sc = bpy.context.scene
     sc.camera = cam
     sc.render.engine = "BLENDER_WORKBENCH"
     sc.display.shading.color_type = "MATERIAL"
+    sc.display.shading.show_xray = True                                 # rays inside and between the optics show
+    sc.display.shading.xray_alpha = 0.25
     sc.render.resolution_x, sc.render.resolution_y = 1600, 1200
     sc.render.filepath = str(png.resolve())
     bpy.ops.render.render(write_still=True)
@@ -86,7 +91,8 @@ def main():
         for p in range(rays["paths"].shape[1]):
             if rays["alive"][f, p]:
                 polyline(f"ray_{f}_{p}", rays["paths"][f, p], mats[f % len(mats)])
-    side_view(out.with_suffix(".png"))
+    live = rays["paths"][rays["alive"]].reshape(-1, 3)
+    side_view(out.with_suffix(".png"), np.concatenate([live, np.asarray(corners)]))
     bpy.ops.wm.save_as_mainfile(filepath=str(out.resolve()))
     print("VIEW_DONE")
 

@@ -26,38 +26,49 @@ TABLE_STEP_MM = 0.02
 TABLE_HALF_MM = spec.PANEL_MM / 2.0 + 0.2
 
 
-def focal_of_position(flip_v):
+def focal_of_position(flip_v, pitch_um=spec.LENS_PITCH_UM):
     if flip_v not in (1, -1):
         raise ValueError(f"flip_v must be +1 or -1, not {flip_v!r}")
-    return lambda u_um, v_um: ft.lenslet_focal_um(np.asarray(u_um), flip_v * np.asarray(v_um))
+    return lambda u_um, v_um: ft.lenslet_focal_um(np.asarray(u_um), flip_v * np.asarray(v_um), pitch_um)
 
 
-def _profile(flip_v):
-    return dict(panel_um=PANEL_UM, side_um=spec.LENS_SIDE_UM, focal_of_position=focal_of_position(flip_v),
+def _side_um(pitch_um):
+    return pitch_um / np.sqrt(3.0)
+
+
+def _profile(flip_v, pitch_um):
+    return dict(panel_um=PANEL_UM, side_um=_side_um(pitch_um), focal_of_position=focal_of_position(flip_v, pitch_um),
                 index=spec.LENS_INDEX, min_thickness_um=spec.LENS_MIN_THICKNESS_UM)
 
 
-def build(flip_v, subdivisions=2):
-    return mla_mesh.build_variable(subdivisions=subdivisions, **_profile(flip_v))
+def build(flip_v, subdivisions=2, pitch_um=spec.LENS_PITCH_UM):
+    """subdivisions per spec.LENS_PITCH_UM of pitch: the mesh spacing stays the
+    same in um, so the border triangles overshoot the hex corners by the same
+    share of the side (the floor lens covers 1.15 side) whatever the pitch."""
+    scaled = subdivisions * pitch_um / spec.LENS_PITCH_UM
+    if abs(scaled - round(scaled)) > 1e-9:
+        raise ValueError(f"pitch {pitch_um} um is not a whole multiple of the mesh spacing")
+    return mla_mesh.build_variable(subdivisions=int(round(scaled)), **_profile(flip_v, pitch_um))
 
 
-@lru_cache(maxsize=4)
-def _gap_um(flip_v):
-    centres = mla_mesh.mla.hex_centres_um(PANEL_UM + 4.0 * spec.LENS_SIDE_UM, spec.LENS_SIDE_UM)
-    return mla_mesh.variable_lens_heights(centres, focal_of_position(flip_v), spec.LENS_INDEX,
-                                          spec.LENS_SIDE_UM, spec.LENS_MIN_THICKNESS_UM)[3]
+@lru_cache(maxsize=8)
+def _gap_um(flip_v, pitch_um=spec.LENS_PITCH_UM):
+    side = _side_um(pitch_um)
+    centres = mla_mesh.mla.hex_centres_um(PANEL_UM + 4.0 * side, side)
+    return mla_mesh.variable_lens_heights(centres, focal_of_position(flip_v, pitch_um), spec.LENS_INDEX,
+                                          side, spec.LENS_MIN_THICKNESS_UM)[3]
 
 
-def vertex_height_um(u_um, v_um, flip_v):
+def vertex_height_um(u_um, v_um, flip_v, pitch_um=spec.LENS_PITCH_UM):
     """Height of the lens vertices above the array's flat face: n (f - gap)."""
-    return spec.LENS_INDEX * (focal_of_position(flip_v)(u_um, v_um) - _gap_um(flip_v))
+    return spec.LENS_INDEX * (focal_of_position(flip_v, pitch_um)(u_um, v_um) - _gap_um(flip_v, pitch_um))
 
 
-@lru_cache(maxsize=4)
-def bowl_table(flip_v):
+@lru_cache(maxsize=8)
+def bowl_table(flip_v, pitch_um=spec.LENS_PITCH_UM):
     """(grid_u mm, grid_v mm, height mm relative to the panel centre's vertex) on a
     uniform grid over the panel plus a 0.2 mm margin."""
     g = np.arange(-TABLE_HALF_MM, TABLE_HALF_MM + 1e-9, TABLE_STEP_MM)
     U, V = np.meshgrid(g, g, indexing="ij")
-    h = vertex_height_um(U * 1e3, V * 1e3, flip_v) - vertex_height_um(0.0, 0.0, flip_v)
+    h = vertex_height_um(U * 1e3, V * 1e3, flip_v, pitch_um) - vertex_height_um(0.0, 0.0, flip_v, pitch_um)
     return g, g, 1e-3 * h

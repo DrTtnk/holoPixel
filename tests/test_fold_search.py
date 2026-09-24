@@ -128,3 +128,105 @@ def test_the_image_surface_is_the_lens_vertex_bowl(designs, device):
     expected = RegularGridInterpolator((gu, gv), h)(loc[inside, :2])
     assert loc[inside, 2] == pytest.approx(expected, abs=1e-9)
     assert inside.mean() > 0.5
+
+
+def _grid_map(fn, n=9):
+    a = torch.linspace(-1.0, 1.0, n, dtype=torch.float64)
+    X, Y = torch.meshgrid(a, a, indexing="ij")
+    return torch.stack(fn(X, Y), -1)[None]                               # (1, n, n, 2)
+
+
+def test_the_fold_term_is_zero_for_the_target_and_positive_for_folds_and_collapse():
+    target = _grid_map(lambda x, y: (x, y))
+    ok = torch.ones(target.shape[:3], dtype=torch.bool)
+    det_t = fs.cell_det(target)[0]
+    assert float(fs.fold_violation(target, ok, det_t, 1.0).abs().max()) == 0.0
+    assert float(fs.fold_violation(_grid_map(lambda x, y: (1.5 * x, y)), ok, det_t, 1.0).abs().max()) == 0.0
+    folded = fs.fold_violation(_grid_map(lambda x, y: (x.abs(), y)), ok, det_t, 1.0)
+    assert float(folded[0, :4].min()) > 0.0 and float(folded[0, 4:].abs().max()) == 0.0   # x < 0 half folds
+    collapsed = fs.fold_violation(_grid_map(lambda x, y: (0.1 * x, y)), ok, det_t, 1.0)
+    assert float(collapsed.min()) == pytest.approx(fs.Q_MIN - 0.1)
+    mirrored = fs.fold_violation(_grid_map(lambda x, y: (-x, y)), ok, det_t, -1.0)   # a flipped image is fine
+    assert float(mirrored.abs().max()) == 0.0
+    dead = ok.clone()
+    dead[0, 0, 0] = False
+    assert float(fs.fold_violation(_grid_map(lambda x, y: (x.abs(), y)), dead, det_t, 1.0)[0, 0, 0]) == 0.0
+
+
+def test_the_outside_term_is_the_depth_inside_the_panel_of_out_of_field_rays():
+    h = fs.PANEL_HALF_MM + fs.OUT_MARGIN_MM
+    land = torch.tensor([[[0.0, 0.0], [h - 1.0, 0.0], [0.0, -(h + 1.0)], [h + 3.0, 2.0]]], dtype=torch.float64)
+    alive = torch.tensor([[True, True, True, False]])
+    got = fs.outside_violation(land, alive)
+    assert got[0].tolist() == pytest.approx([h, 1.0, 0.0, 0.0])
+
+
+def test_the_dense_grid_and_the_ring_enter_the_merit(designs, device):
+    lay, x, idx = designs
+    ctx = fs.context(device)
+    _, info = fs.residuals(x, idx, lay, ctx)
+    batch = fs.to_batch(x, idx, lay)
+    chief = torch.zeros(1, 2, dtype=torch.float64, device=device)
+    land, _, alive = ot.trace(batch, ctx["dense_fields"], chief)
+    shape = ctx["dense_shape"]
+    L = land[:, :, 0].reshape(len(x), *shape, 2)
+    ok = alive[:, :, 0].reshape(len(x), *shape)
+    sign = lay["flip_u"] * lay["flip_v"] * ctx["dense_sign"]
+    fold = fs.fold_violation(L, ok, ctx["dense_det"], sign)
+    expected = fs.W["fold"] * (fold**2).sum((1, 2)) / fold[0].numel()
+    assert info["fold"].detach().cpu().numpy() == pytest.approx(expected.cpu().numpy(), rel=1e-9, abs=1e-12)
+    ring, _, ring_alive = ot.trace(batch, ctx["ring_fields"], chief)
+    out = fs.outside_violation(ring[:, :, 0], ring_alive[:, :, 0])
+    expected = fs.W["outside"] * (out**2).sum(1) / out.shape[1]
+    assert info["outside"].detach().cpu().numpy() == pytest.approx(expected.cpu().numpy(), rel=1e-9, abs=1e-12)
+
+
+FOLD_BEST = HERE / "results_fold" / "best_fold_el1_glass.json"                # anamorphic target map
+
+
+@pytest.fixture(scope="module")
+def splined(device):
+    import json
+    entry = json.loads(FOLD_BEST.read_text())[0]
+    base = fs.layout(entry["n_el"], entry["flip_u"], entry["flip_v"])
+    grid, shape = fs.mirror_spline_grid(entry, device, cells=4)
+    return entry, base, fs.with_mirror_spline(base, grid, shape)
+
+
+def test_a_zero_spline_leaves_a_stored_design_unchanged(splined, device):
+    entry, base, lay = splined
+    ctx = fs.context(device)
+    x_base, idx = fs.stored_seeds([FOLD_BEST], base, entry["material"], device, ctx)
+    x, idx2 = fs.stored_seeds([FOLD_BEST], lay, entry["material"], device, ctx)
+    assert x.shape[1] == lay["size"] and float(x[:, lay["spline"]["slice"]].abs().max()) == 0.0
+    r0, _ = fs.residuals(x_base, idx, base, ctx)
+    r1, _ = fs.residuals(x, idx2, lay, ctx)
+    assert r1.cpu().numpy() == pytest.approx(r0.cpu().numpy(), abs=1e-9)   # uncompiled Newton: other rounding
+
+
+def test_the_spline_controls_are_mirror_symmetric_in_x(splined, device):
+    entry, _, lay = splined
+    x = torch.zeros(1, lay["size"], dtype=torch.float64, device=device)
+    x[0, :len(entry["x"])] = torch.tensor(entry["x"], dtype=torch.float64)
+    x[0, lay["spline"]["slice"]] = torch.linspace(-0.1, 0.2, lay["spline"]["slice"].stop - lay["spline"]["slice"].start)
+    ctrl = fs.to_batch(x, torch.tensor([entry["indices"]], dtype=torch.float64, device=device), lay).spline[2][0]
+    assert ctrl.cpu().numpy() == pytest.approx(ctrl.flip(0).cpu().numpy(), abs=0.0)
+    assert float(ctrl.abs().max()) > 0.0
+
+
+def test_the_spline_grid_covers_the_mirror_footprint_with_a_cell_to_spare(splined, device):
+    entry, base, lay = splined
+    (x0, y0, h), (nx, ny) = lay["spline"]["grid"], lay["spline"]["shape"]
+    ctx = fs.context(device)
+    x = torch.tensor([entry["x"]], dtype=torch.float64, device=device)
+    idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=device)
+    batch = fs.to_batch(x, idx, base)
+    _, _, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+    p = diag["points"][0, 0][alive[0]].cpu().numpy()
+    a = float(batch.rx[0, 0])
+    loc_x = p[:, 0]
+    loc_y = (p[:, 1] - float(batch.y[0, 0])) * math.cos(a) + (p[:, 2] - float(batch.z[0, 0])) * math.sin(a)
+    assert x0 == pytest.approx(-(nx - 1) / 2 * h)
+    e = 1e-9                                                                # the first free control sits on the edge
+    assert x0 + h <= -np.abs(loc_x).max() + e and x0 + (nx - 2) * h >= np.abs(loc_x).max() - e
+    assert y0 + h <= loc_y.min() + e and y0 + (ny - 2) * h >= loc_y.max() - e
