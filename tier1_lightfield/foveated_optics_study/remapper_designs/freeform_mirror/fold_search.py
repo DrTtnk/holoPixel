@@ -486,7 +486,7 @@ def live_seeds(lay, count, material, rng, device, ctx, lo, hi, chunk=512):
         xs.append(x[keep])
         idxs.append(idx[keep])
         tried += chunk
-        if tried > 200 * count:
+        if sum(len(x) for x in xs) < count and tried > 200 * count:
             raise RuntimeError(f"only {sum(len(x) for x in xs)} live seeds in {tried} random designs")
     return torch.cat(xs)[:count], torch.cat(idxs)[:count], tried
 

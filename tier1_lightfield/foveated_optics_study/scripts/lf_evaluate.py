@@ -119,8 +119,11 @@ def validate_surfaces(remapper):
             raise ValueError(f"surface {k}: glass is wound inwards (negative signed volume)")
 
 
-def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5, resolution=2048,
-             fov_deg=76.0, subdivisions=2):
+def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5, resolution=2048,
+                 fov_deg=76.0, subdivisions=2):
+    """The Cycles pass alone: per pupil view, the panel pixel and the entered lens
+    of every camera ray (work/views). Returns the design, remapper path, lenslet
+    mesh, air gap, lenslet summary and the views."""
     design_dir, work = Path(design_dir), Path(work)
     design = json.loads((design_dir / "design.json").read_text())
     remapper = (design_dir / design["remapper_npz"]).resolve()
@@ -138,6 +141,14 @@ def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0
         "out_npz": str(work / "evaluate.npz"),
     }
     lp.run_blender(cfg, work)
+    return design, remapper, mesh, gap, lenslets, views
+
+
+def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5, resolution=2048,
+             fov_deg=76.0, subdivisions=2):
+    work = Path(work)
+    design, remapper, mesh, gap, lenslets, views = render_views(design_dir, work, panel_pixels, view_spacing_mm,
+                                                                resolution, fov_deg, subdivisions)
     report = metrics(work / "views", views, mesh.centres, panel_pixels)
     report["geometry"] = geometry(design, remapper, mesh, gap)
     report["design"] = {**lenslets, "gap_um": gap, "centre_thickness_um": mesh.centre_thickness,
@@ -297,6 +308,8 @@ def metrics(view_dir, views, centres, panel_pixels):
 
     def pct(x, q):
         # nearest rank: interpolating between inf entries would give NaN
+        if len(x) == 0:
+            raise ValueError("no lens has a lit neighbour: the camera is too coarse for the lens pitch")
         return float(np.percentile(x, q, method="nearest"))
 
     return {

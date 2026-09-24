@@ -16,8 +16,15 @@ rows the world directions of u, v, w.
 Optional remapper surfaces (world mm) sit between the MLA and the eye:
   glass     closed solid of the given index: lossless refraction, and total
             internal reflection where it occurs (no Fresnel partial loss).
-            surf{k}_mirror_faces (one bool per face) mirror-coats those faces.
+            surf{k}_mirror_faces (one bool per face) mirror-coats those faces;
+            surf{k}_half_mirror_faces makes those faces an ideal pancake
+            half-mirror: a mirror on the ray's first specular event, the glass
+            from then on.
   mirror    perfect specular reflector (both sides)
+  polariser ideal pancake reflective polariser: transparent, except a mirror
+            on the ray's second specular event (after the half-mirror).
+            Cycles has no polarisation; switching on the ray's glossy-bounce
+            count gives exactly the ideal pancake path (no ghosts).
   absorber  opaque black (baffles, housings)
 Elements must be separated by air: Cycles has no nested-dielectric priority.
 
@@ -151,32 +158,71 @@ def _sharp_mirror(nt):
     return b
 
 
-def glass(name, index):
+def _glass_closure(nt, index):
     """Deterministic lossless dielectric: pure refraction, or pure reflection
     under total internal reflection. Cycles' Refraction BSDF alone drops TIR
     paths, and the Glass BSDF picks Fresnel reflection at random, which would
     corrupt a 1-sample pixel-ID calibration."""
+    refr = nt.nodes.new("ShaderNodeBsdfRefraction")
+    refr.inputs["IOR"].default_value = index
+    refr.inputs["Roughness"].default_value = 0.0
+    refr.inputs["Color"].default_value = (1, 1, 1, 1)
+    fresnel = nt.nodes.new("ShaderNodeFresnel")
+    fresnel.inputs["IOR"].default_value = index
+    tir = nt.nodes.new("ShaderNodeMath")
+    tir.operation = "GREATER_THAN"
+    tir.inputs[1].default_value = 0.9999
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    nt.links.new(fresnel.outputs["Fac"], tir.inputs[0])
+    nt.links.new(tir.outputs["Value"], mix.inputs["Fac"])
+    nt.links.new(refr.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(_sharp_mirror(nt).outputs["BSDF"], mix.inputs[2])
+    return mix.outputs["Shader"]
+
+
+def glass(name, index):
+    return node_material(name, lambda nt: _glass_closure(nt, index))
+
+
+def mirror(name):
+    return node_material(name, lambda nt: _sharp_mirror(nt).outputs["BSDF"])
+
+
+def _glossy_depth_is(nt, n):
+    """1 where the ray has had exactly n glossy (specular) bounces, else 0."""
+    lp = nt.nodes.new("ShaderNodeLightPath")
+    cmp = nt.nodes.new("ShaderNodeMath")
+    cmp.operation = "COMPARE"
+    cmp.inputs[1].default_value = float(n)
+    cmp.inputs[2].default_value = 0.5
+    nt.links.new(lp.outputs["Glossy Depth"], cmp.inputs[0])
+    return cmp.outputs["Value"]
+
+
+def polariser(name):
+    """Ideal pancake reflective polariser: a mirror on the second specular event,
+    transparent otherwise."""
     def build(nt):
-        refr = nt.nodes.new("ShaderNodeBsdfRefraction")
-        refr.inputs["IOR"].default_value = index
-        refr.inputs["Roughness"].default_value = 0.0
-        refr.inputs["Color"].default_value = (1, 1, 1, 1)
-        fresnel = nt.nodes.new("ShaderNodeFresnel")
-        fresnel.inputs["IOR"].default_value = index
-        tir = nt.nodes.new("ShaderNodeMath")
-        tir.operation = "GREATER_THAN"
-        tir.inputs[1].default_value = 0.9999
         mix = nt.nodes.new("ShaderNodeMixShader")
-        nt.links.new(fresnel.outputs["Fac"], tir.inputs[0])
-        nt.links.new(tir.outputs["Value"], mix.inputs["Fac"])
-        nt.links.new(refr.outputs["BSDF"], mix.inputs[1])
+        see_through = nt.nodes.new("ShaderNodeBsdfTransparent")
+        see_through.inputs["Color"].default_value = (1, 1, 1, 1)
+        nt.links.new(_glossy_depth_is(nt, 1), mix.inputs["Fac"])
+        nt.links.new(see_through.outputs["BSDF"], mix.inputs[1])
         nt.links.new(_sharp_mirror(nt).outputs["BSDF"], mix.inputs[2])
         return mix.outputs["Shader"]
     return node_material(name, build)
 
 
-def mirror(name):
-    return node_material(name, lambda nt: _sharp_mirror(nt).outputs["BSDF"])
+def half_mirror(name, index):
+    """Ideal pancake half-mirror on a glass face: a mirror on the first specular
+    event, the lossless glass afterwards."""
+    def build(nt):
+        mix = nt.nodes.new("ShaderNodeMixShader")
+        nt.links.new(_glossy_depth_is(nt, 0), mix.inputs["Fac"])
+        nt.links.new(_glass_closure(nt, index), mix.inputs[1])
+        nt.links.new(_sharp_mirror(nt).outputs["BSDF"], mix.inputs[2])
+        return mix.outputs["Shader"]
+    return node_material(name, build)
 
 
 def absorber(name):
@@ -228,15 +274,21 @@ def add_remapper(cfg):
             mat = mirror(f"REMAP{k}_mirror")
         elif kind == "absorber":
             mat = absorber(f"REMAP{k}_absorber")
+        elif kind == "polariser":
+            mat = polariser(f"REMAP{k}_polariser")
         else:
             raise ValueError(f"surface {k}: unknown kind {kind!r}")
         normals = r[f"surf{k}_normals"] if f"surf{k}_normals" in r else None
         obj = link(f"REMAP{k}_{kind}", r[f"surf{k}_verts"], r[f"surf{k}_faces"], normals, mat)
-        if f"surf{k}_mirror_faces" in r:
-            coated = np.asarray(r[f"surf{k}_mirror_faces"], dtype=bool)
-            if kind != "glass" or len(coated) != len(obj.data.polygons):
-                raise ValueError(f"surface {k}: mirror_faces needs a glass solid and one flag per face")
-            obj.data.materials.append(mirror(f"REMAP{k}_coating"))
+        for key, coating in (("mirror_faces", lambda: mirror(f"REMAP{k}_coating")),
+                             ("half_mirror_faces", lambda: half_mirror(f"REMAP{k}_half_mirror",
+                                                                       float(r[f"surf{k}_index"])))):
+            if f"surf{k}_{key}" not in r:
+                continue
+            coated = np.asarray(r[f"surf{k}_{key}"], dtype=bool)
+            if kind != "glass" or len(coated) != len(obj.data.polygons) or len(obj.data.materials) != 1:
+                raise ValueError(f"surface {k}: {key} needs a glass solid, one flag per face, one coating kind")
+            obj.data.materials.append(coating())
             obj.data.polygons.foreach_set("material_index", coated.astype(np.int32))
         objs.append(obj)
     return objs
