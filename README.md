@@ -70,6 +70,7 @@ python coaxial_dls/gpu_search.py <out> --elements 5
 python coaxial_dls/export_candidate.py <out>/best_el5_flat.json <design_dir>
 # folded: panel above the eye, freeform mirror, 1-2 freeform correctors
 python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or glass; --ratio-weight 0 frees the mapping
+python freeform_mirror/pancake_search.py <out> --elements 1 --material resin   # pancake (tracer only)
 python freeform_mirror/export_fold.py <out>/best_fold_el1_resin.json <design_dir>
 blender -b --factory-startup --python freeform_mirror/view_fold_blender.py -- <design_dir> view.blend
 python ../scripts/lf_evaluate.py <design_dir> --pixels 2560

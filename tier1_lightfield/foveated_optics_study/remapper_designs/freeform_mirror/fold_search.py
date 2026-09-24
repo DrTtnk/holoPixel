@@ -73,7 +73,7 @@ W = {"blur": 1.0, "hinge": 10.0, "ratio": 30.0, "panel": 30.0, "tilt": 1.0, "spa
      "map": 10.0}
 
 
-def layout(n_el, flip_u=1, flip_v=1):
+def fold_layout(n_el, flip_u=1, flip_v=1):
     """Slices of the parameter vector, and the image orientation of this layout
     family relative to the target map (+1 upright, -1 mirrored), measured by
     orientation() on its seeds."""
@@ -85,16 +85,17 @@ def layout(n_el, flip_u=1, flip_v=1):
         i += n
         return s
 
-    lay = {"n_el": n_el, "flip_u": flip_u, "flip_v": flip_v, "mirror_pose": take(3), "mirror_shape": take(N_SHAPE),
-           "elements": []}
+    lay = {"family": "fold", "n_el": n_el, "flip_u": flip_u, "flip_v": flip_v, "mirror_pose": take(3),
+           "mirror_shape": take(N_SHAPE), "elements": []}
     for _ in range(n_el):
         lay["elements"].append({"pose": take(5), "front": take(N_SHAPE), "back": take(N_SHAPE)})
     lay["image"] = take(3)
     lay["size"] = i
+    lay["shapes"] = [lay["mirror_shape"]] + [el[side] for el in lay["elements"] for side in ("front", "back")]
     return lay
 
 
-def bounds(lay, device):
+def fold_bounds(lay, device):
     lo, hi = np.full(lay["size"], -np.inf), np.full(lay["size"], np.inf)
 
     def put(s, low, high):
@@ -111,7 +112,7 @@ def bounds(lay, device):
     return t(lo), t(hi)
 
 
-def random_designs(lay, count, rng, device):
+def fold_random_designs(lay, count, rng, device):
     x = np.zeros((count, lay["size"]))
     s_img = rng.uniform(22.0, 40.0, count)
     x[:, lay["mirror_pose"]] = np.column_stack([rng.uniform(30.0, 45.0, count), rng.normal(0.0, 2.0, count),
@@ -144,7 +145,7 @@ def _shape(p, r0):
     return 2.0 * p[:, 0] / r0**2, p[:, 1], C
 
 
-def to_batch(x, indices, lay):
+def fold_to_batch(x, indices, lay):
     B = x.shape[0]
     zero = torch.zeros(B, dtype=x.dtype, device=x.device)
     z_m, y_m, a_deg = x[:, lay["mirror_pose"]].unbind(1)
@@ -181,6 +182,30 @@ def to_batch(x, indices, lay):
     st = lambda v: torch.stack(v, 1)  # noqa: E731
     return ot.Batch(y=st(ys), z=st(zs), rx=st(rxs), c=st(cs), k=st(ks), xy=st(Cs), n=st(ns),
                     mirror=(True,) + (False,) * (2 * lay["n_el"] + 1), image_sag=bowl(x.device, lay["flip_v"]))
+
+
+FAMILIES = {}
+
+
+def register(name, **functions):
+    """An optical family: layout, bounds, random_designs, to_batch, constraints."""
+    FAMILIES[name] = functions
+
+
+def layout(n_el, flip_u=1, flip_v=1, family="fold"):
+    return FAMILIES[family]["layout"](n_el, flip_u, flip_v)
+
+
+def bounds(lay, device):
+    return FAMILIES[lay["family"]]["bounds"](lay, device)
+
+
+def random_designs(lay, count, rng, device):
+    return FAMILIES[lay["family"]]["random_designs"](lay, count, rng, device)
+
+
+def to_batch(x, indices, lay):
+    return FAMILIES[lay["family"]]["to_batch"](x, indices, lay)
 
 
 _BOWLS = {}
@@ -338,6 +363,24 @@ def residuals(x, indices, lay, ctx):
     r_tilt = (torch.relu(torch.rad2deg(torch.acos(torch.clamp(cos_t, max=1.0 - 1e-12))) - TILT_MAX_DEG)
               * torch.sqrt(ctx["weights"]["tilt"] * okd / F))
 
+    space, barrier = FAMILIES[lay["family"]]["constraints"](batch, diag, alive, lay, x)
+    norm = lambda v: torch.sqrt(v + 1e-30)  # noqa: E731
+    r = torch.cat([r_blur.reshape(B, -1), r_hinge.reshape(B, -1), r_ratio.reshape(B, -1), r_panel.reshape(B, -1),
+                   r_map.reshape(B, -1),
+                   r_tilt, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
+    alive_all = (alive.double().sum((1, 2)) + okd.sum(1)) / (alive[0].numel() + ok_c.shape[1])
+    sq = lambda t: (t**2).reshape(B, -1).sum(1)  # noqa: E731
+    return r, {"blur": sq(r_blur), "hinge": sq(r_hinge), "ratio": sq(r_ratio), "panel": sq(r_panel),
+               "map": sq(r_map),
+               "tilt": sq(r_tilt), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
+               "alive_all": alive_all}
+
+
+def fold_constraints(batch, diag, alive, lay, x):
+    """Space and barrier sums (squared, over rays) of the fold family: no hardware
+    in the eye's view cone, near the pupil or behind the face plane; return rays
+    cross the baffle beyond the hardware; glass and air floors; TIR and sag-domain
+    margins."""
     pts = diag["points"]                                               # (B, S, F, P, 3)
     live = alive[:, None].double()
     hw = pts[:, 1:]
@@ -364,16 +407,7 @@ def residuals(x, indices, lay, ctx):
     barrier = (torch.relu(floor[None, :, None, None] - seg) ** 2 * live).sum((1, 2, 3))
     barrier = barrier + (torch.relu(diag["sin2t"][:, :-1] - SIN2_MAX) ** 2 * live).sum((1, 2, 3))
     barrier = barrier + (torch.relu(DOMAIN_MIN - diag["domain"]) ** 2 * alive[:, None].double()).sum((1, 2, 3))
-    norm = lambda v: torch.sqrt(v + 1e-30)  # noqa: E731
-    r = torch.cat([r_blur.reshape(B, -1), r_hinge.reshape(B, -1), r_ratio.reshape(B, -1), r_panel.reshape(B, -1),
-                   r_map.reshape(B, -1),
-                   r_tilt, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
-    alive_all = (alive.double().sum((1, 2)) + okd.sum(1)) / (alive[0].numel() + ok_c.shape[1])
-    sq = lambda t: (t**2).reshape(B, -1).sum(1)  # noqa: E731
-    return r, {"blur": sq(r_blur), "hinge": sq(r_hinge), "ratio": sq(r_ratio), "panel": sq(r_panel),
-               "map": sq(r_map),
-               "tilt": sq(r_tilt), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
-               "alive_all": alive_all}
+    return space, barrier
 
 
 def merit(x, indices, lay, ctx):
@@ -427,9 +461,9 @@ def orientation(x, indices, lay):
     return torch.sign(land[:, 1, 0, 0] - land[:, 0, 0, 0]), torch.sign(land[:, 3, 0, 1] - land[:, 2, 0, 1])
 
 
-def family_orientation(n_el, material, rng, device, lo, hi, count=512):
+def family_orientation(n_el, material, rng, device, lo, hi, count=512, family="fold"):
     """The image orientation most random designs of this layout produce."""
-    lay = layout(n_el)
+    lay = layout(n_el, family=family)
     x = torch.clamp(random_designs(lay, count, rng, device), lo, hi)
     idx = torch.tensor(rng.choice(INDEX_SETS[material], size=(count, n_el)), dtype=torch.float64, device=device)
     su, sv = orientation(x, idx, lay)
@@ -469,22 +503,22 @@ def fd_jacobian(x, indices, lay, ctx, r0, free, lo, hi, h=1e-5):
     return J
 
 
-def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["ratio"], tag_suffix=""):
+def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["ratio"], tag_suffix="", family="fold"):
     """Batched Levenberg-Marquardt (damped least squares), one damping per
     design. Each iteration tries four dampings and keeps the best step that
     lowers the merit and loses no ray. High-order terms are frozen for the
     first third of the iterations."""
     rng = np.random.default_rng(seed)
-    lo, hi = bounds(layout(n_el), device)
-    flip_u, flip_v = family_orientation(n_el, material, rng, device, lo, hi)
-    lay = layout(n_el, flip_u, flip_v)
+    lo, hi = bounds(layout(n_el, family=family), device)
+    flip_u, flip_v = family_orientation(n_el, material, rng, device, lo, hi, family=family)
+    lay = layout(n_el, flip_u, flip_v, family=family)
     print(f"image orientation of this layout: flip_u {flip_u}, flip_v {flip_v}", flush=True)
     ctx = context(device, {**W, "ratio": ratio_weight})
     with torch.no_grad():
         x, indices, tried = live_seeds(lay, count, material, rng, device, ctx, lo, hi)
         print(f"{count} live seeds from {tried} random designs", flush=True)
         high = torch.zeros(lay["size"], dtype=torch.bool, device=device)
-        for s in [lay["mirror_shape"]] + [el[side] for el in lay["elements"] for side in ("front", "back")]:
+        for s in lay["shapes"]:
             high[s.start + 2 + LOW_ORDER:s.stop] = True
         lam = torch.full((count,), 1e-2, dtype=x.dtype, device=device)
         tries = torch.tensor([0.25, 1.0, 4.0, 16.0], dtype=x.dtype, device=device)
@@ -532,11 +566,15 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
                     "indices": indices[b].tolist(), "x": x[b].detach().tolist(), "n_el": n_el,
                     "flip_u": lay["flip_u"], "flip_v": lay["flip_v"],
                     "material": material, "prescription": to_prescription(x[b].detach(), indices[b], lay)})
-    tag = f"fold_el{n_el}_{material}{tag_suffix}"
+    tag = f"{family}_el{n_el}_{material}{tag_suffix}"
     (Path(out_dir) / f"best_{tag}.json").write_text(json.dumps(out, indent=1))
     top = out[0]
     print(f"TOP {tag}: loss {top['loss']:.3f} blur {top['blur']:.3f} alive {top['alive_all']:.3f} "
           f"worst-cell blur p90 {np.percentile(top['worst_cell_blur_per_field'], 90):.2f}", flush=True)
+
+
+register("fold", layout=fold_layout, bounds=fold_bounds, random_designs=fold_random_designs,
+         to_batch=fold_to_batch, constraints=fold_constraints)
 
 
 def main():
