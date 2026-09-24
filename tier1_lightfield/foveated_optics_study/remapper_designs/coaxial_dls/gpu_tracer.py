@@ -32,7 +32,7 @@ class Batch(NamedTuple):
     k: torch.Tensor      # (B, S) conics
     a: torch.Tensor      # (B, S, 3) r^4, r^6, r^8 coefficients
     n: torch.Tensor      # (B, S) index AFTER each surface (last = medium at the image)
-    image_sag: tuple = ()  # optional (r^2 grid mm^2, sag mm): a radial tabulated image surface
+    image_sag: tuple = ()  # optional (x grid mm, y grid mm, sag (Nx, Ny) mm): a tabulated image surface
 
 
 def pack(prescriptions, device, image=None):
@@ -78,20 +78,30 @@ def dsag_dr2(r2, c, k, a):
     return c / (2.0 * root) + 2 * a[..., 0] * r2 + 3 * a[..., 1] * r2**2 + 4 * a[..., 2] * r2**3
 
 
-def table_sag(r2, grid_r2, table):
-    """Radial tabulated sag, linear in r^2 between grid points (no square root:
-    finite derivatives on the axis): sag, d(sag)/d(r^2), and the domain mask."""
-    ok = r2 <= grid_r2[-1]
-    i = torch.clamp(torch.searchsorted(grid_r2, r2.detach().contiguous()) - 1, 0, len(grid_r2) - 2)
-    slope = (table[i + 1] - table[i]) / (grid_r2[i + 1] - grid_r2[i])
-    return table[i] + (r2 - grid_r2[i]) * slope, slope, ok
+def table_sag(x, y, grid_x, grid_y, table):
+    """Tabulated image surface on a uniform (x, y) grid, bilinear: sag, its x and
+    y slopes, and the domain mask (always true: beyond the grid the surface keeps
+    its edge values, flat across the edge, so a ray landing off the panel is
+    penalised by the merit, not lost)."""
+    dx, dy = grid_x[1] - grid_x[0], grid_y[1] - grid_y[0]
+    fx = torch.clamp((x - grid_x[0]) / dx, 0.0, len(grid_x) - 1.0)
+    fy = torch.clamp((y - grid_y[0]) / dy, 0.0, len(grid_y) - 1.0)
+    inside_x = ((x - grid_x[0]) / dx >= 0.0) & ((x - grid_x[0]) / dx <= len(grid_x) - 1.0)
+    inside_y = ((y - grid_y[0]) / dy >= 0.0) & ((y - grid_y[0]) / dy <= len(grid_y) - 1.0)
+    i = torch.clamp(torch.floor(fx.detach()).long(), 0, len(grid_x) - 2)
+    j = torch.clamp(torch.floor(fy.detach()).long(), 0, len(grid_y) - 2)
+    wx, wy = fx - i, fy - j
+    t00, t10, t01, t11 = table[i, j], table[i + 1, j], table[i, j + 1], table[i + 1, j + 1]
+    s = (1 - wx) * (1 - wy) * t00 + wx * (1 - wy) * t10 + (1 - wx) * wy * t01 + wx * wy * t11
+    sx = ((1 - wy) * (t10 - t00) + wy * (t11 - t01)) / dx * inside_x
+    sy = ((1 - wx) * (t01 - t00) + wx * (t11 - t10)) / dy * inside_y
+    return s, sx, sy, torch.ones_like(s, dtype=torch.bool)
 
 
-def _newton_table(o, d, zv, grid, table, t):
+def _newton_table(o, d, zv, grid_x, grid_y, table, t):
     p = o + t[..., None] * d
-    r2 = p[..., 0] ** 2 + p[..., 1] ** 2
-    f, g, _ = table_sag(r2, grid, table)
-    return t - (p[..., 2] - zv - f) / (d[..., 2] - g * 2.0 * (p[..., 0] * d[..., 0] + p[..., 1] * d[..., 1]))
+    f, sx, sy, _ = table_sag(p[..., 0], p[..., 1], grid_x, grid_y, table)
+    return t - (p[..., 2] - zv - f) / (d[..., 2] - sx * d[..., 0] - sy * d[..., 1])
 
 
 def _newton(o, d, zv, c, k, a, t):
@@ -125,7 +135,7 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
         c, k = batch.c[:, s, None, None], batch.k[:, s, None, None]
         a = batch.a[:, s, None, None, :]
         t = (zv - o[..., 2]) / d[..., 2]
-        tabulated = s == S - 1 and len(batch.image_sag) == 2
+        tabulated = s == S - 1 and len(batch.image_sag) == 3
         with torch.no_grad():
             t_free = t.detach()
             for _ in range(NEWTON_STEPS - GRAD_STEPS):
@@ -138,15 +148,18 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
         p = o + t[..., None] * d
         r2 = p[..., 0] ** 2 + p[..., 1] ** 2
         if tabulated:
-            f, g_tab, in_domain = table_sag(r2, *batch.image_sag)
+            f, sx_tab, sy_tab, in_domain = table_sag(p[..., 0], p[..., 1], *batch.image_sag)
         else:
             f, in_domain = sag(r2, c, k, a)
         if diagnostics:
             radius.append(torch.sqrt(r2))
             domain.append(1.0 - (1.0 + k) * c * c * r2)
             points.append(p.detach())
-        g = g_tab if tabulated else dsag_dr2(r2, c, k, a)
-        normal = torch.stack([-2.0 * g * p[..., 0], -2.0 * g * p[..., 1], torch.ones_like(g)], dim=-1)
+        if tabulated:
+            normal = torch.stack([-sx_tab, -sy_tab, torch.ones_like(sx_tab)], dim=-1)
+        else:
+            g = dsag_dr2(r2, c, k, a)
+            normal = torch.stack([-2.0 * g * p[..., 0], -2.0 * g * p[..., 1], torch.ones_like(g)], dim=-1)
         normal = normal / torch.linalg.norm(normal, dim=-1, keepdim=True)
         converged = (p[..., 2] - zv - f).abs() < 1e-9
         alive = alive & in_domain & converged & (t > 0)

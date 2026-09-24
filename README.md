@@ -81,9 +81,11 @@ python ../scripts/hmd_encoded.py <design_dir> <out_dir> --work <scratch>
 python foveal_inset/inset_study.py <out>
 ```
 
-Designs use the variable-focal lenslet array by default (`"lenslets": "variable_retina"`
-in design.json): each lens's focal length follows the retina-matched local focal length,
-so the lens vertices form a ~1.5 mm bowl, which is the searches' image surface.
+Fold designs use the variable-focal lenslet array (`"lenslets": "variable_retina"` in
+design.json, `scripts/variable_lenslets.py`): each lens's focal length is set so its number
+of views follows the retina and diffraction (about one at the fovea, up to 5 x 5 outside),
+so the lens vertices form a 2D surface that is the fold search's image surface. Coaxial
+designs are round and keep the round map (`foveation_target_radial.py`) with a uniform array.
 
 ## Run Simulations
 

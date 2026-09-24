@@ -15,7 +15,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 from system import field_grid, hex_pupil_samples, loss_and_metrics, make_mirror, panel_frame, trace  # noqa: E402
-import foveation_target as ft  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402
 
 PUPIL_Y_MM = -3.6
 

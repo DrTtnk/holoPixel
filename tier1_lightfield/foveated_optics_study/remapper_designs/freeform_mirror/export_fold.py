@@ -26,7 +26,7 @@ sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
 import fold_search as fs  # noqa: E402
 import lf_pipeline as lp  # noqa: E402
-import mla_mesh  # noqa: E402
+import variable_lenslets as vl  # noqa: E402
 import offaxis_tracer as ot  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
@@ -173,7 +173,7 @@ def export(best_json, out_dir, rank=0, device="cuda"):
 
 def export_entry(entry, out_dir, device="cuda", source={}):
     dev = torch.device(device)
-    lay = fs.layout(entry["n_el"])
+    lay = fs.layout(entry["n_el"], entry["flip_u"], entry["flip_v"])
     x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
     idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
     batch = fs.to_batch(x, idx, lay)
@@ -216,11 +216,9 @@ def export_entry(entry, out_dir, device="cuda", source={}):
     v = np.cross(toward_light, u)
     basis = np.stack([u, v, toward_light]) @ TRACER_TO_WORLD
     # the centre lens's vertex sits on the image surface's origin; the bowl follows
-    centre_height_um = float(mla_mesh.variable_vertex_profile_um(0.0, spec.PANEL_MM * 1e3, spec.LENS_SIDE_UM,
-                                                                 fs.ft.lenslet_focal_of_radius_um, spec.LENS_INDEX,
-                                                                 spec.LENS_MIN_THICKNESS_UM))
+    centre_height_um = float(vl.vertex_height_um(0.0, 0.0, lay["flip_v"]))
     origin = to_world(o) - centre_height_um * 1e-3 * basis[2]
-    design = {"lenslets": fs.LENSLETS, "remapper_npz": "remapper.npz",
+    design = {"lenslets": fs.LENSLETS, "lenslet_flip_v": lay["flip_v"], "remapper_npz": "remapper.npz",
               "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
               "source": {**source, "material": entry["material"]}}
     (out / "design.json").write_text(json.dumps(design, indent=1))
@@ -234,7 +232,7 @@ FAN_PUPIL = tuple((0.0, py) for py in (-1.0, -0.5, 0.0, 0.5, 1.0))
 
 def fans(entry, dev):
     """World-frame polylines (pupil -> every surface) for a few fields, for viewing."""
-    lay = fs.layout(entry["n_el"])
+    lay = fs.layout(entry["n_el"], entry["flip_u"], entry["flip_v"])
     x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
     idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
     t = lambda a: torch.tensor(a, dtype=torch.float64, device=dev)  # noqa: E731

@@ -626,3 +626,12 @@ growing outwards). The study's wave-optics table
 (foveated_optics_study/results/hex_pupil_packing_waveoptics.csv) points the
 same way from another side: crosstalk between hex-packed views grows from 5 %
 at 7 views to 37 % at 61. The Cycles evaluator is ray optics and shows neither.
+
+## Do not finite-difference a bilinear table with a step smaller than its cells
+
+foveation_target's map is a bilinear interpolation of a polar table (cells
+1.7e-4 rad). Its Jacobian by central differences with h = 1e-5 rad
+differentiated the interpolant cell by cell: J jumped at every cell edge, the
+lens focal lengths derived from it were jagged, and the lens-vertex surface
+built from them missed its own table by up to 2 um. A step spanning several
+cells (5e-4 rad) gives the smooth derivative of the underlying map.

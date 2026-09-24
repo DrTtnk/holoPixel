@@ -101,18 +101,21 @@ def test_gradients_match_finite_differences(device):
 
 
 def test_a_tabulated_image_surface_lands_rays_like_the_analytic_one(device):
-    """The coaxial tracer's radial table (for the variable-focal lenslet bowl):
-    a sphere tabulated at 1 um steps lands every ray where the analytic sphere does."""
+    """The coaxial tracer's 2D table (for the variable-focal lenslet bowl): a
+    sphere tabulated on a 20 um grid lands every ray where the analytic sphere
+    does, to the bilinear error (~1e-6 mm)."""
     rx = _designs(1, seed=4)[0]
     radius = -40.0
     sphere = gt.pack([rx], device=device, image=(radius, 0.0))
-    grid = torch.linspace(0.0, 30.0, 30001, dtype=torch.float64, device=device)
+    g = torch.linspace(-30.0, 30.0, 3001, dtype=torch.float64, device=device)
+    X, Y = torch.meshgrid(g, g, indexing="ij")
     c = 1.0 / radius
-    table = c * grid**2 / (1.0 + torch.sqrt(1.0 - c * c * grid**2))
-    tabulated = gt.pack([rx], device=device)._replace(image_sag=(grid**2, table))
+    r2 = X**2 + Y**2
+    table = c * r2 / (1.0 + torch.sqrt(1.0 - c * c * r2))
+    tabulated = gt.pack([rx], device=device)._replace(image_sag=(g, g, table))
     fields = torch.tensor(FIELDS, dtype=torch.float64, device=device)
     pupil = torch.tensor(fm.pupil_samples(), dtype=torch.float64, device=device)
     ref, _, ok_ref = gt.trace(sphere, fields, pupil)
     got, _, ok = gt.trace(tabulated, fields, pupil)
     assert torch.equal(ok, ok_ref) and bool(ok.all())
-    assert got.cpu().numpy() == pytest.approx(ref.cpu().numpy(), abs=1e-6)
+    assert got.cpu().numpy() == pytest.approx(ref.cpu().numpy(), abs=1e-5)

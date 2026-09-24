@@ -165,31 +165,32 @@ def _zip_chains(p, q, hp, hq):
     return tris
 
 
-def variable_lens_heights(centres, focal_of_radius, index, side_um, min_thickness_um):
+def variable_lens_heights(centres, focal_of_position, index, side_um, min_thickness_um):
     """Per lens: focal length, sphere radius, axial glass height, and the one air
-    gap, for lenses that all focus on a flat panel (f - h / n = gap)."""
-    focal = np.asarray(focal_of_radius(np.linalg.norm(centres, axis=1)), dtype=float)
+    gap, for lenses that all focus on a flat panel (f - h / n = gap).
+    focal_of_position(u_um, v_um) gives a lens's focal length from its centre."""
+    focal = np.asarray(focal_of_position(centres[:, 0], centres[:, 1]), dtype=float)
     radius = mla.radius_for_focal_length_um(focal, index)
     gap = float(np.min(focal - (min_thickness_um + mla.sag_um(side_um, radius)) / index))
     return focal, radius, index * (focal - gap), gap
 
 
-def variable_vertex_profile_um(r_um, panel_um, side_um, focal_of_radius, index, min_thickness_um):
+def variable_vertex_profile_um(u_um, v_um, panel_um, side_um, focal_of_position, index, min_thickness_um):
     """Height of the lens vertices above the flat face, as a smooth function of
-    panel radius: n (f(r) - gap), the gap being the array's own."""
+    panel position: n (f(u, v) - gap), the gap being the array's own."""
     centres = mla.hex_centres_um(panel_um + 4.0 * side_um, side_um)
-    _, _, _, gap = variable_lens_heights(centres, focal_of_radius, index, side_um, min_thickness_um)
-    return index * (np.asarray(focal_of_radius(np.asarray(r_um)), dtype=float) - gap)
+    _, _, _, gap = variable_lens_heights(centres, focal_of_position, index, side_um, min_thickness_um)
+    return index * (np.asarray(focal_of_position(np.asarray(u_um), np.asarray(v_um)), dtype=float) - gap)
 
 
-def build_variable(panel_um, side_um, focal_of_radius, index, min_thickness_um, subdivisions):
-    """Hex MLA whose lens focal lengths follow focal_of_radius(|centre|) (um), all
+def build_variable(panel_um, side_um, focal_of_position, index, min_thickness_um, subdivisions):
+    """Hex MLA whose lens focal lengths follow focal_of_position(u, v) (um), all
     focused on one flat panel: lens i stands on a glass column of height
     h_i = n (f_i - g), with the air gap g chosen so the thinnest lens is
     min_thickness_um at its hex corners. Neighbouring lenses of different height
     meet at vertical walls; where three lenses meet, the wall edges stack."""
     centres = mla.hex_centres_um(panel_um + 4.0 * side_um, side_um)
-    focal, radius, height, gap = variable_lens_heights(centres, focal_of_radius, index, side_um, min_thickness_um)
+    focal, radius, height, gap = variable_lens_heights(centres, focal_of_position, index, side_um, min_thickness_um)
 
     spacing = side_um / subdivisions
     rows = _rows(panel_um, spacing)

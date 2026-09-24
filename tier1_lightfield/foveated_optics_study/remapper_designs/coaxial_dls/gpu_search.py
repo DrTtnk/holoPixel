@@ -7,8 +7,9 @@ Parameter vector per design (sags in mm at R0, as in fast_merit):
     [eye_relief, (t_glass, gap_after) per element, (s2, k, b4, b6, b8) per surface,
      (s2_img, k_img) if the image surface is curved (fibre-optic faceplate)]
 
-Image surface: the vertex bowl of the variable-focal lenslet array
-(mla_mesh.build_variable with foveation_target.lenslet_focal_of_radius_um).
+Target: the round, temporal-meridian map of foveation_target_radial (a round
+design cannot follow the anamorphic, left-right symmetric foveation_target).
+Image surface: flat, a uniform lenslet array of foveation_target_radial.lenslet_focal_um().
 
 Merit, per design (all landing errors in units of the blur the eye tolerates
 there, foveation_target.blur_tolerance_rad times the local focal length):
@@ -36,8 +37,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-import foveation_target as ft  # noqa: E402
-import mla_mesh  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402  (a round design can only follow a round map)
 import screen_spec as spec  # noqa: E402
 
 import gpu_tracer as gt  # noqa: E402
@@ -51,18 +51,6 @@ MIN_GLASS_MM, MIN_AIR_MM = 1.0, 0.3
 LOST = 100.0                  # squared residual of a lost ray, in tolerance units
 W_CHIEF, W_TILT, W_SHAPE, W_MARGIN, W_TRACK = 9.0, 1.0, 100.0, 50.0, 1.0
 PUPIL_SPACING_MM = 0.4
-_PROFILE = dict(panel_um=spec.PANEL_MM * 1e3, side_um=spec.LENS_SIDE_UM, focal_of_radius=ft.lenslet_focal_of_radius_um,
-                index=spec.LENS_INDEX, min_thickness_um=spec.LENS_MIN_THICKNESS_UM)
-BOWL_R_MM = np.linspace(0.0, 60.0, 60001)     # flat past the panel: an off-panel ray is penalised, not lost
-BOWL_SAG_MM = 1e-3 * (mla_mesh.variable_vertex_profile_um(0.0, **_PROFILE)
-                      - mla_mesh.variable_vertex_profile_um(BOWL_R_MM * 1e3, **_PROFILE))   # rays travel +z
-
-
-def bowl(device):
-    t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
-    return t(BOWL_R_MM**2), t(BOWL_SAG_MM)
-
-
 def pupil_samples(spacing_mm=PUPIL_SPACING_MM):
     """Hexagonal grid inside the pupil disc, normalised to its radius."""
     r = spec.PUPIL_DIAMETER_MM / 2.0
@@ -76,7 +64,7 @@ def pupil_cells(fields_deg, pupil):
     """(F, P, K) one-hot: the pupil cell each ray belongs to, per field; a cell is
     a pixel's footprint on the pupil, pixel * F(theta) / f_lenslet(theta)."""
     th = np.radians(fields_deg)
-    side = spec.PIXEL_UM * ft.local_focal_mm(th) / ft.lenslet_focal_of_radius_um(ft.panel_radius_mm(th) * 1e3)
+    side = spec.PIXEL_UM * ft.local_focal_mm(th) / ft.lenslet_focal_um()
     uv = pupil * spec.PUPIL_DIAMETER_MM / 2.0 + spec.PUPIL_DIAMETER_MM / 2.0
     ids = np.zeros((len(fields_deg), len(pupil)), dtype=np.int64)
     for f, a in enumerate(side):
@@ -103,9 +91,8 @@ def tolerance_mm(fields_deg):
     return ft.blur_tolerance_rad(th, np.zeros_like(th)) * ft.local_focal_mm(th)
 
 
-def layout(n_el, curved, lenslets="variable_retina"):
-    """lenslets: "variable_retina" (image surface = the vertex bowl) or "uniform"
-    (a flat image surface, the earlier searches' candidates)."""
+def layout(n_el, curved, lenslets="uniform"):
+    """lenslets: "uniform" (a flat image surface), the only kind a round design uses."""
     n_shape = 2 * n_el * 5
     return {"n_el": n_el, "curved": curved, "lenslets": lenslets,
             "size": 1 + 2 * n_el + n_shape + (2 if curved else 0)}
@@ -158,16 +145,13 @@ def to_batch(x, indices, lay):
     else:
         c_img = torch.zeros(B, 1, dtype=x.dtype, device=x.device)
         k_img = torch.zeros(B, 1, dtype=x.dtype, device=x.device)
-    if lay["lenslets"] == "variable_retina" and lay["curved"]:
-        raise ValueError("the image surface is the lenslet bowl; a fitted curved image is not supported")
-    if lay["lenslets"] not in ("variable_retina", "uniform"):
-        raise ValueError(f"unknown lenslets {lay['lenslets']!r}")
+    if lay["lenslets"] != "uniform":
+        raise ValueError(f"a coaxial design uses a uniform lenslet array, not {lay['lenslets']!r}")
     zeros3 = torch.zeros(B, 1, 3, dtype=x.dtype, device=x.device)
     n_after = torch.stack([indices, torch.ones_like(indices)], -1).reshape(B, 2 * n)
     return gt.Batch(z=z, c=torch.cat([c, c_img], 1), k=torch.cat([k, k_img], 1),
                     a=torch.cat([a, zeros3], 1), n=torch.cat([n_after, torch.ones(B, 1, dtype=x.dtype,
-                                                                                    device=x.device)], 1),
-                    image_sag=bowl(x.device) if lay["lenslets"] == "variable_retina" else ())
+                                                                                    device=x.device)], 1))
 
 
 def merit(x, indices, lay, fields, pupil, tol, target, onehot):

@@ -38,7 +38,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[2] / "scripts"))
 import optics as op  # noqa: E402
-import foveation_target as ft  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402
 
 DTYPE = op.DTYPE
 torch.set_default_dtype(DTYPE)

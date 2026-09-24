@@ -32,7 +32,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import raytrace as rt  # noqa: E402
-import foveation_target as ft  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402
 
 DTYPE = rt.DTYPE
 PUPIL_Y_MM = -3.6

@@ -23,10 +23,13 @@ import offaxis_tracer as ot  # noqa: E402
 @pytest.fixture(scope="module")
 def exported(tmp_path_factory):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lay = fs.layout(1)
-    lo, hi = fs.bounds(lay, dev)
-    x, idx, _ = fs.live_seeds(lay, 1, "resin", np.random.default_rng(4), dev, fs.context(dev), lo, hi, chunk=64)
-    entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin"}
+    rng = np.random.default_rng(4)
+    lo, hi = fs.bounds(fs.layout(1), dev)
+    flip_u, flip_v = fs.family_orientation(1, "resin", rng, dev, lo, hi)
+    lay = fs.layout(1, flip_u, flip_v)
+    x, idx, _ = fs.live_seeds(lay, 1, "resin", rng, dev, fs.context(dev), lo, hi, chunk=64)
+    entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin",
+             "flip_u": flip_u, "flip_v": flip_v}
     out = ef.export_entry(entry, tmp_path_factory.mktemp("fold"), device=str(dev))
     batch = fs.to_batch(x, idx, lay)
     ctx = fs.context(dev)
@@ -74,16 +77,18 @@ def test_the_lens_vertices_lie_on_the_image_surface_and_face_the_light(exported)
     out, _, pts, _ = exported
     design = json.loads((out / "design.json").read_text())
     assert design["lenslets"] == "variable_retina" and "focal_um" not in design
+    flip_v = design["lenslet_flip_v"]
     pose = design["panel_pose"]
     basis, origin = np.asarray(pose["basis"]), np.asarray(pose["origin_mm"])
     assert np.linalg.det(basis) == pytest.approx(1.0, abs=1e-12)          # right-handed: the MLA keeps its winding
     img = ef.to_world(pts[-1].reshape(-1, 3))
     local = (img - origin) @ basis.T                                     # (u, v, w) mm
-    r_um = np.hypot(local[:, 0], local[:, 1]) * 1e3
-    h_um = ef.mla_mesh.variable_vertex_profile_um(r_um, ef.spec.PANEL_MM * 1e3, ef.spec.LENS_SIDE_UM,
-                                                  fs.ft.lenslet_focal_of_radius_um, ef.spec.LENS_INDEX,
-                                                  ef.spec.LENS_MIN_THICKNESS_UM)
-    assert local[:, 2] * 1e3 == pytest.approx(h_um, abs=0.05)             # 50 nm: the tracer's table step
+    inside = (np.abs(local[:, 0]) < ef.vl.TABLE_HALF_MM) & (np.abs(local[:, 1]) < ef.vl.TABLE_HALF_MM)
+    h_um = ef.vl.vertex_height_um(local[inside, 0] * 1e3, local[inside, 1] * 1e3, flip_v)
+    # the tracer follows the bilinear table (20 um grid): nm-exact in bulk, ~2 um on the
+    # crease where the lenslet rule switches from the diffraction to the lens-fit limit
+    err = np.abs(local[inside, 2] * 1e3 - h_um)
+    assert np.percentile(err, 99) < 0.1 and err.max() < 2.5
     incoming = img - ef.to_world(pts[-2].reshape(-1, 3))
     assert np.all(incoming @ basis[2] < 0)
 

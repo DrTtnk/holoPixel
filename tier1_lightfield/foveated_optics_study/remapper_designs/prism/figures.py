@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from design import Design, mapping_grid, pupil_ring, field_direction, PUPIL_Y_MM  # noqa: E402
 import raytrace as rt  # noqa: E402
-import foveation_target as ft  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 DTYPE = rt.DTYPE

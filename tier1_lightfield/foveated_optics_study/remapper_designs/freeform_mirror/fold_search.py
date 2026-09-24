@@ -42,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
 import foveation_target as ft  # noqa: E402
-import mla_mesh  # noqa: E402
+import variable_lenslets as vl  # noqa: E402
 import offaxis_tracer as ot  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
@@ -52,14 +52,6 @@ FIELDS_Y_DEG = (-22.5, -15.0, -8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0, 1
 FD_DEG = 0.1
 PUPIL_SPACING_MM = 0.4
 LENSLETS = "variable_retina"     # lens focal length follows the local F (foveation_target)
-BOWL_R_MM = np.linspace(0.0, 60.0, 60001)   # the image surface: the lens-vertex bowl (flat past the panel,
-                                            # so a ray landing off the panel is penalised, not lost)
-BOWL_SAG_MM = 1e-3 * (mla_mesh.variable_vertex_profile_um(BOWL_R_MM * 1e3, spec.PANEL_MM * 1e3, spec.LENS_SIDE_UM,
-                                                           ft.lenslet_focal_of_radius_um, spec.LENS_INDEX,
-                                                           spec.LENS_MIN_THICKNESS_UM)
-                      - mla_mesh.variable_vertex_profile_um(0.0, spec.PANEL_MM * 1e3, spec.LENS_SIDE_UM,
-                                                            ft.lenslet_focal_of_radius_um, spec.LENS_INDEX,
-                                                            spec.LENS_MIN_THICKNESS_UM))
 TOP_FIELD_DEG = 22.5
 CONE_MARGIN_MM = 2.0            # rim of an element beyond its footprint, plus air
 BAFFLE_OFFSET_MM = 0.5          # baffle plane above the top ray of the view cone
@@ -76,11 +68,15 @@ TERMS = ((0, 2), (2, 0), (0, 3), (2, 1), (0, 4), (2, 2), (4, 0), (0, 5), (2, 3),
 LOW_ORDER = 4                   # (0,2) (2,0) (0,3) (2,1): free from the first step
 N_SHAPE = 2 + len(TERMS)        # base sag at R0, conic, polynomial sags at R0
 POLY = 7
-W = {"blur": 1.0, "hinge": 10.0, "ratio": 30.0, "panel": 30.0, "tilt": 1.0, "space": 3.0, "barrier": 30.0}
+MAP_SCALE_MM = 0.1               # chief landing vs the target map's panel point
+W = {"blur": 1.0, "hinge": 10.0, "ratio": 30.0, "panel": 30.0, "tilt": 1.0, "space": 3.0, "barrier": 30.0,
+     "map": 10.0}
 
 
-def layout(n_el):
-    """Slices of the parameter vector."""
+def layout(n_el, flip_u=1, flip_v=1):
+    """Slices of the parameter vector, and the image orientation of this layout
+    family relative to the target map (+1 upright, -1 mirrored), measured by
+    orientation() on its seeds."""
     i = 0
 
     def take(n):
@@ -89,7 +85,8 @@ def layout(n_el):
         i += n
         return s
 
-    lay = {"n_el": n_el, "mirror_pose": take(3), "mirror_shape": take(N_SHAPE), "elements": []}
+    lay = {"n_el": n_el, "flip_u": flip_u, "flip_v": flip_v, "mirror_pose": take(3), "mirror_shape": take(N_SHAPE),
+           "elements": []}
     for _ in range(n_el):
         lay["elements"].append({"pose": take(5), "front": take(N_SHAPE), "back": take(N_SHAPE)})
     lay["image"] = take(3)
@@ -183,21 +180,32 @@ def to_batch(x, indices, lay):
     add(M + s[:, None] * u + lat[:, None] * up, 2 * a + torch.deg2rad(tilt), flat, torch.ones_like(zero))
     st = lambda v: torch.stack(v, 1)  # noqa: E731
     return ot.Batch(y=st(ys), z=st(zs), rx=st(rxs), c=st(cs), k=st(ks), xy=st(Cs), n=st(ns),
-                    mirror=(True,) + (False,) * (2 * lay["n_el"] + 1), image_sag=bowl(x.device))
+                    mirror=(True,) + (False,) * (2 * lay["n_el"] + 1), image_sag=bowl(x.device, lay["flip_v"]))
 
 
-def bowl(device):
-    """The image surface: the vertex bowl of the variable-focal lenslet array, as
-    a radial table in the image surface's local frame (rays arrive along -z)."""
-    t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
-    return t(BOWL_R_MM**2), t(BOWL_SAG_MM)
+_BOWLS = {}
+
+
+def bowl(device, flip_v):
+    """The image surface: the vertex surface of the variable-focal lenslet array
+    (variable_lenslets), tabulated in the image surface's local (x, y) = panel
+    (u, v); the vertices stand up towards the light, which arrives along -z."""
+    key = (str(device), flip_v)
+    if key not in _BOWLS:
+        gu, gv, h = vl.bowl_table(flip_v)
+        t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
+        _BOWLS[key] = (t(gu), t(gv), t(h))
+    return _BOWLS[key]
 
 
 def pack(prescriptions, device):
     """offaxis_tracer.pack for fold prescriptions: their image surface is the bowl."""
     if any(rx["image_surface"] != LENSLETS for rx in prescriptions):
         raise ValueError(f"fold prescriptions must declare image_surface {LENSLETS!r}")
-    return ot.pack(prescriptions, device)._replace(image_sag=bowl(device))
+    flips = {rx["lenslet_flip_v"] for rx in prescriptions}
+    if len(flips) != 1:
+        raise ValueError("a batch needs one lenslet orientation")
+    return ot.pack(prescriptions, device)._replace(image_sag=bowl(device, flips.pop()))
 
 
 def to_prescription(x_row, indices_row, lay):
@@ -209,7 +217,7 @@ def to_prescription(x_row, indices_row, lay):
         out.append({"y_mm": float(b.y[0, s]), "z_mm": float(b.z[0, s]), "rx_deg": math.degrees(float(b.rx[0, s])),
                     "radius_mm": math.inf if c == 0.0 else 1.0 / c, "conic": float(b.k[0, s]),
                     "xy": b.xy[0, s].tolist(), "mirror": b.mirror[s], "index_after": float(b.n[0, s])})
-    return {"surfaces": out, "image_surface": LENSLETS}
+    return {"surfaces": out, "image_surface": LENSLETS, "lenslet_flip_v": lay["flip_v"]}
 
 
 def pupil_samples(spacing_mm=PUPIL_SPACING_MM):
@@ -230,9 +238,10 @@ def pupil_cells(fields_deg, pupil):
     """Cell of each pupil point, per field: squares of side pixel * F / f_lenslet
     (whole pupil in one cell where that exceeds it). Returns (F, P) ids and the
     count of cells."""
-    ecc = np.arctan(np.hypot(np.tan(np.radians(fields_deg[:, 0])), np.tan(np.radians(fields_deg[:, 1]))))
-    focal_um = ft.lenslet_focal_of_radius_um(ft.panel_radius_mm(ecc) * 1e3)    # the lens this field lands on
-    side = spec.PIXEL_UM * ft.local_focal_mm(ecc) / focal_um                    # mm on the pupil
+    tx, tz = np.radians(fields_deg[:, 0]), np.radians(fields_deg[:, 1])
+    u, v = ft.field_to_panel_mm(tx, tz)
+    focal_um = ft.lenslet_focal_um(u * 1e3, v * 1e3)                          # the lens this field lands on
+    side = spec.PIXEL_UM * ft.local_focal_mm(tx, tz) / focal_um                # mm on the pupil
     uv = pupil * spec.PUPIL_DIAMETER_MM / 2.0 + spec.PUPIL_DIAMETER_MM / 2.0   # 0 .. D
     ids = np.zeros((len(fields_deg), len(pupil)), dtype=np.int64)
     for f, a in enumerate(side):
@@ -246,13 +255,16 @@ def context(device, weights=W):
     fields = field_grid()
     pupil = pupil_samples()
     ids, n_cells = pupil_cells(fields, pupil)
-    ecc = np.arctan(np.hypot(np.tan(np.radians(fields[:, 0])), np.tan(np.radians(fields[:, 1]))))
+    tx, tz = np.radians(fields[:, 0]), np.radians(fields[:, 1])
+    jac_t = ft.jacobian_mm_per_rad(tx, tz)
+    panel_t = np.stack(ft.field_to_panel_mm(tx, tz), -1)
     t = lambda a, dt=torch.float64: torch.tensor(a, dtype=dt, device=device)  # noqa: E731
     onehot = torch.nn.functional.one_hot(t(ids, torch.int64), n_cells).double()   # (F, P, K)
     fd = np.concatenate([fields, fields + [FD_DEG, 0.0], fields + [0.0, FD_DEG]])
     return {"weights": dict(weights), "fields": t(fields), "fd_fields": t(fd), "pupil": t(pupil), "onehot": onehot,
             "tol": t(ft.blur_tolerance_rad(np.radians(fields[:, 0]), np.radians(fields[:, 1]))),
-            "focal": t(ft.local_focal_mm(ecc)), "n_fields": len(fields)}
+            "jac_target": t(jac_t), "sv_target": t(np.linalg.svd(jac_t, compute_uv=False)),
+            "panel_target": t(panel_t), "n_fields": len(fields)}
 
 
 def jacobian(land_fd, n_fields):
@@ -296,7 +308,7 @@ def residuals(x, indices, lay, ctx):
     okd = ok_c.double()
     jac = jacobian(land_fd[:, :, 0], F)
     eye = torch.eye(2, dtype=x.dtype, device=x.device)
-    jac = torch.where(ok_c[..., None, None], jac, eye * ctx["focal"][None, :, None, None])
+    jac = torch.where(ok_c[..., None, None], jac, ctx["jac_target"][None])
 
     ang, count = cell_offsets(land, alive, ctx["onehot"], jac)
     used_cell = (count >= 2).double()                                  # (B, F, K)
@@ -308,16 +320,20 @@ def residuals(x, indices, lay, ctx):
     n_cells = used_cell.sum((1, 2)).clamp(min=1.0)
     r_hinge = torch.relu(torch.sqrt(b2 + 1e-18) - 0.6) * torch.sqrt(ctx["weights"]["hinge"] * used_cell / n_cells[:, None, None])
 
-    A = jac / ctx["focal"][None, :, None, None]
-    T = (A**2).sum((-1, -2))
-    D = torch.linalg.det(A) ** 2
+    # magnification: the design's singular values against the target map's (largest with largest)
+    T = (jac**2).sum((-1, -2))
+    D = torch.linalg.det(jac) ** 2
     disc = torch.sqrt(torch.clamp(T**2 - 4 * D, min=0.0))
-    log_s = 0.5 * torch.log(torch.clamp(torch.stack([(T + disc) / 2, (T - disc) / 2], -1), min=1e-12))
+    sv2 = torch.clamp(torch.stack([(T + disc) / 2, (T - disc) / 2], -1), min=1e-12)
+    log_s = 0.5 * torch.log(sv2) - torch.log(ctx["sv_target"])[None]
     lo, hi = math.log(RATIO_BAND[0]), math.log(RATIO_BAND[1])
     r_ratio = torch.cat([torch.relu(lo - log_s), torch.relu(log_s - hi)], -1) * torch.sqrt(ctx["weights"]["ratio"] * okd / F)[..., None]
 
     h0 = land_fd[:, :F, 0]
     r_panel = torch.relu(h0.abs() - PANEL_HALF_MM) * torch.sqrt(ctx["weights"]["panel"] * okd / F)[..., None]
+    flip = torch.tensor([lay["flip_u"], lay["flip_v"]], dtype=x.dtype, device=x.device)
+    r_map = ((h0 - flip * ctx["panel_target"][None]) / MAP_SCALE_MM
+             * torch.sqrt(ctx["weights"]["map"] * okd / F)[..., None])
     cos_t = dir_fd[:, :F, 0, 2].abs()
     r_tilt = (torch.relu(torch.rad2deg(torch.acos(torch.clamp(cos_t, max=1.0 - 1e-12))) - TILT_MAX_DEG)
               * torch.sqrt(ctx["weights"]["tilt"] * okd / F))
@@ -350,10 +366,12 @@ def residuals(x, indices, lay, ctx):
     barrier = barrier + (torch.relu(DOMAIN_MIN - diag["domain"]) ** 2 * alive[:, None].double()).sum((1, 2, 3))
     norm = lambda v: torch.sqrt(v + 1e-30)  # noqa: E731
     r = torch.cat([r_blur.reshape(B, -1), r_hinge.reshape(B, -1), r_ratio.reshape(B, -1), r_panel.reshape(B, -1),
+                   r_map.reshape(B, -1),
                    r_tilt, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
     alive_all = (alive.double().sum((1, 2)) + okd.sum(1)) / (alive[0].numel() + ok_c.shape[1])
     sq = lambda t: (t**2).reshape(B, -1).sum(1)  # noqa: E731
     return r, {"blur": sq(r_blur), "hinge": sq(r_hinge), "ratio": sq(r_ratio), "panel": sq(r_panel),
+               "map": sq(r_map),
                "tilt": sq(r_tilt), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
                "alive_all": alive_all}
 
@@ -400,6 +418,24 @@ def per_field_blur(x, indices, lay, ctx):
         return torch.where(count >= 2, b, torch.zeros_like(b)).amax(-1)
 
 
+def orientation(x, indices, lay):
+    """Per design, the sign of d(image x)/d(theta_x) and d(image y)/d(theta_z) at
+    the fovea: +1 when the image is upright relative to the target map."""
+    f = torch.tensor([[-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]], dtype=x.dtype, device=x.device)
+    with torch.no_grad():
+        land, _, _ = ot.trace(to_batch(x, indices, lay), f, torch.zeros(1, 2, dtype=x.dtype, device=x.device))
+    return torch.sign(land[:, 1, 0, 0] - land[:, 0, 0, 0]), torch.sign(land[:, 3, 0, 1] - land[:, 2, 0, 1])
+
+
+def family_orientation(n_el, material, rng, device, lo, hi, count=512):
+    """The image orientation most random designs of this layout produce."""
+    lay = layout(n_el)
+    x = torch.clamp(random_designs(lay, count, rng, device), lo, hi)
+    idx = torch.tensor(rng.choice(INDEX_SETS[material], size=(count, n_el)), dtype=torch.float64, device=device)
+    su, sv = orientation(x, idx, lay)
+    return int(torch.sign(su.sum())), int(torch.sign(sv.sum()))
+
+
 def live_seeds(lay, count, material, rng, device, ctx, lo, hi, chunk=512):
     """Random designs in which every traced ray (and every chief ray of the
     Jacobian) reaches the panel. The search then never lets a ray die."""
@@ -410,7 +446,8 @@ def live_seeds(lay, count, material, rng, device, ctx, lo, hi, chunk=512):
                            device=device)
         with torch.no_grad():
             _, info = merit(x, idx, lay, ctx)
-        keep = info["alive_all"] == 1.0
+        su, sv = orientation(x, idx, lay)
+        keep = (info["alive_all"] == 1.0) & (su == lay["flip_u"]) & (sv == lay["flip_v"])
         xs.append(x[keep])
         idxs.append(idx[keep])
         tried += chunk
@@ -437,9 +474,11 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
     design. Each iteration tries four dampings and keeps the best step that
     lowers the merit and loses no ray. High-order terms are frozen for the
     first third of the iterations."""
-    lay = layout(n_el)
     rng = np.random.default_rng(seed)
-    lo, hi = bounds(lay, device)
+    lo, hi = bounds(layout(n_el), device)
+    flip_u, flip_v = family_orientation(n_el, material, rng, device, lo, hi)
+    lay = layout(n_el, flip_u, flip_v)
+    print(f"image orientation of this layout: flip_u {flip_u}, flip_v {flip_v}", flush=True)
     ctx = context(device, {**W, "ratio": ratio_weight})
     with torch.no_grad():
         x, indices, tried = live_seeds(lay, count, material, rng, device, ctx, lo, hi)
@@ -491,6 +530,7 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
         out.append({"rank": rank, "loss": float(loss[b]), **{k: float(v[b]) for k, v in info.items()},
                     "worst_cell_blur_per_field": worst[b].tolist(), "fields_deg": ctx["fields"].tolist(),
                     "indices": indices[b].tolist(), "x": x[b].detach().tolist(), "n_el": n_el,
+                    "flip_u": lay["flip_u"], "flip_v": lay["flip_v"],
                     "material": material, "prescription": to_prescription(x[b].detach(), indices[b], lay)})
     tag = f"fold_el{n_el}_{material}{tag_suffix}"
     (Path(out_dir) / f"best_{tag}.json").write_text(json.dumps(out, indent=1))

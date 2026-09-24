@@ -4,7 +4,7 @@
 
 <design_dir>/design.json:
     {"focal_um": lenslet focal length        (a uniform array), or
-     "lenslets": "variable_retina"           (foveation_target.lenslet_focal_of_radius_um),
+     "lenslets": "variable_retina",          (variable_lenslets, with "lenslet_flip_v": +1 or -1)
      "panel_pose": {"origin_mm": [x, y, z], "basis": [u_world, v_world, w_world]},
      "remapper_npz": "remapper.npz"}          (relative to design_dir)
 
@@ -39,6 +39,7 @@ import lf_pipeline as lp
 import mla_design as mla
 import mla_mesh
 import screen_spec as spec
+import variable_lenslets as vl
 
 SIDE_UM, PIXEL_UM, INDEX, MIN_THICKNESS_UM = (spec.LENS_SIDE_UM, spec.PIXEL_UM, spec.LENS_INDEX,
                                               spec.LENS_MIN_THICKNESS_UM)
@@ -161,10 +162,11 @@ def lenslet_array(design, panel_um, subdivisions):
         return mesh, mla.back_focal_gap_um(radius, INDEX, mesh.centre_thickness), {"focal_um": focal}
     if design["lenslets"] != "variable_retina":
         raise ValueError(f"unknown lenslets {design['lenslets']!r}")
-    v = mla_mesh.build_variable(panel_um=panel_um, side_um=SIDE_UM, focal_of_radius=ft.lenslet_focal_of_radius_um,
-                                index=INDEX, min_thickness_um=MIN_THICKNESS_UM, subdivisions=subdivisions)
-    return v.mesh, v.gap_um, {"lenslets": "variable_retina", "focal_um_range": [float(v.focal_um.min()),
-                                                                                 float(v.focal_um.max())]}
+    if abs(panel_um - vl.PANEL_UM) > 1e-6:
+        raise ValueError("the retina-matched lenslet array is defined on the full panel")
+    v = vl.build(int(design["lenslet_flip_v"]), subdivisions)
+    return v.mesh, v.gap_um, {"lenslets": "variable_retina", "lenslet_flip_v": int(design["lenslet_flip_v"]),
+                              "focal_um_range": [float(v.focal_um.min()), float(v.focal_um.max())]}
 
 
 def metrics(view_dir, views, centres, panel_pixels):
@@ -198,7 +200,7 @@ def metrics(view_dir, views, centres, panel_pixels):
     mean = np.stack([np.bincount(ent, weights=d[idx, c], minlength=n_lens) for c in range(3)], axis=1)
     chief = count > 0
     mean[chief] = _unit(mean[chief])
-    pitch = np.where(chief, ft.target_pitch_rad(_ecc(mean)), np.inf)
+    pitch = np.where(chief, ft.target_pitch_rad(*np.radians(_field_deg(mean))), np.inf)
     uv = np.column_stack([(pix % panel_pixels + 0.5) * PIXEL_UM, (pix // panel_pixels + 0.5) * PIXEL_UM])
     uv -= panel_pixels * PIXEL_UM / 2
     offset = np.stack([np.bincount(ent, weights=uv[:, c], minlength=n_lens) for c in range(2)], axis=1)
@@ -277,7 +279,7 @@ def metrics(view_dir, views, centres, panel_pixels):
                          np.radians(np.arange(-FOV_Z_DEG, FOV_Z_DEG + 1e-9, 0.25)))
     grid = _unit(np.stack([np.tan(gx), np.ones_like(gx), np.tan(gz)], axis=-1).reshape(-1, 3))
     dist, _ = cKDTree(mean[chief]).query(grid)
-    coverage = float(np.mean(dist <= ft.target_pitch_rad(_ecc(grid))))
+    coverage = float(np.mean(dist <= ft.target_pitch_rad(gx.ravel(), gz.ravel())))
 
     fov_rays = np.nonzero(_in_fov(d))[0]
     reached = []

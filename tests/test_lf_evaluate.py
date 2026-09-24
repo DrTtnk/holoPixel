@@ -219,12 +219,14 @@ def test_direct_view_is_seen_from_the_whole_pupil(direct):
 
 def test_direct_view_sampling_ratio_is_local_focal_length_over_eye_relief(direct):
     """Neighbouring lenses sit sqrt(3)*side apart, seen from L = 20 mm; the target
-    spacing is sqrt(3)*side / F(theta), so the ratio is F(theta) / L, lens by lens."""
+    spacing is sqrt(3)*side / F(direction), so the ratio is F / L, lens by lens."""
     _, pl = direct
     lenses = pl["ratio_lens"]
-    ecc = np.arccos(np.clip(pl["mean"][lenses, 1], -1.0, 1.0))
+    m = pl["mean"][lenses]
+    ecc = np.arccos(np.clip(m[:, 1], -1.0, 1.0))
     central = ecc < np.radians(2.0)
-    expected = ft.local_focal_mm(ecc[central]) / RELIEF
+    tx, tz = np.arctan2(m[central, 0], m[central, 1]), np.arctan2(m[central, 2], m[central, 1])
+    expected = ft.local_focal_mm(tx, tz) / RELIEF
     assert np.median(pl["ratio"][central] / expected) == pytest.approx(1.0, rel=0.03)
 
 

@@ -19,7 +19,7 @@ sys.path.insert(0, str(HERE.parents[2] / "scripts"))
 import optics as op  # noqa: E402
 import design_opt as d  # noqa: E402
 import build_design as bd  # noqa: E402
-import foveation_target as ft  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402
 
 DTYPE = op.DTYPE
 

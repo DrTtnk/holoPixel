@@ -23,9 +23,9 @@ def device():
 
 @pytest.fixture(scope="module", params=[1, 2])
 def designs(request, device):
-    lay = fs.layout(request.param)
     rng = np.random.default_rng(request.param)
-    lo, hi = fs.bounds(lay, device)
+    lo, hi = fs.bounds(fs.layout(request.param), device)
+    lay = fs.layout(request.param, *fs.family_orientation(request.param, "resin", rng, device, lo, hi))
     x = torch.clamp(fs.random_designs(lay, 6, rng, device), lo, hi)
     x[:, lay["mirror_shape"]] += torch.tensor(rng.normal(0, 0.05, (6, fs.N_SHAPE)), device=device)
     idx = torch.tensor(rng.choice(fs.INDEX_SETS["resin"], (6, request.param)), dtype=torch.float64, device=device)
@@ -53,22 +53,24 @@ def test_merit_and_its_gradient_are_finite_on_random_seeds(designs, device):
 
 
 def test_pupil_cells_follow_the_pixel_footprint_on_the_pupil():
-    """The variable-focal lenslets make the pupil fill one lens pitch (36 um =
-    5 pixels) everywhere, so a pixel's footprint on the pupil is 4/5 mm at every
-    field inside 35 deg: 5 x 5 squares, of which those that hold hexagonal pupil
-    points survive."""
+    """A pixel sees a pupil square of side pixel * F / f_lens (F the target map's
+    local focal length, f_lens the lens that field lands on). The lenslet rule
+    makes it ~2.4 mm at the fovea (about one view), smaller further out (at
+    least 0.8 mm: 5 views along the map's tighter axis); cells are those squares that hold hexagonal pupil points."""
     pupil = fs.pupil_samples()
-    fields = np.array([[0.0, 0.0], [10.0, 0.0], [35.0, 0.0]])
+    fields = np.array([[0.0, 0.0], [10.0, 0.0], [35.0, 0.0], [5.0, -15.0]])
     ids, _ = fs.pupil_cells(fields, pupil)
     uv = pupil * 2.0 + 2.0
+    sides = []
     for f, (fx, fy) in enumerate(fields):
-        ecc = np.arctan(np.hypot(np.tan(np.radians(fx)), np.tan(np.radians(fy))))
-        side = 7.2 * float(fs.ft.local_focal_mm(ecc)) / float(
-            fs.ft.lenslet_focal_of_radius_um(fs.ft.panel_radius_mm(ecc) * 1e3))
-        assert side == pytest.approx(4.0 / 5.0, rel=1e-6)
+        tx, tz = np.radians(fx), np.radians(fy)
+        u, v = fs.ft.field_to_panel_mm(tx, tz)
+        side = 7.2 * float(fs.ft.local_focal_mm(tx, tz)) / float(fs.ft.lenslet_focal_um(u * 1e3, v * 1e3))
+        sides.append(side)
         n = max(1, math.ceil(4.0 / side))                    # points on the far rim belong to the last cell
-        expected = len({(min(int(u / side), n - 1), min(int(v / side), n - 1)) for u, v in uv})
+        expected = len({(min(int(a / side), n - 1), min(int(b / side), n - 1)) for a, b in uv})
         assert len(np.unique(ids[f])) == expected
+    assert sides[0] > 2.0 and 0.8 <= sides[1] < sides[0]            # ~1 view at the fovea, more outside
 
 
 def test_cell_blur_is_the_rms_angle_about_each_cells_centroid(device):
@@ -107,19 +109,22 @@ def test_panel_corners_lie_on_the_image_plane(designs, device):
 
 
 def test_the_image_surface_is_the_lens_vertex_bowl(designs, device):
-    """Traced landings lie on the variable-focal array's vertex profile: local z
-    of the hit = (h(r) - h(0)) mm, the lenses standing up towards the light."""
+    """Traced landings lie on the variable-focal array's vertex surface: local z
+    of the hit = (h(x, y) - h(0, 0)) mm, the lenses standing up towards the light."""
+    from scipy.interpolate import RegularGridInterpolator
     lay, x, idx = designs
-    _, d_img, alive, diag = ot.trace(fs.to_batch(x, idx, lay), fs.context(device)["fields"],
-                                     fs.context(device)["pupil"], diagnostics=True)
-    assert bool((d_img[..., 2][alive] < 0).all())                        # light arrives along -z
+    ctx = fs.context(device)
     batch = fs.to_batch(x, idx, lay)
+    _, d_img, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+    assert bool((d_img[..., 2][alive] < 0).all())                        # light arrives along -z
     p = diag["points"][:, -1]                                            # global
     a = batch.rx[:, -1, None, None]
     y = p[..., 1] - batch.y[:, -1, None, None]
     z = p[..., 2] - batch.z[:, -1, None, None]
     local = torch.stack([p[..., 0], y * torch.cos(a) + z * torch.sin(a), -y * torch.sin(a) + z * torch.cos(a)], -1)
-    r = torch.linalg.norm(local[..., :2], dim=-1)[alive].cpu().numpy()
-    expected = np.interp(r**2, fs.BOWL_R_MM**2, fs.BOWL_SAG_MM)
-    assert local[..., 2][alive].cpu().numpy() == pytest.approx(expected, abs=1e-9)
-    assert fs.BOWL_SAG_MM[0] == 0.0 and fs.BOWL_SAG_MM[-1] < -1.0          # ~1.5 mm deep
+    loc = local[alive].cpu().numpy()
+    gu, gv, h = fs.vl.bowl_table(lay["flip_v"])
+    inside = (np.abs(loc[:, 0]) < gu[-1]) & (np.abs(loc[:, 1]) < gv[-1])
+    expected = RegularGridInterpolator((gu, gv), h)(loc[inside, :2])
+    assert loc[inside, 2] == pytest.approx(expected, abs=1e-9)
+    assert inside.mean() > 0.5

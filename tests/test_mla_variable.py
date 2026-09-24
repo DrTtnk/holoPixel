@@ -16,14 +16,14 @@ import mla_mesh  # noqa: E402
 SIDE, T_MIN, PANEL, INDEX = 17.37, 10.0, 240.0, 1.5
 
 
-def focal(r_um):
-    """A steep radial focal-length profile: 400 um at the centre to 60 um at the rim."""
-    return 60.0 + 340.0 * np.exp(-(np.asarray(r_um) / 40.0) ** 2)
+def focal(u_um, v_um):
+    """A steep, anisotropic, off-centre focal-length profile: 400 um at its peak to 60 um."""
+    return 60.0 + 340.0 * np.exp(-((np.asarray(u_um) - 10.0) / 40.0) ** 2 - (np.asarray(v_um) / 25.0) ** 2)
 
 
 @pytest.fixture(scope="module")
 def mesh():
-    return mla_mesh.build_variable(panel_um=PANEL, side_um=SIDE, focal_of_radius=focal, index=INDEX,
+    return mla_mesh.build_variable(panel_um=PANEL, side_um=SIDE, focal_of_position=focal, index=INDEX,
                                    min_thickness_um=T_MIN, subdivisions=3)
 
 
@@ -51,7 +51,7 @@ def test_it_is_wound_outwards_and_has_no_degenerate_faces(mesh):
 
 def test_every_lens_focuses_on_the_panel(mesh):
     """Back focal distance of each plano-convex lens, f - t / n, equals the one air gap."""
-    f = focal(np.linalg.norm(mesh.mesh.centres, axis=1))
+    f = focal(mesh.mesh.centres[:, 0], mesh.mesh.centres[:, 1])
     np.testing.assert_allclose(mesh.focal_um, f, rtol=1e-12)
     gaps = mla.back_focal_gap_um(mesh.radius_um, INDEX, mesh.centre_height_um)
     np.testing.assert_allclose(gaps, mesh.gap_um, atol=1e-9)
@@ -72,7 +72,7 @@ def test_top_faces_lie_on_their_own_lens_sphere(mesh):
     duv = corners[:, :, :2] - m.centres[owner][:, None, :]
     expected = mesh.centre_height_um[owner][:, None] - mla.sag_um(np.linalg.norm(duv, axis=2),
                                                                   mesh.radius_um[owner][:, None])
-    assert np.max(np.abs(corners[:, :, 2] - expected)) < 1e-9
+    assert np.max(np.abs(corners[:, :, 2] - expected)) <= mla_mesh.MERGE_UM   # near-equal heights share a vertex
 
 
 def test_steps_between_neighbours_are_vertical_walls(mesh):
@@ -92,7 +92,7 @@ def test_a_uniform_profile_builds_the_uniform_array_away_from_the_border():
     one build() makes and no wall is needed. (At the panel border the lattice
     triangles cross hex edges; build() gives each vertex its nearest lens's
     height, build_variable keeps every face on its own lens and adds a wall.)"""
-    uniform = mla_mesh.build_variable(panel_um=PANEL, side_um=SIDE, focal_of_radius=lambda r: np.full_like(r, 150.0),
+    uniform = mla_mesh.build_variable(panel_um=PANEL, side_um=SIDE, focal_of_position=lambda u, v: np.full_like(u, 150.0),
                                       index=INDEX, min_thickness_um=T_MIN, subdivisions=3)
     radius = mla.radius_for_focal_length_um(150.0, INDEX)
     ref = mla_mesh.build(panel_um=PANEL, side_um=SIDE, radius_um=radius, min_thickness_um=T_MIN, subdivisions=3)
@@ -109,6 +109,6 @@ def test_a_uniform_profile_builds_the_uniform_array_away_from_the_border():
 
 def test_the_vertex_profile_passes_through_every_lens_vertex(mesh):
     """The smooth profile the remapper must focus on: n (f(r) - gap) at each centre."""
-    r = np.linalg.norm(mesh.mesh.centres, axis=1)
-    profile = mla_mesh.variable_vertex_profile_um(r, PANEL, SIDE, focal, INDEX, T_MIN)
+    c = mesh.mesh.centres
+    profile = mla_mesh.variable_vertex_profile_um(c[:, 0], c[:, 1], PANEL, SIDE, focal, INDEX, T_MIN)
     np.testing.assert_allclose(profile, mesh.centre_height_um, atol=1e-9)

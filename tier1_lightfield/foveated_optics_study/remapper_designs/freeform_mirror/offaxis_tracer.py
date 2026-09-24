@@ -32,7 +32,7 @@ class Batch(NamedTuple):
     xy: torch.Tensor      # (B, S, I, J) coefficient of x^i y^j
     n: torch.Tensor       # (B, S) index after each surface
     mirror: tuple         # (S,) static: which surfaces reflect
-    image_sag: tuple = () # optional (r^2 grid mm^2, sag mm): a radial tabulated image surface
+    image_sag: tuple = () # optional (x grid mm, y grid mm, sag (Nx, Ny) mm): a tabulated image surface
                           # (shared by the batch), replacing the last surface's shape
 
 
@@ -115,19 +115,29 @@ def _newton(o, d, c, k, C, t):
 _newton_fused = torch.compile(_newton, dynamic=True)
 
 
-def table_sag(x, y, grid_r2, table):
-    """Radial tabulated sag, linear in r^2 between grid points (no square root:
-    finite derivatives on the axis): sag, gradient and the domain mask."""
-    r2 = x**2 + y**2
-    ok = r2 <= grid_r2[-1]
-    i = torch.clamp(torch.searchsorted(grid_r2, r2.detach().contiguous()) - 1, 0, len(grid_r2) - 2)
-    slope = (table[i + 1] - table[i]) / (grid_r2[i + 1] - grid_r2[i])          # d(sag)/d(r^2)
-    return table[i] + (r2 - grid_r2[i]) * slope, 2.0 * slope * x, 2.0 * slope * y, ok
+def table_sag(x, y, grid_x, grid_y, table):
+    """Tabulated image surface on a uniform (x, y) grid, bilinear: sag, its x and
+    y slopes, and the domain mask (always true: beyond the grid the surface keeps
+    its edge values, flat across the edge, so a ray landing off the panel is
+    penalised by the merit, not lost)."""
+    dx, dy = grid_x[1] - grid_x[0], grid_y[1] - grid_y[0]
+    fx = torch.clamp((x - grid_x[0]) / dx, 0.0, len(grid_x) - 1.0)
+    fy = torch.clamp((y - grid_y[0]) / dy, 0.0, len(grid_y) - 1.0)
+    inside_x = ((x - grid_x[0]) / dx >= 0.0) & ((x - grid_x[0]) / dx <= len(grid_x) - 1.0)
+    inside_y = ((y - grid_y[0]) / dy >= 0.0) & ((y - grid_y[0]) / dy <= len(grid_y) - 1.0)
+    i = torch.clamp(torch.floor(fx.detach()).long(), 0, len(grid_x) - 2)
+    j = torch.clamp(torch.floor(fy.detach()).long(), 0, len(grid_y) - 2)
+    wx, wy = fx - i, fy - j
+    t00, t10, t01, t11 = table[i, j], table[i + 1, j], table[i, j + 1], table[i + 1, j + 1]
+    s = (1 - wx) * (1 - wy) * t00 + wx * (1 - wy) * t10 + (1 - wx) * wy * t01 + wx * wy * t11
+    sx = ((1 - wy) * (t10 - t00) + wy * (t11 - t01)) / dx * inside_x
+    sy = ((1 - wx) * (t01 - t00) + wx * (t11 - t10)) / dy * inside_y
+    return s, sx, sy, torch.ones_like(s, dtype=torch.bool)
 
 
-def _newton_table(o, d, grid, table, t):
+def _newton_table(o, d, grid_x, grid_y, table, t):
     p = o + t[..., None] * d
-    s, sx, sy, _ = table_sag(p[..., 0], p[..., 1], grid, table)
+    s, sx, sy, _ = table_sag(p[..., 0], p[..., 1], grid_x, grid_y, table)
     return t - (p[..., 2] - s) / (d[..., 2] - sx * d[..., 0] - sy * d[..., 1])
 
 
@@ -154,7 +164,7 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
         a = batch.rx[:, s, None, None]
         c, k, C = batch.c[:, s, None, None], batch.k[:, s, None, None], batch.xy[:, s, None, None]
         ol, dl = _rot_x(o - origin, -a), _rot_x(d, -a)                    # local frame
-        tabulated = s == S - 1 and len(batch.image_sag) == 2
+        tabulated = s == S - 1 and len(batch.image_sag) == 3
         step = (lambda o_, d_, t_: _newton_table(o_, d_, *batch.image_sag, t_)) if tabulated else \
             (lambda o_, d_, t_: _newton_fused(o_, d_, c, k, C, t_))  # noqa: E731
         with torch.no_grad():

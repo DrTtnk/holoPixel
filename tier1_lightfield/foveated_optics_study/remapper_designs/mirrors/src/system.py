@@ -13,7 +13,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 from surfaces import DTYPE, Freeform, reflect, rot_x_frame  # noqa: E402
-import foveation_target as ft  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402
 from layout import TERMS, PUPIL_Y_MM  # noqa: E402
 
 FOV_X_DEG, FOV_Z_DEG = 35.0, 22.5

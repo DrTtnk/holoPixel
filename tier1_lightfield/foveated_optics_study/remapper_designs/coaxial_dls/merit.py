@@ -19,7 +19,7 @@ import numpy as np
 from optiland.optimization.operand import operand_registry as ops
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-import foveation_target as ft  # noqa: E402
+import foveation_target_radial as ft  # noqa: E402
 
 import coaxial_optiland as co  # noqa: E402
 
