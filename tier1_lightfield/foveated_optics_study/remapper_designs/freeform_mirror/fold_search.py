@@ -211,15 +211,16 @@ def to_batch(x, indices, lay):
 _BOWLS = {}
 
 
-def bowl(device, flip_v):
+def bowl(device, flip_v, light_along_z=-1):
     """The image surface: the vertex surface of the variable-focal lenslet array
     (variable_lenslets), tabulated in the image surface's local (x, y) = panel
-    (u, v); the vertices stand up towards the light, which arrives along -z."""
-    key = (str(device), flip_v)
+    (u, v). The lens vertices stand up towards the light: when the light
+    arrives along -z (the fold), towards +z; along +z (the pancake), towards -z."""
+    key = (str(device), flip_v, light_along_z)
     if key not in _BOWLS:
         gu, gv, h = vl.bowl_table(flip_v)
         t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
-        _BOWLS[key] = (t(gu), t(gv), t(h))
+        _BOWLS[key] = (t(gu), t(gv), -light_along_z * t(h))
     return _BOWLS[key]
 
 

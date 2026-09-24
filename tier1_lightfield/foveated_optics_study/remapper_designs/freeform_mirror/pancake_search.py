@@ -14,8 +14,10 @@ XY polynomials, so the anamorphic target can be followed):
   --   optional correctors, then the image surface: the variable-focal
        lenslet array's vertex surface
 The polarisation bookkeeping (quarter-wave plate, 25 % of polarised light at
-best) is ideal and not traced; Cycles cannot model it, so these designs are
-judged by the tracer, not by lf_evaluate.
+best) is ideal and not traced. Cycles has no polarisation either, but renders
+the same ideal path with shaders switched by the ray's glossy-bounce count
+(prototype checked against an independent numpy trace: 0 ghost pixels, max
+landing error 0.0125 mm).
 """
 from __future__ import annotations
 
@@ -128,7 +130,7 @@ def to_batch(x, indices, lay):
     return ot.Batch(y=torch.zeros(B, S, dtype=x.dtype, device=x.device), z=st(zs),
                     rx=torch.zeros(B, S, dtype=x.dtype, device=x.device), c=st(cs), k=st(ks), xy=st(Cs), n=st(ns),
                     mirror=(True, True) + (False,) * (S - 2),
-                    image_sag=fs.bowl(x.device, lay["flip_v"]))
+                    image_sag=fs.bowl(x.device, lay["flip_v"], light_along_z=1))
 
 
 def constraints(batch, diag, alive, lay, x):

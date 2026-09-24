@@ -635,3 +635,12 @@ differentiated the interpolant cell by cell: J jumped at every cell edge, the
 lens focal lengths derived from it were jagged, and the lens-vertex surface
 built from them missed its own table by up to 2 um. A step spanning several
 cells (5e-4 rad) gives the smooth derivative of the underlying map.
+
+## The lenslet vertices stand towards the light, whichever way the light travels
+
+The image surface of the searches is the lens-vertex surface of the
+variable-focal array, with the lenses standing up towards the incoming light.
+The fold's light reaches the panel along -z, so the table is +(h - h0); the
+pancake reused it unchanged although its light travels along +z, which mirrors
+a ~0.7 mm deep surface in z. Caught by reading the code before a Cycles export,
+after one partial run; fold_search.bowl now takes the light direction.

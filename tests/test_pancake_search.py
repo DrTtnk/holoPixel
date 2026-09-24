@@ -70,3 +70,20 @@ def test_merit_and_its_gradient_are_finite(designs, device):
     assert torch.isfinite(loss).all() and bool((info["alive_all"] == 1.0).all())
     loss.sum().backward()
     assert torch.isfinite(xg.grad).all()
+
+
+def test_the_lens_vertices_stand_up_towards_the_light(designs, device):
+    """Light reaches the pancake's image surface along +z, so the lens vertex
+    surface there is -(h - h0): a lens that stands taller sits nearer the eye."""
+    from scipy.interpolate import RegularGridInterpolator
+    lay, x, idx = designs
+    ctx = fs.context(device)
+    batch = fs.to_batch(x, idx, lay)
+    _, d_img, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+    assert bool((d_img[..., 2][alive] > 0).all())
+    p = diag["points"][:, -1][alive].cpu().numpy()
+    z_img = batch.z[:, -1, None, None].expand(alive.shape)[alive].cpu().numpy()
+    gu, gv, h = fs.vl.bowl_table(lay["flip_v"])
+    inside = (np.abs(p[:, 0]) < gu[-1]) & (np.abs(p[:, 1]) < gv[-1])
+    expected = -RegularGridInterpolator((gu, gv), h)(p[inside, :2])
+    assert (p[inside, 2] - z_img[inside]) == pytest.approx(expected, abs=1e-9)
