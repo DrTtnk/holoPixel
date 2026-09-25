@@ -3,8 +3,10 @@
     blender -b --factory-startup --python combine_scenes.py -- <out.blend> <name>=<scene.blend> ...
 
 Each scene keeps its remapper, lenslet array and ST-map panel. Its camera
-becomes the eye: a fisheye over about the monocular field of view (EYE_FOV_DEG
-across, EYE_RES), with a PUPIL_MM pupil; a second, foveal camera (FOVEA_FOV_DEG,
+becomes the eye: an equidistant fisheye over the monocular field of the right
+eye (EYE_FIELD_DEG: 100 deg temporal at world +x, 60 nasal, 60 up, 75 down; the
+frame is off-centre by lens shift, the gaze stays straight ahead), with a
+PUPIL_MM pupil; a second, foveal camera (FOVEA_FOV_DEG,
 perspective) has the same pupil. Both focus at infinity; set the focus distance
 to look at the depth scene's sphere (0.35 m) or cube (0.7 m). The panel's
 CONTENT_SWITCH value picks the resolution charts (0) or the depth scene (1).
@@ -17,8 +19,9 @@ import bpy
 import numpy as np
 
 FOVEA_FOV_DEG = 12.0
-EYE_FOV_DEG = 160.0               # monocular field: ~160 deg across, ~130 deg high
-EYE_RES = (1600, 1300)            # 0.1 deg per pixel on the fisheye
+EYE_FIELD_DEG = {"temporal": 100.0, "nasal": 60.0, "up": 60.0, "down": 75.0}
+EYE_DEG_PER_PX = 0.1
+TEMPORAL_SIGN = 1.0               # right eye: temporal along world +x (a left eye: -1)
 PUPIL_MM = 4.0
 FOCUS_MM = 1e6                    # infinity
 SAMPLES = 64
@@ -58,12 +61,18 @@ def main():
         fovea.name = f"{name}_FOVEA_CAMERA"
         fovea.data.angle = np.radians(FOVEA_FOV_DEG)
         scene.collection.objects.link(fovea)
+        f = EYE_FIELD_DEG
+        width, height = f["temporal"] + f["nasal"], f["up"] + f["down"]
         eye.data.type = "PANO"
         eye.data.panorama_type = "FISHEYE_EQUIDISTANT"
-        eye.data.fisheye_fov = np.radians(EYE_FOV_DEG)
+        eye.data.fisheye_fov = np.radians(width)                    # across the frame width
+        # Cycles shifts a panoramic frame by a fraction of its width: here of `width` degrees
+        eye.data.shift_x = TEMPORAL_SIGN * (f["temporal"] - f["nasal"]) / 2.0 / width
+        eye.data.shift_y = (f["up"] - f["down"]) / 2.0 / width
         for cam in (eye, fovea):
             _pupil(cam)
-        scene.render.resolution_x, scene.render.resolution_y = EYE_RES
+        scene.render.resolution_x = round(width / EYE_DEG_PER_PX)
+        scene.render.resolution_y = round(height / EYE_DEG_PER_PX)
         scene.cycles.samples = SAMPLES
         scene.cycles.filter_width = 1.0
         for obj in scene.objects:
