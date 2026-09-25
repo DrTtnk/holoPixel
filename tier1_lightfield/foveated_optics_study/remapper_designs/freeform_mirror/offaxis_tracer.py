@@ -21,6 +21,7 @@ import offaxis_optiland as oo
 
 NEWTON_STEPS = 30
 GRAD_STEPS = 2   # from a converged intersection one step gives the exact implicit derivative
+NEWTON_TOL_MM = 1e-12   # the free steps stop when no finite ray moves more than this
 
 
 class Batch(NamedTuple):
@@ -29,9 +30,10 @@ class Batch(NamedTuple):
     rx: torch.Tensor      # (B, S) tilt about x, radians
     c: torch.Tensor       # (B, S) base curvature
     k: torch.Tensor       # (B, S) conic
-    xy: torch.Tensor      # (B, S, I, J) coefficient of x^i y^j
+    xy: torch.Tensor      # (B, S, T) coefficient of x^i y^j for each (i, j) of terms
     n: torch.Tensor       # (B, S) index after each surface
     mirror: tuple         # (S,) static: which surfaces reflect
+    terms: tuple          # (T,) static: the (i, j) of the polynomial terms, shared by every surface
     image_sag: tuple = () # optional (x grid mm, y grid mm, sag (Nx, Ny) mm): a tabulated image surface
                           # (shared by the batch), replacing the last surface's shape
     spline: tuple = ()    # optional (surfaces (tuple), (x0, y0, h) mm, controls (B, Nx, Ny) mm): a bicubic
@@ -40,12 +42,14 @@ class Batch(NamedTuple):
 
 
 def pack(prescriptions, device):
+    """Prescriptions -> Batch; the terms are every (i, j) with a nonzero
+    coefficient in any surface of any prescription."""
     S = len(prescriptions[0]["surfaces"])
-    I = max(len(s["xy"]) for rx in prescriptions for s in rx["surfaces"])
-    J = max(len(row) for rx in prescriptions for s in rx["surfaces"] for row in s["xy"])
     mirror = tuple(bool(s["mirror"]) for s in prescriptions[0]["surfaces"])
     if any(tuple(bool(s["mirror"]) for s in rx["surfaces"]) != mirror for rx in prescriptions):
         raise ValueError("every design in a batch must have the same mirror layout")
+    terms = tuple(sorted({(i, j) for rx in prescriptions for s in rx["surfaces"]
+                          for i, row in enumerate(s["xy"]) for j, value in enumerate(row) if value != 0.0}))
     rows = {key: [] for key in ("y", "z", "rx", "c", "k", "xy", "n")}
     for rx in prescriptions:
         if len(rx["surfaces"]) != S:
@@ -59,46 +63,50 @@ def pack(prescriptions, device):
             rows["rx"][-1].append(math.radians(s["rx_deg"]))
             rows["c"][-1].append(0.0 if math.isinf(s["radius_mm"]) else 1.0 / s["radius_mm"])
             rows["k"][-1].append(s["conic"])
-            grid = [[0.0] * J for _ in range(I)]
-            for i, row in enumerate(s["xy"]):
-                for j, value in enumerate(row):
-                    grid[i][j] = value
-            rows["xy"][-1].append(grid)
+            rows["xy"][-1].append([s["xy"][i][j] if i < len(s["xy"]) and j < len(s["xy"][i]) else 0.0
+                                   for i, j in terms])
             n_medium = n_medium if s["mirror"] else s["index_after"]
             rows["n"][-1].append(n_medium)
-    t = {key: torch.tensor(v, dtype=torch.float64, device=device) for key, v in rows.items()}
-    return Batch(mirror=mirror, **t)
+    t = {key: torch.tensor(v, dtype=torch.float64, device=device).reshape(len(prescriptions), S, -1)
+         if key == "xy" else torch.tensor(v, dtype=torch.float64, device=device) for key, v in rows.items()}
+    return Batch(mirror=mirror, terms=terms, **t)
 
 
-def _poly(x, y, C):
-    """sum C_ij x^i y^j and its x and y derivatives; C (..., I, J) broadcasts."""
-    I, J = C.shape[-2], C.shape[-1]
-    # Horner in y for each power of x (value and y-derivative), then in x:
-    # elementwise only, never a (..., I, J) intermediate.
-    q, dq = [], []
-    for i in range(I):
-        v, dv = torch.zeros_like(y), torch.zeros_like(y)
-        for j in reversed(range(J)):
+def _poly(x, y, C, terms):
+    """sum_n C[..., n] x^i y^j over terms (i, j), and its x and y derivatives.
+    Horner's rule in y along each row of equal i, then in x across the rows (in
+    X = x^2 when every i is even): only the listed terms cost work. C (..., T)
+    broadcasts against x and y; terms is static."""
+    rows = {}
+    for n, (i, j) in enumerate(terms):
+        rows.setdefault(i, {})[j] = n
+    zero = torch.zeros_like(x)
+    if not rows:
+        return zero, zero, zero
+    even = all(i % 2 == 0 for i in rows)
+    step = 2 if even else 1
+    X = x * x if even else x
+    val, dval, ddy = zero, zero, zero                  # dval: derivative in X
+    for m in reversed(range(max(rows) // step + 1)):
+        row = rows.get(m * step, {})
+        v, dv = zero, zero
+        for j in reversed(range(max(row) + 1 if row else 0)):
             dv = dv * y + v
-            v = v * y + C[..., i, j]
-        q.append(v)
-        dq.append(dv)
-    val, ddx, ddy = torch.zeros_like(x), torch.zeros_like(x), torch.zeros_like(x)
-    for i in reversed(range(I)):
-        ddx = ddx * x + val
-        val = val * x + q[i]
-        ddy = ddy * x + dq[i]
-    return val, ddx, ddy
+            v = v * y + C[..., row[j]] if j in row else v * y
+        dval = dval * X + val
+        val = val * X + v
+        ddy = ddy * X + dv
+    return val, (2.0 * x * dval if even else dval), ddy
 
 
-def sag(x, y, c, k, C):
+def sag(x, y, c, k, C, terms):
     """Sag, its gradient and the sqrt domain mask."""
     r2 = x**2 + y**2
     arg = 1.0 - (1.0 + k) * c * c * r2
     ok = arg > 0.0
     root = torch.sqrt(torch.where(ok, arg, torch.ones_like(arg)))
     g = c / (2.0 * root)                         # d/d(r^2) of c r^2 / (1 + root)
-    val, ddx, ddy = _poly(x, y, C)
+    val, ddx, ddy = _poly(x, y, C, terms)
     return c * r2 / (1.0 + root) + val, 2.0 * g * x + ddx, 2.0 * g * y + ddy, ok
 
 
@@ -138,30 +146,30 @@ def bspline_sag(x, y, grid, ctrl):
     return val, dx / h, dy / h
 
 
-def _newton_spline(o, d, c, k, C, grid, ctrl, t):
+def _newton_spline(o, d, c, k, C, terms, grid, ctrl, t):
     p = o + t[..., None] * d
-    s, sx, sy, _ = sag(p[..., 0], p[..., 1], c, k, C)
+    s, sx, sy, _ = sag(p[..., 0], p[..., 1], c, k, C, terms)
     e, ex, ey = bspline_sag(p[..., 0], p[..., 1], grid, ctrl)
     return t - (p[..., 2] - s - e) / (d[..., 2] - (sx + ex) * d[..., 0] - (sy + ey) * d[..., 1])
 
 
-_newton_spline_fused = torch.compile(_newton_spline, dynamic=True)
-
-
 def _rot_x(v, a):
     """optiland's rotate_x by angle a (broadcast over the leading dims)."""
-    ca, sa = torch.cos(a), torch.sin(a)
+    return _rot(v, torch.cos(a), torch.sin(a))
+
+
+def _rot(v, ca, sa):
+    """rotate_x by the angle of cosine ca and sine sa: in the fused kernels an fp64
+    cos and sin per ray element would cost more than the rest of the surface."""
     return torch.stack([v[..., 0], v[..., 1] * ca - v[..., 2] * sa, v[..., 1] * sa + v[..., 2] * ca], -1)
 
 
-def _newton(o, d, c, k, C, t):
+def _newton(o, d, c, k, C, terms, t):
     p = o + t[..., None] * d
-    s, sx, sy, _ = sag(p[..., 0], p[..., 1], c, k, C)
+    s, sx, sy, _ = sag(p[..., 0], p[..., 1], c, k, C, terms)
     return t - (p[..., 2] - s) / (d[..., 2] - sx * d[..., 0] - sy * d[..., 1])
 
 
-# Fused into one kernel: the eager step is memory-bound (about 18x slower).
-_newton_fused = torch.compile(_newton, dynamic=True)
 
 
 def table_sag(x, y, grid_x, grid_y, table):
@@ -190,6 +198,88 @@ def _newton_table(o, d, grid_x, grid_y, table, t):
     return t - (p[..., 2] - s) / (d[..., 2] - sx * d[..., 0] - sy * d[..., 1])
 
 
+def _stepped(fused):
+    """The free Newton steps as a loop of one fused step each, at most
+    NEWTON_STEPS - GRAD_STEPS: from the fourth on, every second step checks
+    whether any ray still moves more than NEWTON_TOL_MM (a lost ray, NaN or
+    infinite, does not count: it stays lost), and stops the loop when none does."""
+    def loop(o, d, *args):
+        *shape, t = args
+        for n in range(NEWTON_STEPS - GRAD_STEPS):
+            new = fused(o, d, *shape, t)
+            if n >= 3 and n % 2 == 1 and not bool(((new - t).abs() > NEWTON_TOL_MM).any()):
+                return new
+            t = new
+        return t
+    return loop
+
+
+# Fused into one kernel each: the eager step is memory-bound (about 18x slower).
+_newton_fused = torch.compile(_newton, dynamic=True)
+_newton_spline_fused = torch.compile(_newton_spline, dynamic=True)
+_newton_table_fused = torch.compile(_newton_table, dynamic=True)
+_newton_loop = _stepped(_newton_fused)
+_newton_spline_loop = _stepped(_newton_spline_fused)
+_newton_table_loop = _stepped(_newton_table_fused)
+
+
+def _local(o, d, origin, ca, sa):
+    return _rot(o - origin, ca, -sa), _rot(d, ca, -sa)
+
+
+def _hit(kind, mirror, ol, dl, t, ca, sa, origin, c, k, n_before, n_after, shape):
+    """One surface after its Newton solve (local ray ol + t dl): the hit point p
+    (local), the ray leaving it in the global frame (pg, dg), whether the ray
+    survives (in the sag domain, converged, forwards, no TIR), the sag-domain
+    margin and, on a refracting surface, sin^2 of the refracted angle. kind
+    ("poly", "spline", "table"), shape and mirror are static."""
+    p = ol + t[..., None] * dl
+    if kind == "table":
+        f, sx, sy, ok = table_sag(p[..., 0], p[..., 1], *shape)
+    else:
+        f, sx, sy, ok = sag(p[..., 0], p[..., 1], c, k, *shape[:2])
+    if kind == "spline":
+        e, ex, ey = bspline_sag(p[..., 0], p[..., 1], *shape[2:])
+        f, sx, sy = f + e, sx + ex, sy + ey
+    domain = 1.0 - (1.0 + k) * c * c * (p[..., 0] ** 2 + p[..., 1] ** 2)
+    ok = ok & ((p[..., 2] - f).abs() < 1e-9) & (t > 0)
+    normal = torch.stack([-sx, -sy, torch.ones_like(sx)], -1)
+    normal = normal / torch.linalg.norm(normal, dim=-1, keepdim=True)
+    cosi = (normal * dl).sum(-1)
+    normal = torch.where((cosi < 0)[..., None], -normal, normal)           # along the ray
+    cosi = cosi.abs()
+    if mirror:
+        d_new = dl - 2.0 * cosi[..., None] * normal
+        extra = ()
+    else:
+        mu = n_before / n_after
+        sin2t = mu**2 * (1.0 - cosi**2)
+        ok = ok & (sin2t < 1.0)
+        cost = torch.sqrt(torch.clamp(1.0 - sin2t, min=1e-30))
+        d_new = mu[..., None] * dl + (cost - mu * cosi)[..., None] * normal
+        extra = (sin2t,)
+    pg, dg = _rot(p, ca, sa) + origin, _rot(d_new / torch.linalg.norm(d_new, dim=-1, keepdim=True), ca, sa)
+    return (p, pg, dg, ok, domain) + extra
+
+
+# one function (one compile cache) per surface kind: each has a mirror and a lens variant
+def _hit_poly(*args):
+    return _hit("poly", *args)
+
+
+def _hit_spline(*args):
+    return _hit("spline", *args)
+
+
+def _hit_table(*args):
+    return _hit("table", *args)
+
+
+_local_fused = torch.compile(_local, dynamic=True)
+_hit_fused = {"poly": torch.compile(_hit_poly, dynamic=True), "spline": torch.compile(_hit_spline, dynamic=True),
+              "table": torch.compile(_hit_table, dynamic=True)}
+
+
 def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
     """fields_deg (F, 2) as (theta_x, theta_y); pupil (P, 2) normalised.
     Returns the landing (B, F, P, 2) in the image surface's local (x, y), the
@@ -206,77 +296,48 @@ def trace(batch: Batch, fields_deg, pupil, diagnostics=False):
     o = torch.cat([pupil * oo.PUPIL_RADIUS_MM, torch.zeros(P, 1, dtype=torch.float64, device=dev)], -1)
     o = o[None, None].expand(B, F, P, 3)
     alive = torch.ones(B, F, P, dtype=torch.bool, device=dev)
-    n_before = torch.ones(B, F, P, dtype=torch.float64, device=dev)
+    n_before = torch.ones(B, 1, 1, dtype=torch.float64, device=dev)
     points, sin2, domain = [], [], []
     for s in range(S):
         origin = torch.stack([torch.zeros_like(batch.y[:, s]), batch.y[:, s], batch.z[:, s]], -1)[:, None, None]
         a = batch.rx[:, s, None, None]
+        ca, sa = torch.cos(a), torch.sin(a)
         c, k, C = batch.c[:, s, None, None], batch.k[:, s, None, None], batch.xy[:, s, None, None]
-        ol, dl = _rot_x(o - origin, -a), _rot_x(d, -a)                    # local frame
+        ol, dl = _local_fused(o, d, origin, ca, sa)
         tabulated = s == S - 1 and len(batch.image_sag) == 3
         splined = len(batch.spline) == 3 and s in batch.spline[0]
         if tabulated and splined:
             raise ValueError("the tabulated image surface cannot also carry a spline")
         if tabulated:
-            step = lambda o_, d_, t_: _newton_table(o_, d_, *batch.image_sag, t_)  # noqa: E731
+            kind, shape, step, free = "table", batch.image_sag, _newton_table_fused, _newton_table_loop
         elif splined:
-            step = lambda o_, d_, t_: _newton_spline_fused(o_, d_, c, k, C, *batch.spline[1:], t_)  # noqa: E731
+            kind, shape = "spline", (C, batch.terms, *batch.spline[1:])
+            step, free = _newton_spline_fused, _newton_spline_loop
         else:
-            step = lambda o_, d_, t_: _newton_fused(o_, d_, c, k, C, t_)  # noqa: E731
+            kind, shape, step, free = "poly", (C, batch.terms), _newton_fused, _newton_loop
+        newton_shape = shape if tabulated else (c, k, *shape)
         with torch.no_grad():
-            t = -ol[..., 2] / dl[..., 2]
-            for _ in range(NEWTON_STEPS - GRAD_STEPS):
-                if tabulated:
-                    t = step(ol.detach(), dl.detach(), t)
-                elif splined:
-                    t = _newton_spline_fused(ol.detach(), dl.detach(), c.detach(), k.detach(), C.detach(),
-                                             batch.spline[1], batch.spline[2].detach(), t)
-                else:
-                    t = _newton_fused(ol.detach(), dl.detach(), c.detach(), k.detach(), C.detach(), t)
+            t = free(ol, dl, *newton_shape, -ol[..., 2] / dl[..., 2])
             # every forward value stays finite, so the backward pass is finite too
             finite = torch.isfinite(t)
             t = torch.where(finite, t, torch.zeros_like(t))
-        alive = alive & finite
         for _ in range(GRAD_STEPS):
-            t = step(ol, dl, t)
-        p = ol + t[..., None] * dl
-        f, sx, sy, in_domain = (table_sag(p[..., 0], p[..., 1], *batch.image_sag) if tabulated
-                                else sag(p[..., 0], p[..., 1], c, k, C))
-        if splined:
-            e, ex, ey = bspline_sag(p[..., 0], p[..., 1], *batch.spline[1:])
-            f, sx, sy = f + e, sx + ex, sy + ey
+            t = step(ol, dl, *newton_shape, t)
+        n_after = n_before if batch.mirror[s] else batch.n[:, s, None, None]
+        p, pg, dg, ok, margin, *bent = _hit_fused[kind](batch.mirror[s], ol, dl, t, ca, sa, origin, c, k, n_before,
+                                                        n_after, shape)
+        alive = alive & finite & ok
         if diagnostics:
-            domain.append(1.0 - (1.0 + k) * c * c * (p[..., 0] ** 2 + p[..., 1] ** 2))
-        converged = (p[..., 2] - f).abs() < 1e-9
-        alive = alive & in_domain & converged & (t > 0)
-        normal = torch.stack([-sx, -sy, torch.ones_like(sx)], -1)
-        normal = normal / torch.linalg.norm(normal, dim=-1, keepdim=True)
-        cosi = (normal * dl).sum(-1)
-        normal = torch.where((cosi < 0)[..., None], -normal, normal)       # along the ray
-        cosi = cosi.abs()
-        if batch.mirror[s]:
-            d_new = dl - 2.0 * cosi[..., None] * normal
-            n_after = n_before
-        else:
-            n_after = batch.n[:, s, None, None].expand(B, F, P)
-            mu = n_before / n_after
-            sin2t = mu**2 * (1.0 - cosi**2)
-            if diagnostics:
-                sin2.append(sin2t)
-            alive = alive & (sin2t < 1.0)
-            cost = torch.sqrt(torch.clamp(1.0 - sin2t, min=1e-30))
-            d_new = mu[..., None] * dl + (cost - mu * cosi)[..., None] * normal
+            domain.append(margin)
+            sin2.extend(bent)
+            points.append(pg.detach())
         if s == S - 1:
             p_img, d_img = p, dl
             break
-        pg, dg = _rot_x(p, a) + origin, _rot_x(d_new / torch.linalg.norm(d_new, dim=-1, keepdim=True), a)
-        if diagnostics:
-            points.append(pg.detach())
         o = torch.where(alive[..., None], pg, o.detach())
         d = torch.where(alive[..., None], dg, d.detach())
         n_before = n_after
     if diagnostics:
-        points.append((_rot_x(p_img, a) + origin).detach())
         return p_img[..., :2], d_img, alive, {"points": torch.stack(points, 1), "domain": torch.stack(domain, 1),
                                               "sin2t": torch.stack(sin2, 1)}
     return p_img[..., :2], d_img, alive

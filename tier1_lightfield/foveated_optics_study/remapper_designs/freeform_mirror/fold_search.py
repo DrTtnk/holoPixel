@@ -151,12 +151,9 @@ def fold_random_designs(lay, count, rng, device):
 
 
 def _shape(p, r0):
-    """(B, N_SHAPE) -> curvature, conic, (B, POLY, POLY) coefficients."""
-    B = p.shape[0]
-    C = torch.zeros(B, POLY, POLY, dtype=p.dtype, device=p.device)
-    for n, (i, j) in enumerate(TERMS):
-        C[:, i, j] = p[:, 2 + n] / r0 ** (i + j)
-    return 2.0 * p[:, 0] / r0**2, p[:, 1], C
+    """(B, N_SHAPE) -> curvature, conic, (B, len(TERMS)) coefficients."""
+    scale = torch.tensor([r0 ** (i + j) for i, j in TERMS], dtype=p.dtype, device=p.device)
+    return 2.0 * p[:, 0] / r0**2, p[:, 1], p[:, 2:] / scale
 
 
 def fold_to_batch(x, indices, lay):
@@ -191,11 +188,12 @@ def fold_to_batch(x, indices, lay):
         s = s + thick
     gap, lat, tilt = x[:, lay["image"]].unbind(1)
     s = s + gap
-    flat = (zero, zero, torch.zeros(B, POLY, POLY, dtype=x.dtype, device=x.device))
+    flat = (zero, zero, torch.zeros(B, len(TERMS), dtype=x.dtype, device=x.device))
     add(M + s[:, None] * u + lat[:, None] * up, 2 * a + torch.deg2rad(tilt), flat, torch.ones_like(zero))
     st = lambda v: torch.stack(v, 1)  # noqa: E731
     return ot.Batch(y=st(ys), z=st(zs), rx=st(rxs), c=st(cs), k=st(ks), xy=st(Cs), n=st(ns),
-                    mirror=(True,) + (False,) * (2 * lay["n_el"] + 1), image_sag=bowl(x.device, lay["flip_v"]))
+                    mirror=(True,) + (False,) * (2 * lay["n_el"] + 1), terms=TERMS,
+                    image_sag=bowl(x.device, lay["flip_v"]))
 
 
 FAMILIES = {}
@@ -319,9 +317,12 @@ def to_prescription(x_row, indices_row, lay):
     out = []
     for s in range(b.z.shape[1]):
         c = float(b.c[0, s])
+        grid = [[0.0] * POLY for _ in range(POLY)]
+        for (i, j), value in zip(b.terms, b.xy[0, s].tolist()):
+            grid[i][j] = value
         out.append({"y_mm": float(b.y[0, s]), "z_mm": float(b.z[0, s]), "rx_deg": math.degrees(float(b.rx[0, s])),
                     "radius_mm": math.inf if c == 0.0 else 1.0 / c, "conic": float(b.k[0, s]),
-                    "xy": b.xy[0, s].tolist(), "mirror": b.mirror[s], "index_after": float(b.n[0, s])})
+                    "xy": grid, "mirror": b.mirror[s], "index_after": float(b.n[0, s])})
     return {"surfaces": out, "image_surface": LENSLETS, "lenslet_flip_v": lay["flip_v"]}
 
 
@@ -571,20 +572,18 @@ def rim_thickness(batch, pts, alive, s_front, s_back):
     rim = hits + CONE_MARGIN_MM * out / torch.linalg.norm(out, dim=-1, keepdim=True).clamp(min=1e-9)
     xy = torch.cat([hits, rim], 1)
     shape = lambda s: (batch.c[:, s, None], batch.k[:, s, None], batch.xy[:, s, None])  # noqa: E731
-    f, _, _, ok_f = ot.sag(xy[..., 0], xy[..., 1], *shape(s_front))
+    f, _, _, ok_f = ot.sag(xy[..., 0], xy[..., 1], *shape(s_front), batch.terms)
     axis = ot._rot_x(torch.tensor([0.0, 0.0, 1.0], dtype=xy.dtype, device=xy.device).expand_as(o_f), a_f)
     g = ot._rot_x(torch.cat([xy, f[..., None]], -1), a_f) + o_f
     ob, db = ot._rot_x(g - o_b, -a_b), ot._rot_x(axis, -a_b).expand_as(g)
     c, k, C = shape(s_back)
     with torch.no_grad():
-        t = -ob[..., 2] / db[..., 2]
-        for _ in range(ot.NEWTON_STEPS - ot.GRAD_STEPS):
-            t = ot._newton_fused(ob.detach(), db.detach(), c.detach(), k.detach(), C.detach(), t)
+        t = ot._newton_loop(ob, db, c, k, C, batch.terms, -ob[..., 2] / db[..., 2])
         t = torch.where(torch.isfinite(t), t, torch.zeros_like(t))
     for _ in range(ot.GRAD_STEPS):
-        t = ot._newton_fused(ob, db, c, k, C, t)
+        t = ot._newton_fused(ob, db, c, k, C, batch.terms, t)
     q = ob + t[..., None] * db
-    f_b, _, _, ok_b = ot.sag(q[..., 0], q[..., 1], c, k, C)
+    f_b, _, _, ok_b = ot.sag(q[..., 0], q[..., 1], c, k, C, batch.terms)
     valid = ok_f & ok_b & ((q[..., 2] - f_b).abs() < 1e-9) & torch.cat([live, live], 1).bool()
     n = hits.shape[1]
     t_hit = torch.where(valid[:, :n], t[:, :n], torch.zeros_like(t[:, :n]))
@@ -695,10 +694,11 @@ def seeded_layout(lay, seed_from, spline_cells, device):
     return lay
 
 
-def stored_seeds(paths, lay, material, device, ctx):
+def stored_seeds(paths, lay, material, device, ctx, other_field=False):
     """Every design of earlier best_*.json files, as seeds: they must match the
     layout's element count, orientation and material, and be alive under the
-    current merit."""
+    current merit. They must also have been searched for this run's field, unless
+    other_field (a field continuation: the search scores them under this field)."""
     xs, idxs = [], []
     for path in paths:
         for e in json.loads(Path(path).read_text()):
@@ -706,9 +706,10 @@ def stored_seeds(paths, lay, material, device, ctx):
                                                                        material):
                 raise ValueError(f"{path}: rank {e.get('rank', 0)} is not a {lay['n_el']}-element {material} design "
                                  f"with flips ({lay['flip_u']}, {lay['flip_v']})")
-            if e["field_deg"] != spec.FIELD_DEG:
+            if e["field_deg"] != spec.FIELD_DEG and not other_field:
                 raise ValueError(f"{path}: rank {e.get('rank', 0)} was searched for a {e['field_deg']} deg field, "
-                                 f"not this run's {spec.FIELD_DEG} (HOLOPIXEL_FIELD_DEG)")
+                                 f"not this run's {spec.FIELD_DEG} (HOLOPIXEL_FIELD_DEG; a continuation "
+                                 "needs --seed-other-field)")
             if e["spline"] and ("spline" not in lay or
                                 (tuple(e["spline"]["grid"]), tuple(e["spline"]["shape"]))
                                 != (lay["spline"]["grid"], lay["spline"]["shape"])):
@@ -730,21 +731,29 @@ def stored_seeds(paths, lay, material, device, ctx):
     return x, idx
 
 
-def fd_jacobian(x, indices, lay, ctx, r0, free, lo, hi, h=1e-5):
+FD_CHUNK = 4        # Jacobian columns traced in one batch: the small traces cost CPU time per call, not per ray
+
+
+def fd_jacobian(x, indices, lay, ctx, r0, free, lo, hi, h=1e-5, chunk=FD_CHUNK):
     """Forward-difference Jacobian of the residuals, (B, R, D); zero columns for
-    frozen parameters. The step points inwards at a bound."""
-    J = torch.zeros(x.shape[0], r0.shape[1], x.shape[1], dtype=x.dtype, device=x.device)
-    for d in torch.nonzero(free).flatten().tolist():
-        step = torch.where(x[:, d] + h > hi[d], -h, h)
-        xp = x.clone()
-        xp[:, d] += step
-        rp, _ = residuals(xp, indices, lay, ctx)
-        J[:, :, d] = (rp - r0) / step[:, None]
+    frozen parameters. The step points inwards at a bound. `chunk` columns are
+    traced together, as one batch of chunk * B designs."""
+    B = x.shape[0]
+    J = torch.zeros(B, r0.shape[1], x.shape[1], dtype=x.dtype, device=x.device)
+    columns = torch.nonzero(free).flatten().tolist()
+    for n in range(0, len(columns), chunk):
+        ds = columns[n:n + chunk]
+        steps = torch.stack([torch.where(x[:, d] + h > hi[d], -h, h) for d in ds])       # (k, B)
+        xp = x.repeat(len(ds), 1).reshape(len(ds), B, -1)
+        for m, d in enumerate(ds):
+            xp[m, :, d] += steps[m]
+        rp, _ = residuals(xp.reshape(len(ds) * B, -1), indices.repeat(len(ds), 1), lay, ctx)
+        J[:, :, ds] = ((rp.reshape(len(ds), B, -1) - r0) / steps[..., None]).permute(1, 2, 0)
     return J
 
 
 def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["ratio"], tag_suffix="", family="fold",
-        seed_from=(), spline_cells=0):
+        seed_from=(), spline_cells=0, seed_other_field=False):
     """Batched Levenberg-Marquardt (damped least squares), one damping per
     design. Each iteration tries four dampings and keeps the best step that
     lowers the merit and loses no ray. High-order terms are frozen for the
@@ -761,7 +770,7 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
     ctx = context(device, {**W, "ratio": ratio_weight})
     with torch.no_grad():
         if seed_from:
-            x_s, idx_s = stored_seeds(seed_from, lay, material, device, ctx)
+            x_s, idx_s = stored_seeds(seed_from, lay, material, device, ctx, other_field=seed_other_field)
         else:
             x_s = torch.zeros(0, lay["size"], dtype=torch.float64, device=device)
             idx_s = torch.zeros(0, n_el, dtype=torch.float64, device=device)
@@ -787,19 +796,17 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
             A[:, frozen, frozen] = 1.0
             diag = torch.diagonal(A, dim1=1, dim2=2)
             floor = 1e-9 * diag.amax(1, keepdim=True)
-            best_loss, best_x, best_lam = loss.clone(), x.clone(), lam * 16.0 * 4.0
-            for f in tries:
-                damp = (lam * f)[:, None] * torch.maximum(diag, floor)
-                delta = -torch.linalg.solve(A + torch.diag_embed(damp), g[..., None])[..., 0]
-                xc = torch.clamp(x + delta, lo, hi)
-                lc, ic = merit(xc, indices, lay, ctx)
-                ok = (ic["alive_all"] == 1.0) & torch.isfinite(lc) & (lc < best_loss)
-                best_loss = torch.where(ok, lc, best_loss)
-                best_x[ok] = xc[ok]
-                best_lam = torch.where(ok, lam * f / 3.0, best_lam)
-            moved = best_loss < loss
-            x = best_x
-            lam = torch.clamp(best_lam, 1e-9, 1e9)
+            # the dampings, all tried in one batch; the first with the lowest merit that loses no ray wins
+            damp = (lam[None, :] * tries[:, None])[..., None] * torch.maximum(diag, floor)[None]   # (T, B, D)
+            delta = -torch.linalg.solve(A[None] + torch.diag_embed(damp), g[None, ..., None])[..., 0]
+            xc = torch.clamp(x[None] + delta, lo, hi)
+            lc, ic = merit(xc.reshape(len(tries) * count, -1), indices.repeat(len(tries), 1), lay, ctx)
+            lc, alive_c = lc.reshape(len(tries), count), ic["alive_all"].reshape(len(tries), count)
+            lc = torch.where((alive_c == 1.0) & torch.isfinite(lc), lc, torch.full_like(lc, math.inf))
+            pick = torch.argmin(lc, 0)
+            moved = lc[pick, torch.arange(count, device=device)] < loss
+            x = torch.where(moved[:, None], xc[pick, torch.arange(count, device=device)], x)
+            lam = torch.clamp(torch.where(moved, lam * tries[pick] / 3.0, lam * 16.0 * 4.0), 1e-9, 1e9)
             r, info = residuals(x, indices, lay, ctx)
             loss = (r**2).sum(1)
             if it % 5 == 0 or it == iters - 1:
@@ -845,11 +852,14 @@ def main():
     ap.add_argument("--seed-from", nargs="*", default=[], help="best_*.json files whose designs join the seeds")
     ap.add_argument("--spline-cells", type=int, default=0,
                     help="add a B-spline of this many cells across to the mirror (needs --seed-from)")
+    ap.add_argument("--seed-other-field", action="store_true",
+                    help="accept --seed-from designs searched for another field (a field continuation)")
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"),
-        ratio_weight=args.ratio_weight, tag_suffix=args.tag, seed_from=args.seed_from, spline_cells=args.spline_cells)
+        ratio_weight=args.ratio_weight, tag_suffix=args.tag, seed_from=args.seed_from, spline_cells=args.spline_cells,
+        seed_other_field=args.seed_other_field)
 
 
 if __name__ == "__main__":

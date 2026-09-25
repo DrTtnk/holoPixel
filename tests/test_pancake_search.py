@@ -73,6 +73,24 @@ def test_merit_and_its_gradient_are_finite(designs, device):
     assert torch.isfinite(xg.grad).all()
 
 
+def test_the_jacobian_is_the_same_in_chunks_of_columns(designs, device):
+    """fd_jacobian traces several perturbed columns in one batch: the columns (and
+    the frozen zero ones) must not depend on the chunk size."""
+    lay, x, idx = designs
+    ctx = fs.context(device)
+    lo, hi = fs.bounds(lay, device)
+    x = torch.minimum(x, hi - 1e-6)
+    x[0, 0] = hi[0] - 1e-6                                                # a step that turns back at the bound
+    free = torch.ones(lay["size"], dtype=torch.bool, device=device)
+    free[5] = False
+    with torch.no_grad():
+        r, _ = fs.residuals(x, idx, lay, ctx)
+        one = fs.fd_jacobian(x, idx, lay, ctx, r, free, lo, hi, chunk=1)
+        many = fs.fd_jacobian(x, idx, lay, ctx, r, free, lo, hi, chunk=4)
+    assert not one[:, :, 5].any() and one[:, :, 0].abs().max() > 0
+    assert many.cpu().numpy() == pytest.approx(one.cpu().numpy(), rel=1e-6, abs=1e-6 * float(one.abs().max()))
+
+
 def test_the_lens_vertices_stand_up_towards_the_light(designs, device):
     """Light reaches the pancake's image surface along +z, so the lens vertex
     surface there is -(h - h0): a lens that stands taller sits nearer the eye."""
@@ -131,7 +149,7 @@ def test_one_spline_shapes_both_passes_of_the_half_mirror(device):
     for s in (0, 2):                                                      # both hits lie on the splined sag
         p = diag["points"][0, s][alive[0]]
         c, k, C = batch.c[:1, s], batch.k[:1, s], batch.xy[:1, s]
-        f, _, _, _ = ot.sag(p[None, :, 0], p[None, :, 1], c[:, None], k[:, None], C[:, None])
+        f, _, _, _ = ot.sag(p[None, :, 0], p[None, :, 1], c[:, None], k[:, None], C[:, None], batch.terms)
         e, _, _ = ot.bspline_sag(p[None, :, 0], p[None, :, 1], batch.spline[1], batch.spline[2])
         assert (p[:, 2] - batch.z[0, s]).cpu().numpy() == pytest.approx((f + e)[0].cpu().numpy(), abs=1e-8)
 
@@ -182,3 +200,18 @@ def test_a_stored_design_of_another_field_is_refused(device):
             fs.stored_seeds([other], lay, "glass", device, fs.context(device))
     finally:
         other.unlink()
+
+
+def test_a_stored_design_of_another_field_seeds_a_continuation_when_asked(device):
+    """Field continuation: a design searched for another field starts the search
+    only on an explicit request; the search then scores it under this field."""
+    import json
+    entry = json.loads(STORED.read_text())[0]
+    lay = fs.layout(1, entry["flip_u"], entry["flip_v"], family="pancake")
+    other = STORED.parent.parent / "other_field_continue.json"
+    other.write_text(json.dumps([{**entry, "field_deg": [100.0, 80.0]}]))
+    try:
+        x, idx = fs.stored_seeds([other], lay, "glass", device, fs.context(device), other_field=True)
+    finally:
+        other.unlink()
+    assert x[0].tolist() == entry["x"] and idx[0].tolist() == entry["indices"]

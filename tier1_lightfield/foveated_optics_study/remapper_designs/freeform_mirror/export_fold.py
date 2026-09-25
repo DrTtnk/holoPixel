@@ -50,7 +50,8 @@ def _frame(batch, s):
 
 def _sag(batch, s, x, y):
     t = lambda v: torch.as_tensor(v, dtype=torch.float64)  # noqa: E731
-    f, sx, sy, ok = ot.sag(t(x), t(y), batch.c[0, s].cpu(), batch.k[0, s].cpu(), batch.xy[0, s].cpu())
+    f, sx, sy, ok = ot.sag(t(x), t(y), batch.c[0, s].cpu(), batch.k[0, s].cpu(), batch.xy[0, s].cpu(),
+                         batch.terms)
     if not bool(ok.all()):
         raise ValueError(f"surface {s}: the exported region leaves the sag domain")
     if len(batch.spline) == 3 and s in batch.spline[0]:
@@ -63,7 +64,7 @@ def _sag(batch, s, x, y):
 def cpu_batch(batch):
     """A detached CPU copy of a one-design batch, its spline included."""
     spline = (batch.spline[0], batch.spline[1], batch.spline[2].detach().cpu()) if batch.spline else ()
-    return ot.Batch(*(t.detach().cpu() for t in batch[:7]), mirror=batch.mirror, spline=spline)
+    return ot.Batch(*(t.detach().cpu() for t in batch[:7]), mirror=batch.mirror, terms=batch.terms, spline=spline)
 
 
 def _local(batch, s, p):
@@ -135,7 +136,7 @@ def _back_along_front_axis(batch, s_front, s_back, gx, gy):
     c, k, C = batch.c[0, s_back].cpu(), batch.k[0, s_back].cpu(), batch.xy[0, s_back].cpu()
     t = -o[:, 2] / d[:, 2]
     for _ in range(ot.NEWTON_STEPS):
-        t = ot._newton(o, d, c, k, C, t)
+        t = ot._newton(o, d, c, k, C, batch.terms, t)
     p = o + t[:, None] * d
     f_b, _, _ = _sag(batch, s_back, p[:, 0].numpy(), p[:, 1].numpy())
     if np.max(np.abs(p[:, 2].numpy() - f_b)) > 1e-9:

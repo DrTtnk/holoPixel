@@ -859,3 +859,23 @@ A first 100 x 80 glass pancake (random seeds, 90 iterations, not converged)
 reached only ~76 deg across (coverage 0.65), blur 8x, ghosts 0.039 (rank 2),
 with the fovea's magnification the weak point again. The field is now a
 parameter (HOLOPIXEL_FIELD_DEG), recorded in results and designs and checked.
+
+## Search tracer speed: what counted, what did not
+
+Profiled on the RTX 5090 laptop GPU (fp64 is 1/64 of fp32 there), one pancake
+LM iteration at 128 designs took ~17 s, 90 % of it the forward-difference
+Jacobian (36 full traces). What made it faster, with results the same to
+1e-13 (residuals) and 1e-10 (Jacobian), checked against saved baselines:
+- The XY polynomial ran over a dense 7 x 7 grid with 14 nonzero terms. The
+  Batch now carries only the terms (static `terms`) and Horner runs in
+  (x^2, y) over them: ~3x fewer fp64 operations per Newton step.
+- The Newton loop ran 28 free steps; rays need 3-12. It stops once no finite
+  ray moves more than 1e-12 mm (checked every second step from the fourth).
+- `_rot_x` computed an fp64 cos and sin of the tilt for every ray element: in a
+  fused kernel that cost more than the whole surface. cos/sin are computed once
+  per design and surface now.
+- Several Jacobian columns (and the four LM dampings) go through one batch: the
+  small traces (chief rays, ring fields) cost CPU time per call, not per ray.
+What did not help: unrolling the 28 Newton steps into one compiled kernel (same
+speed; for the spline surface the unrolled graph took over 10 minutes to
+compile) and tracing the never-converging ring fields apart from the dense grid.

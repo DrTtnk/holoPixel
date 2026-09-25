@@ -156,6 +156,51 @@ def test_a_tabulated_image_surface_lands_rays_like_the_analytic_one(device):
     assert float((flat_land - got).abs().max()) > 0.1                    # the table is really used
 
 
+@pytest.mark.parametrize("terms", [((0, 2), (2, 0), (0, 3), (2, 1), (0, 6), (2, 4), (4, 2), (6, 0)),   # even in x
+                                   ((1, 0), (0, 1), (3, 2), (0, 0)),                               # odd rows, a gap
+                                   ((4, 1),),
+                                   ()])
+def test_the_polynomial_sums_its_terms_and_its_slopes_are_exact(terms):
+    """_poly evaluates only the listed terms, by Horner's rule (in x^2 when every
+    power of x is even): it must equal the direct sum, and its slopes autograd's."""
+    rng = np.random.default_rng(len(terms))
+    t = lambda a: torch.tensor(a, dtype=torch.float64)  # noqa: E731
+    C = t(rng.normal(0.0, 1.0, (3, 1, len(terms))))
+    x = t(rng.uniform(-1.5, 1.5, (3, 50))).requires_grad_(True)
+    y = t(rng.uniform(-1.5, 1.5, (3, 50))).requires_grad_(True)
+    ref = sum((C[..., n] * x**i * y**j for n, (i, j) in enumerate(terms)), torch.zeros_like(x))
+    val, ddx, ddy = ot._poly(x, y, C, terms)
+    assert val.detach().numpy() == pytest.approx(ref.detach().numpy(), abs=1e-12)
+    if terms:
+        gx, gy = torch.autograd.grad(ref.sum(), (x, y))
+        assert ddx.detach().numpy() == pytest.approx(gx.numpy(), abs=1e-12)
+        assert ddy.detach().numpy() == pytest.approx(gy.numpy(), abs=1e-12)
+    else:
+        assert not ddx.detach().numpy().any() and not ddy.detach().numpy().any()
+
+
+def test_the_newton_early_exit_lands_the_rays_where_every_step_does(device, monkeypatch):
+    """The free Newton steps stop once no ray moves more than NEWTON_TOL_MM; with a
+    zero tolerance all of them run. Same landings, same lost rays (a TIR ray too)."""
+    designs = [_fold(np.random.default_rng(s)) for s in range(3)]
+    designs[1]["surfaces"][1]["rx_deg"] += 60.0                                # loses rays
+    batch = ot.pack(designs, device)
+    f, p = torch.tensor(FIELDS, device=device), torch.tensor(PUPIL, device=device)
+    early, _, ok_early = ot.trace(batch, f, p)
+    monkeypatch.setattr(ot, "NEWTON_TOL_MM", 0.0)
+    full, _, ok_full = ot.trace(batch, f, p)
+    assert torch.equal(ok_early, ok_full) and not bool(ok_full.all()) and bool(ok_full.any())
+    assert early[ok_full].cpu().numpy() == pytest.approx(full[ok_full].cpu().numpy(), abs=1e-12)
+
+
+def test_pack_keeps_the_nonzero_terms_of_the_prescriptions(device):
+    rx = _fold(np.random.default_rng(1))
+    batch = ot.pack([rx, _fold(np.random.default_rng(2))], device)
+    assert batch.terms == ((0, 1), (0, 2), (0, 3), (2, 0), (2, 1))
+    assert tuple(batch.xy.shape) == (2, len(rx["surfaces"]), len(batch.terms))
+    assert float(batch.xy[0, 0, 3]) == rx["surfaces"][0]["xy"][2][0]
+
+
 def _centred_cubic(t):
     a = np.abs(t)
     return np.where(a < 1, 2.0 / 3.0 - a**2 + a**3 / 2.0, np.where(a < 2, (2.0 - a) ** 3 / 6.0, 0.0))

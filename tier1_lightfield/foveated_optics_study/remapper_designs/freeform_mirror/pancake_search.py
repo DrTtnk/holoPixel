@@ -33,6 +33,7 @@ import offaxis_tracer as ot
 EYE_RELIEF_MIN_MM = 15.0
 TRACK_MAX_MM = 40.0          # pupil to lenslet array: the point of a pancake
 HM_R0_MM, LENS_R0_MM = 20.0, 10.0
+LENS_SHAPE_MM = 20.0         # bound of the lens shape parameters: the 70 x 45 best lens back sat at +-10
 
 
 def layout(n_el, flip_u=1, flip_v=1):
@@ -65,11 +66,11 @@ def bounds(lay, device):
     put(lay["cavity"], [EYE_RELIEF_MIN_MM, 1.0], [30.0, 20.0])            # z_p, polariser -> half-mirror gap
     put(lay["hm_shape"], -10.0, 10.0)
     put(lay["lens1"]["thickness"], fs.MIN_GLASS_MM, 10.0)
-    put(lay["lens1"]["back"], -10.0, 10.0)
+    put(lay["lens1"]["back"], -LENS_SHAPE_MM, LENS_SHAPE_MM)
     for el in lay["elements"]:
         put(el["pose"], [0.3, fs.MIN_GLASS_MM], [20.0, 8.0])             # gap before, thickness
-        put(el["front"], -10.0, 10.0)
-        put(el["back"], -10.0, 10.0)
+        put(el["front"], -LENS_SHAPE_MM, LENS_SHAPE_MM)
+        put(el["back"], -LENS_SHAPE_MM, LENS_SHAPE_MM)
     put(lay["image"], 0.3, 30.0)
     t = lambda a: torch.tensor(a, dtype=torch.float64, device=device)  # noqa: E731
     return t(lo), t(hi)
@@ -103,7 +104,7 @@ def to_batch(x, indices, lay):
     z_p, gap = x[:, lay["cavity"]].unbind(1)
     z_hm = z_p + gap
     hm = fs._shape(x[:, lay["hm_shape"]], HM_R0_MM)
-    flat = (zero, zero, torch.zeros(B, fs.POLY, fs.POLY, dtype=x.dtype, device=x.device))
+    flat = (zero, zero, torch.zeros(B, len(fs.TERMS), dtype=x.dtype, device=x.device))
     zs, cs, ks, Cs, ns = [], [], [], [], []
 
     def add(z, shape, n_after):
@@ -129,7 +130,7 @@ def to_batch(x, indices, lay):
     S = len(zs)
     return ot.Batch(y=torch.zeros(B, S, dtype=x.dtype, device=x.device), z=st(zs),
                     rx=torch.zeros(B, S, dtype=x.dtype, device=x.device), c=st(cs), k=st(ks), xy=st(Cs), n=st(ns),
-                    mirror=(True, True) + (False,) * (S - 2),
+                    mirror=(True, True) + (False,) * (S - 2), terms=fs.TERMS,
                     image_sag=fs.bowl(x.device, lay["flip_v"], light_along_z=1))
 
 
@@ -165,11 +166,14 @@ def main():
     ap.add_argument("--tag", default="", help="suffix of the output file name")
     ap.add_argument("--spline-cells", type=int, default=0,
                     help="add a B-spline of this many cells across to the half-mirror (needs --seed-from)")
+    ap.add_argument("--seed-other-field", action="store_true",
+                    help="accept --seed-from designs searched for another field (a field continuation)")
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     fs.run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"),
-           family="pancake", seed_from=args.seed_from, tag_suffix=args.tag, spline_cells=args.spline_cells)
+           family="pancake", seed_from=args.seed_from, tag_suffix=args.tag, spline_cells=args.spline_cells,
+           seed_other_field=args.seed_other_field)
 
 
 if __name__ == "__main__":
