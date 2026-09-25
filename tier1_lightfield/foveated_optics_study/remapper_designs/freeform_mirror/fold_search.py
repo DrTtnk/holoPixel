@@ -673,6 +673,24 @@ def live_seeds(lay, count, material, rng, device, ctx, lo, hi, chunk=512):
     return torch.cat(xs)[:count], torch.cat(idxs)[:count], tried
 
 
+def seeded_layout(lay, seed_from, spline_cells, device):
+    """The search layout. A first seed that carries a mirror spline brings its
+    own grid (its controls are defined on it); with spline_cells, a new grid is
+    laid over a smooth first seed's mirror footprint."""
+    if not seed_from:
+        if spline_cells:
+            raise ValueError("a mirror spline is laid over a stored design's footprint: give --seed-from")
+        return lay
+    first = json.loads(Path(seed_from[0]).read_text())[0]
+    if first["spline"]:
+        if spline_cells:
+            raise ValueError(f"{seed_from[0]} already carries a spline: its own grid is kept, give no --spline-cells")
+        return with_mirror_spline(lay, first["spline"]["grid"], first["spline"]["shape"])
+    if spline_cells:
+        return with_mirror_spline(lay, *mirror_spline_grid(first, device, spline_cells, lay["family"]))
+    return lay
+
+
 def stored_seeds(paths, lay, material, device, ctx):
     """Every design of earlier best_*.json files, as seeds: they must match the
     layout's element count, orientation and material, and be alive under the
@@ -684,6 +702,11 @@ def stored_seeds(paths, lay, material, device, ctx):
                                                                        material):
                 raise ValueError(f"{path}: rank {e.get('rank', 0)} is not a {lay['n_el']}-element {material} design "
                                  f"with flips ({lay['flip_u']}, {lay['flip_v']})")
+            if e["spline"] and ("spline" not in lay or
+                                (tuple(e["spline"]["grid"]), tuple(e["spline"]["shape"]))
+                                != (lay["spline"]["grid"], lay["spline"]["shape"])):
+                raise ValueError(f"{path}: rank {e.get('rank', 0)} carries a mirror spline on another spline grid; "
+                                 "its controls mean nothing on this layout's")
             missing = lay["size"] - len(e["x"])
             spline_n = lay["size"] - lay["spline"]["slice"].start if "spline" in lay else 0
             if missing not in (0, spline_n):
@@ -724,11 +747,8 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
     flip_u, flip_v = family_orientation(n_el, material, rng, device, lo, hi, family=family)
     lay = layout(n_el, flip_u, flip_v, family=family)
     print(f"image orientation of this layout: flip_u {flip_u}, flip_v {flip_v}", flush=True)
-    if spline_cells:
-        if not seed_from:
-            raise ValueError("a mirror spline is laid over a stored design's footprint: give --seed-from")
-        first = json.loads(Path(seed_from[0]).read_text())[0]
-        lay = with_mirror_spline(lay, *mirror_spline_grid(first, device, spline_cells, family))
+    lay = seeded_layout(lay, seed_from, spline_cells, device)
+    if "spline" in lay:
         lo, hi = bounds(lay, device)
         print(f"mirror spline: grid {lay['spline']['grid']}, controls {lay['spline']['shape']}", flush=True)
     ctx = context(device, {**W, "ratio": ratio_weight})

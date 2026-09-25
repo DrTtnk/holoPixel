@@ -134,3 +134,38 @@ def test_one_spline_shapes_both_passes_of_the_half_mirror(device):
         f, _, _, _ = ot.sag(p[None, :, 0], p[None, :, 1], c[:, None], k[:, None], C[:, None])
         e, _, _ = ot.bspline_sag(p[None, :, 0], p[None, :, 1], batch.spline[1], batch.spline[2])
         assert (p[:, 2] - batch.z[0, s]).cpu().numpy() == pytest.approx((f + e)[0].cpu().numpy(), abs=1e-8)
+
+
+SPLINED = HERE / "results_pancake" / "best_pancake_el1_glass_spline4.json"
+
+
+def test_a_splined_seed_must_match_the_layouts_spline_grid(device):
+    """A seed's spline controls only mean something on its own grid: a layout
+    whose grid was laid out again (over the seed's own, changed footprint)
+    must refuse it, not reinterpret the controls."""
+    import json
+    entry = json.loads(SPLINED.read_text())[0]
+    own = fs.entry_layout(entry, "pancake")
+    ctx = fs.context(device)
+    x, _ = fs.stored_seeds([SPLINED], own, "glass", device, ctx)
+    assert x[0].tolist() == entry["x"]
+    grid, shape = fs.mirror_spline_grid(entry, device, cells=4, family="pancake")
+    assert tuple(grid) != tuple(entry["spline"]["grid"])                  # the footprint moved in the search
+    regrid = fs.with_mirror_spline(fs.layout(1, entry["flip_u"], entry["flip_v"], family="pancake"), grid, shape)
+    with pytest.raises(ValueError, match="spline grid"):
+        fs.stored_seeds([SPLINED], regrid, "glass", device, ctx)
+
+
+def test_a_search_seeded_from_a_splined_design_keeps_its_grid(device):
+    import json
+    entry = json.loads(SPLINED.read_text())[0]
+    base = fs.layout(1, entry["flip_u"], entry["flip_v"], family="pancake")
+    lay = fs.seeded_layout(base, [SPLINED], 0, device)
+    assert lay["spline"]["grid"] == tuple(entry["spline"]["grid"])
+    assert lay["spline"]["shape"] == tuple(entry["spline"]["shape"])
+    with pytest.raises(ValueError, match="already carries a spline"):
+        fs.seeded_layout(base, [SPLINED], 4, device)
+    smooth = fs.seeded_layout(base, [STORED], 4, device)                  # a smooth seed: a new grid over it
+    assert smooth["spline"]["shape"] == tuple(fs.mirror_spline_grid(json.loads(STORED.read_text())[0], device,
+                                                                     4, "pancake")[1])
+    assert "spline" not in fs.seeded_layout(base, [STORED], 0, device)
