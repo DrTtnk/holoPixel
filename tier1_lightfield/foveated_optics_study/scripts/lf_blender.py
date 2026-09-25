@@ -160,17 +160,48 @@ def _sharp_mirror(nt):
     return b
 
 
+def glass_index(value):
+    """A glass index as stored: one value, or three (R, G, B) for dispersive glass."""
+    a = np.asarray(value, dtype=np.float64).ravel()
+    if a.size == 1:
+        return float(a[0])
+    if a.size == 3:
+        return tuple(float(x) for x in a)
+    raise ValueError(f"a glass index is one value or three (R, G, B), not {a.size}")
+
+
 def _glass_closure(nt, index):
+    """One index: a deterministic lossless dielectric (_single_glass). Three
+    indices (R, G, B): dispersive glass, still one deterministic closure, whose
+    index is picked by the view layer's "channel" property (0, 1, 2): the scene
+    renders one view layer per channel and the compositor keeps channel c of
+    layer c (colour_layers)."""
+    if not isinstance(index, tuple):
+        return _single_glass(nt, index)
+    attr = nt.nodes.new("ShaderNodeAttribute")
+    attr.attribute_type = "VIEW_LAYER"
+    attr.attribute_name = "channel"
+    ior = index[0]
+    for c in (1, 2):
+        ior = _math(nt, "MULTIPLY_ADD", _math(nt, "COMPARE", attr.outputs["Fac"], float(c), 0.5),
+                    index[c] - index[0], ior)
+    return _single_glass(nt, ior)
+
+
+def _single_glass(nt, index):
     """Deterministic lossless dielectric: pure refraction, or pure reflection
     under total internal reflection. Cycles' Refraction BSDF alone drops TIR
     paths, and the Glass BSDF picks Fresnel reflection at random, which would
-    corrupt a 1-sample pixel-ID calibration."""
+    corrupt a 1-sample pixel-ID calibration. index: a value or a socket."""
     refr = nt.nodes.new("ShaderNodeBsdfRefraction")
-    refr.inputs["IOR"].default_value = index
     refr.inputs["Roughness"].default_value = 0.0
     refr.inputs["Color"].default_value = (1, 1, 1, 1)
     fresnel = nt.nodes.new("ShaderNodeFresnel")
-    fresnel.inputs["IOR"].default_value = index
+    for socket in (refr.inputs["IOR"], fresnel.inputs["IOR"]):
+        if isinstance(index, float):
+            socket.default_value = index
+        else:
+            nt.links.new(index, socket)
     tir = nt.nodes.new("ShaderNodeMath")
     tir.operation = "GREATER_THAN"
     tir.inputs[1].default_value = 0.9999
@@ -239,7 +270,7 @@ def add_mla(cfg):
     m = np.load(cfg["mla_npz"])
     _, basis = pose_matrix(cfg)
     obj = link("MLA", panel_to_world(m["verts"], cfg), m["faces"], m["loop_normals"] @ basis,
-               glass("MLA_glass", cfg["index"]))
+               glass("MLA_glass", glass_index(cfg["index"])))
     if "face_lens" in m:
         attr = obj.data.attributes.new("lens", "FLOAT", "FACE")
         attr.data.foreach_set("value", m["face_lens"].astype(np.float32))
@@ -280,7 +311,7 @@ def add_remapper(cfg):
     for k in range(int(r["n_surfaces"])):
         kind = str(r[f"surf{k}_kind"])
         if kind == "glass":
-            mat = glass(f"REMAP{k}_glass", float(r[f"surf{k}_index"]))
+            mat = glass(f"REMAP{k}_glass", glass_index(r[f"surf{k}_index"]))
         elif kind == "mirror":
             mat = mirror(f"REMAP{k}_mirror")
         elif kind == "absorber":
@@ -294,7 +325,7 @@ def add_remapper(cfg):
         slot = np.zeros(len(obj.data.polygons), dtype=np.int32)
         for key, coating in (("mirror_faces", lambda: mirror(f"REMAP{k}_coating")),
                              ("half_mirror_faces", lambda: half_mirror(f"REMAP{k}_half_mirror",
-                                                                       float(r[f"surf{k}_index"]))),
+                                                                       glass_index(r[f"surf{k}_index"]))),
                              ("absorber_faces", lambda: absorber(f"REMAP{k}_blackened"))):
             if f"surf{k}_{key}" not in r:
                 continue
@@ -309,8 +340,98 @@ def add_remapper(cfg):
     return objs
 
 
-def add_panel(cfg, rgb):
-    """rgb: (N, N, 3) float, row j along +v, column i along +u. Emits along +w only."""
+def float_image(name, rgb):
+    """A packed float image (Non-Color) from (H, W, 3) values, row 0 at the bottom."""
+    h, w = rgb.shape[:2]
+    img = bpy.data.images.new(name, w, h, alpha=True, float_buffer=True)
+    # Changing the colorspace of a generated image rebuilds (and zeroes) its
+    # buffer, so it must be set before the pixels are written.
+    img.colorspace_settings.name = "Non-Color"
+    rgba = np.concatenate([rgb.astype(np.float32), np.ones((h, w, 1), np.float32)], axis=2).ravel()
+    img.pixels.foreach_set(rgba)
+    img.pack()
+    back = np.empty(rgba.size, np.float32)
+    img.pixels.foreach_get(back)
+    if not np.array_equal(back, rgba):
+        raise RuntimeError(f"image {name} pixels did not survive being written")
+    return img
+
+
+def _texture(nt, img, vector, interpolation):
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.image = img
+    tex.interpolation = interpolation
+    tex.extension = "CLIP"
+    nt.links.new(vector, tex.inputs["Vector"])
+    sep = nt.nodes.new("ShaderNodeSeparateColor")
+    nt.links.new(tex.outputs["Color"], sep.inputs["Color"])
+    return sep.outputs
+
+
+def _math(nt, op, a, b=None, c=None):
+    node = nt.nodes.new("ShaderNodeMath")
+    node.operation = op
+    for socket, value in zip(node.inputs, (a, b, c)):
+        if value is None:
+            continue
+        if isinstance(value, float):
+            socket.default_value = value
+        else:
+            nt.links.new(value, socket)
+    return node.outputs["Value"]
+
+
+def image_colour(img):
+    """Panel colour: the image itself, one texel per panel pixel."""
+    def colour(nt):
+        uv = nt.nodes.new("ShaderNodeTexCoord").outputs["UV"]
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = img
+        tex.interpolation = "Closest"
+        tex.extension = "CLIP"
+        nt.links.new(uv, tex.inputs["Vector"])
+        return tex.outputs["Color"]
+    return colour
+
+
+def stmap_colour(st):
+    """Panel colour through per-channel ST-maps. stmaps[c] holds, per panel pixel,
+    (u, v, seen): the content coordinate of the field direction the pixel must
+    show in channel c, over +/- wide_half_deg. Inside +/- fovea_half_deg the
+    fovea texture (finer) is shown instead of the wide one."""
+    stmaps = [float_image(f"STMAP_{c}", np.load(path)) for c, path in zip("RGB", st["stmaps"])]
+    wide, fovea = float_image("CONTENT_wide", np.load(st["wide_npy"])), float_image("CONTENT_fovea",
+                                                                                    np.load(st["fovea_npy"]))
+    k = st["wide_half_deg"] / st["fovea_half_deg"]
+    edge = 0.5 / k                                                     # the fovea's half-width in wide coordinates
+
+    def colour(nt):
+        uv = nt.nodes.new("ShaderNodeTexCoord").outputs["UV"]
+        channels = []
+        for c, img in enumerate(stmaps):
+            u, v, seen = _texture(nt, img, uv, "Closest")[:3]
+            xy = nt.nodes.new("ShaderNodeCombineXYZ")
+            nt.links.new(u, xy.inputs["X"])
+            nt.links.new(v, xy.inputs["Y"])
+            w = _texture(nt, wide, xy.outputs["Vector"], "Linear")[c]
+            fxy = nt.nodes.new("ShaderNodeCombineXYZ")
+            nt.links.new(_math(nt, "MULTIPLY_ADD", _math(nt, "SUBTRACT", u, 0.5), k, 0.5), fxy.inputs["X"])
+            nt.links.new(_math(nt, "MULTIPLY_ADD", _math(nt, "SUBTRACT", v, 0.5), k, 0.5), fxy.inputs["Y"])
+            f = _texture(nt, fovea, fxy.outputs["Vector"], "Linear")[c]
+            inside = _math(nt, "MULTIPLY", _math(nt, "LESS_THAN", _math(nt, "ABSOLUTE", _math(nt, "SUBTRACT", u, 0.5)), edge),
+                           _math(nt, "LESS_THAN", _math(nt, "ABSOLUTE", _math(nt, "SUBTRACT", v, 0.5)), edge))
+            mixed = _math(nt, "ADD", w, _math(nt, "MULTIPLY", inside, _math(nt, "SUBTRACT", f, w)))
+            channels.append(_math(nt, "MULTIPLY", mixed, seen))
+        rgb = nt.nodes.new("ShaderNodeCombineColor")
+        for socket, value in zip(rgb.inputs, channels):
+            nt.links.new(value, socket)
+        return rgb.outputs["Color"]
+    return colour
+
+
+def add_panel(cfg, colour):
+    """colour(nt) -> the panel's colour socket, row j along +v, column i along +u
+    of the UV square. Emits along +w only."""
     n = cfg["panel_pixels"]
     half = 0.5 * n * cfg["pixel_um"]
     w = -cfg["gap_um"]
@@ -322,26 +443,11 @@ def add_panel(cfg, rgb):
         uv.data[loop.index].uv = (s, t)
     obj = bpy.data.objects.new("PANEL", mesh)
     bpy.context.scene.collection.objects.link(obj)
-    img = bpy.data.images.new("panel_pixels", n, n, alpha=True, float_buffer=True)
-    # Changing the colorspace of a generated image rebuilds (and zeroes) its
-    # buffer, so it must be set before the pixels are written.
-    img.colorspace_settings.name = "Non-Color"
-    rgba = np.concatenate([rgb.astype(np.float32), np.ones((n, n, 1), np.float32)], axis=2).ravel()
-    img.pixels.foreach_set(rgba)
-    img.pack()
-    back = np.empty(rgba.size, np.float32)
-    img.pixels.foreach_get(back)
-    if not np.array_equal(back, rgba):
-        raise RuntimeError("panel image pixels did not survive being written")
 
     def build(nt):
-        tex = nt.nodes.new("ShaderNodeTexImage")
-        tex.image = img
-        tex.interpolation = "Closest"
-        tex.extension = "CLIP"
         em = nt.nodes.new("ShaderNodeEmission")
         em.inputs["Strength"].default_value = 1.0
-        nt.links.new(tex.outputs["Color"], em.inputs["Color"])
+        nt.links.new(colour(nt), em.inputs["Color"])
         dark = nt.nodes.new("ShaderNodeEmission")
         dark.inputs["Strength"].default_value = 0.0
         geo = nt.nodes.new("ShaderNodeNewGeometry")
@@ -535,6 +641,35 @@ def display(cfg, cam, tmp):
     return {"images": np.stack(images)}
 
 
+def colour_layers():
+    """Three view layers R, G, B with "channel" 0, 1, 2 (read by dispersive glass),
+    and a compositor that keeps channel c of layer c."""
+    sc = bpy.context.scene
+    layers = [sc.view_layers[0], sc.view_layers.new("G"), sc.view_layers.new("B")]
+    layers[0].name = "R"
+    ng = bpy.data.node_groups.new("combine_channels", "CompositorNodeTree")
+    ng.interface.new_socket("Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+    out = ng.nodes.new("NodeGroupOutput")
+    comb = ng.nodes.new("CompositorNodeCombineColor")
+    for c, vl in enumerate(layers):
+        vl["channel"] = float(c)
+        rl = ng.nodes.new("CompositorNodeRLayers")
+        rl.layer = vl.name
+        sep = ng.nodes.new("CompositorNodeSeparateColor")
+        ng.links.new(rl.outputs["Image"], sep.inputs["Image"])
+        ng.links.new(sep.outputs[c], comb.inputs[c])
+    ng.links.new(comb.outputs["Image"], out.inputs[0])
+    sc.compositing_node_group = ng
+
+
+def _any_dispersive(cfg):
+    indices = [cfg["index"]]
+    if cfg.get("remapper_npz"):
+        r = np.load(cfg["remapper_npz"])
+        indices += [r[f"surf{k}_index"] for k in range(int(r["n_surfaces"])) if f"surf{k}_index" in r]
+    return any(isinstance(glass_index(i), tuple) for i in indices)
+
+
 def main():
     cfg = json.loads(Path(sys.argv[sys.argv.index("--") + 1]).read_text())
     tmp = Path(cfg["tmp_dir"])
@@ -546,6 +681,11 @@ def main():
         np.savez_compressed(cfg["out_npz"], **result)
         print(f"LF_BLENDER_DONE {cfg['mode']} {cfg['out_npz']}")
         return
+    if cfg["mode"] in ("calibrate", "evaluate") and _any_dispersive(cfg):
+        raise ValueError(f"{cfg['mode']} renders pixel ids along one path per camera ray: "
+                         "a dispersive (three-index) glass picks one at random")
+    if _any_dispersive(cfg):
+        colour_layers()
     add_eye_reference()
     if "mla_npz" in cfg:                  # a plain display (no lenslets) has none
         add_mla(cfg)
@@ -559,8 +699,12 @@ def main():
         # reaches the panel through no lens reads 0, i.e. no lens, not lens 0
         rgb = np.stack([np.zeros_like(i), i + 1, j + 1], axis=-1).astype(np.float32)
     else:  # display, build
-        rgb = np.load(cfg["panel_image_npy"])
-    add_panel(cfg, rgb)
+        rgb = None
+    if rgb is None and "panel_stmap" in cfg:
+        colour = stmap_colour(cfg["panel_stmap"])
+    else:
+        colour = image_colour(float_image("panel_pixels", np.load(cfg["panel_image_npy"]) if rgb is None else rgb))
+    add_panel(cfg, colour)
     cam = add_camera(cfg)
     if cfg.get("save_blend"):
         bpy.ops.wm.save_as_mainfile(filepath=cfg["save_blend"])

@@ -129,9 +129,10 @@ def validate_surfaces(remapper):
 
 
 def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5, resolution=2048,
-                 fov_deg=76.0, subdivisions=2):
+                 fov_deg=76.0, subdivisions=2, mla_index=INDEX):
     """The Cycles pass alone: per pupil view, the panel pixel and the entered lens
-    of every camera ray (work/views). Returns the design, remapper path, lenslet
+    of every camera ray (work/views). The lenslets are built for INDEX and render
+    at mla_index (another wavelength). Returns the design, remapper path, lenslet
     mesh, air gap, lenslet summary and the views."""
     design_dir, work = Path(design_dir), Path(work)
     design = json.loads((design_dir / "design.json").read_text())
@@ -143,7 +144,7 @@ def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_
              face_lens=mesh.face_lens, face_wall=mesh.face_lens == mla_mesh.WALL)
     views = lp.hex_views_mm(view_spacing_mm, 2.0)
     cfg = {
-        "mode": "evaluate", "mla_npz": str(work / "mla_mesh.npz"), "index": INDEX,
+        "mode": "evaluate", "mla_npz": str(work / "mla_mesh.npz"), "index": mla_index,
         "panel_pose": design["panel_pose"], "gap_um": gap, "panel_pixels": panel_pixels,
         "pixel_um": PIXEL_UM, "camera": {"resolution": resolution, "fov_deg": fov_deg},
         "views_mm": views.tolist(), "tmp_dir": str(work / "views"), "remapper_npz": str(remapper),

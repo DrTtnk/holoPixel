@@ -837,3 +837,14 @@ black (a black matrix and mount); only the floor stays glass. Ghost mean
 0.044 -> 0.012, p90 0.148 -> 0.000; what stray light is left (0.28 %) enters
 sideways through the 33 um panel gap at the very edge. A field stop near the
 eye cannot do this job: the 4 mm pupil blurs its edge over ~20 deg.
+
+## Dispersion as a sum of tinted closures is noise, not colour
+
+The first dispersive glass summed three refraction closures tinted R, G and B,
+each at its own index. Cycles picks one closure per surface at random, so a
+path survives only if it picks the same channel at every glass surface: with
+~4 surfaces (lens, half-mirror passes, lenslets) only (1/3)^3 of the paths
+did, and a 64-sample display render was mostly colour noise. A wedge-prism
+test (2 surfaces) had passed and hid it. Now the index is chosen by a
+view-layer attribute ("channel"): three view layers render with fixed indices
+and the compositor takes channel c from layer c. Deterministic and clean.

@@ -83,6 +83,11 @@ python ../scripts/lf_evaluate.py <design_dir> --pixels 2560
 # (the latter needs the lf_evaluate run above, it reuses <design_dir>/evaluation)
 python ../scripts/hmd_view.py <design_dir> <out_dir> --work <scratch> [--aperture-mm 4]
 python ../scripts/hmd_encoded.py <design_dir> <out_dir> --work <scratch>   # --fovea: true-size +/-5 deg crop, bar chart
+# one display scene per design, in colour: dispersive glass (N-LASF46B lens, silica lenslets,
+# narrow-band R G B), panel content through per-channel ST-maps; then all scenes in one file
+python ../scripts/design_scenes.py scene <name> pancake freeform_mirror/results_pancake/best_pancake_el1_glass_spline4.json <out>
+python ../scripts/design_scenes.py blend <name> <out>        # save the scene again from its calibration
+blender -b --factory-startup --python ../scripts/combine_scenes.py -- <out>/designs.blend <name>=<out>/<name>/<name>.blend ...
 # foveal inset: the whole panel over +/- 10 deg through a moulded singlet or achromat (CPU)
 python foveal_inset/inset_study.py <out>
 ```
