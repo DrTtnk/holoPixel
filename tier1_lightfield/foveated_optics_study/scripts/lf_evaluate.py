@@ -19,7 +19,8 @@ centre), its angular blur (RMS width of the beams of its pixels, what the eye
 perceives; the RMS spread over the whole pupil is kept as a diagnostic), its pupil fill
 (fraction of pupil points that see it) and its landing offset at the panel
 (the chief ray's tilt there). A ghost is a ray landing on a pixel that is also
-reached through a lens more than 3 pitches away. Pitches are the foveation
+reached through a lens more than 3 pitches away, or by stray light (a ray
+through no lens, or more than STRAY_DEG from its lens's direction). Pitches are the foveation
 target's lens pitch at the lens's own field direction. Blur is reported in
 units of what the eye could see there (foveation_target.blur_tolerance_rad:
 the retinal pitch, clipped at the RMS diffraction blur of the 4 mm pupil).
@@ -45,6 +46,11 @@ SIDE_UM, PIXEL_UM, INDEX, MIN_THICKNESS_UM = (spec.LENS_SIDE_UM, spec.PIXEL_UM, 
                                               spec.LENS_MIN_THICKNESS_UM)
 FOV_X_DEG, FOV_Z_DEG = 35.0, 22.5
 HEX_RMS_PITCH = math.sqrt(5.0 / 12.0) / math.sqrt(3.0)
+# A ray this far from its lens's chief direction is stray light, not the lens's
+# light field: pupil parallax keeps a lens's own rays within ~5 deg (99.99 % of
+# them on the spline pancake), and 10 deg would need a virtual image nearer
+# than ~11 mm; the stray rays measured there sit at 20 to 63 deg.
+STRAY_DEG = 10.0
 
 ACCEPT = {
     "coverage_min": 0.98,
@@ -183,12 +189,25 @@ def lenslet_array(design, panel_um, subdivisions):
                               "focal_um_range": [float(v.focal_um.min()), float(v.focal_um.max())]}
 
 
+def _group_median(keys, values, n):
+    """Per key in range(n), the median of its values; 0 for a key without any."""
+    order = np.lexsort((values, keys))
+    k, v = keys[order], values[order]
+    count = np.bincount(k, minlength=n)
+    start = np.cumsum(count) - count
+    has = count > 0
+    out = np.zeros(n)
+    out[has] = 0.5 * (v[(start + (count - 1) // 2)[has]] + v[(start + count // 2)[has]])
+    return out
+
+
 def metrics(view_dir, views, centres, panel_pixels):
     """Rays are grouped by the lens they ENTER (read from Cycles), not by the lens
     above the pixel they land on: with a tilted chief ray a lens's pupil cone
     lands under its neighbour, and that is correct, not crosstalk.
 
-    Per lens: chief direction (mean of the pupil-centre rays), blur (ray-weighted
+    Per lens: chief direction (median of the pupil-centre rays, so one stray ray
+    cannot move it), blur (ray-weighted
     RMS width of the beams of the pixels it lights, what the eye perceives),
     lens spread (RMS angle of all its pupil rays about its direction: full-pupil
     focus, a diagnostic that is stricter than perception whenever each pixel
@@ -196,7 +215,10 @@ def metrics(view_dir, views, centres, panel_pixels):
     landing offset (pupil-centre landing point minus lens centre: the chief
     ray's tilt at the panel, in um). A ghost is a ray whose pixel is also reached
     through a lens more than 3 pitches away: that pixel must serve two field
-    directions, so one of them sees wrong content."""
+    directions, so one of them sees wrong content. Stray light (a ray that
+    reaches a pixel through no lens, or more than STRAY_DEG from its lens's
+    chief direction) is left out of every lens metric, makes its pixel a ghost
+    pixel, and counts as a ghost of the lens it entered."""
     d = _unit(np.load(view_dir / "direction.npy").astype(np.float64)).reshape(-1, 3)
     n_lens, n_views = len(centres), len(views)
     order = np.argsort(np.linalg.norm(views, axis=1))
@@ -206,14 +228,23 @@ def metrics(view_dir, views, centres, panel_pixels):
     def rays(k):
         pix = np.load(view_dir / f"pix_{k}.npy").ravel()
         ent = np.load(view_dir / f"entered_{k}.npy").ravel()
-        ok = (pix >= 0) & (ent >= 0)
+        ok = pix >= 0
         return np.nonzero(ok)[0], pix[ok], ent[ok]
 
+    def stray(idx, ent):
+        """Rays through no lens, or far from their lens's chief direction."""
+        lens = np.maximum(ent, 0)
+        far = chief[lens] & (np.einsum("ij,ij->i", d[idx], mean[lens]) < math.cos(math.radians(STRAY_DEG)))
+        return (ent < 0) | far
+
     idx, pix, ent = rays(order[0])
-    count = np.bincount(ent, minlength=n_lens)
-    mean = np.stack([np.bincount(ent, weights=d[idx, c], minlength=n_lens) for c in range(3)], axis=1)
-    chief = count > 0
+    lensed = ent >= 0
+    mean = np.stack([_group_median(ent[lensed], d[idx[lensed], c], n_lens) for c in range(3)], axis=1)
+    chief = np.bincount(ent[lensed], minlength=n_lens) > 0
     mean[chief] = _unit(mean[chief])
+    good = ~stray(idx, ent)
+    idx, pix, ent = idx[good], pix[good], ent[good]
+    count = np.bincount(ent, minlength=n_lens)
     pitch = np.where(chief, ft.target_pitch_rad(*np.radians(_field_deg(mean))), np.inf)
     uv = np.column_stack([(pix % panel_pixels + 0.5) * PIXEL_UM, (pix // panel_pixels + 0.5) * PIXEL_UM])
     uv -= panel_pixels * PIXEL_UM / 2
@@ -224,9 +255,15 @@ def metrics(view_dir, views, centres, panel_pixels):
     conflict = np.zeros(panel_pixels**2, dtype=bool)
     pix_sum = np.zeros((panel_pixels**2, 3))
     pix_n = np.zeros(panel_pixels**2)
-    seen, total, sq_all = (np.zeros(n_lens) for _ in range(3))
+    seen, total, sq_all, delivered = (np.zeros(n_lens) for _ in range(4))
+    n_stray = n_reach = 0
     for k in order:
         idx, pix, ent = rays(k)
+        bad = stray(idx, ent)
+        conflict[pix[bad]] = True
+        n_stray, n_reach = n_stray + int(bad.sum()), n_reach + len(pix)
+        delivered += np.bincount(ent[ent >= 0], minlength=n_lens)     # every ray a lens sends, stray or not
+        idx, pix, ent = idx[~bad], pix[~bad], ent[~bad]
         for c in range(3):
             pix_sum[:, c] += np.bincount(pix, weights=d[idx, c], minlength=panel_pixels**2)
         pix_n += np.bincount(pix, minlength=panel_pixels**2)
@@ -245,7 +282,8 @@ def metrics(view_dir, views, centres, panel_pixels):
     ghosts = np.zeros(n_lens)
     for k in order:
         _, pix, ent = rays(k)
-        ghosts += np.bincount(ent[conflict[pix]], minlength=n_lens)
+        lensed = ent >= 0
+        ghosts += np.bincount(ent[lensed & conflict[pix]], minlength=n_lens)
 
     valid = chief & (total > 0) & _in_fov(mean)
     lens_spread_rad = np.sqrt(sq_all[valid] / total[valid])
@@ -276,7 +314,7 @@ def metrics(view_dir, views, centres, panel_pixels):
     blur = blur_rad / tolerance
     lens_spread = lens_spread_rad / tolerance
     fill = seen[valid] / n_views
-    ghost = ghosts[valid] / total[valid]
+    ghost = ghosts[valid] / delivered[valid]
     landing_um = np.linalg.norm(offset[valid], axis=1)
     inl = total
 
@@ -298,7 +336,8 @@ def metrics(view_dir, views, centres, panel_pixels):
     fov_rays = np.nonzero(_in_fov(d))[0]
     reached = []
     for k in order:
-        idx, _, _ = rays(k)
+        idx, _, ent = rays(k)
+        idx = idx[ent >= 0]
         reached.append(np.isin(fov_rays, idx, assume_unique=True).mean())
     throughput = float(np.mean(reached))
 
@@ -325,6 +364,7 @@ def metrics(view_dir, views, centres, panel_pixels):
         "lens_spread_pitch": {"median": pct(lens_spread, 50), "p90": pct(lens_spread, 90)},
         "fill": {"p10": pct(fill, 10), "median": pct(fill, 50)},
         "ghost": {"mean": float(ghost.mean()), "p90": pct(ghost, 90)},
+        "stray": {"fraction": n_stray / n_reach},
         "landing_offset_um": {"median": pct(landing_um, 50), "p90": pct(landing_um, 90)},
     }
 

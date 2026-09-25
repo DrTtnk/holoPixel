@@ -785,13 +785,35 @@ later. A 1e-9 widening of the barycentric test fixed it. A synthetic sheet with
 the same grid did not reproduce the miss, so the regression test is the real
 exported design (test_export_fold, stored_spline).
 
-## Cycles evaluation spends 90 % of its time off the GPU
+## Cycles evaluation spent 90 % of its time building a light tree
 
-lf_evaluate ran at ~10 s per view with the GPU at 0 % almost always: the
-render itself takes ~1 s. `render.use_persistent_data` is not set, and the
-lenslet material changes (glass, lens id, glass) inside the view loop, so
-Cycles rebuilds the 1.2 GB lenslet BVH and shaders for each of the 123 renders.
-Also: several evaluations run in parallel fit easily (9 GB RAM each, 2 GB VRAM).
+lf_evaluate ran at ~10 s per view with the GPU at 0 % almost always. The first
+guess (the BVH rebuilt because persistent data was off and the lenslet material
+changed inside the view loop) was only a small part: persistent data plus one
+material change took the pixel render from 3.5 to 2.2 s, but the lens-id render
+stayed at ~20 s. `--debug-cycles` showed the cause: "Use light tree with
+10629172 emitters". The lens-id material is an Emission shader, so every
+lenslet face became a light, and Cycles rebuilt the light tree for each render.
+`mat.cycles.emission_sampling = "NONE"` (camera rays still see the emission)
+took it to 1.6 s with bit-identical output. Profile with --debug-cycles before
+guessing. Several evaluations also fit in parallel (9 GB RAM, 2 GB VRAM each).
+
+## The lens-id render read a ray that reached the panel through no lens as lens 0
+
+In evaluate mode the panel emitted (1, i + 1, j + 1) and the lens-id render
+decodes red - 1 as the lens: a ray that reached the panel without passing any
+lens read as lens 0 (the panel corner). ~6000 edge-of-field rays per view
+landed on lens 0. The panel now emits red 0 in evaluate mode.
+
+## One stray ray moved a lens's direction by 5 deg and made a streak
+
+The asymmetric high-ratio streaks of the spline pancake were not a tear in the
+map: single out-of-field rays (|tx| ~ 37 deg) entered ordinary lenses, and with
+~10 rays per lens the MEAN direction moved by ~5 deg; the neighbours' spacing
+ratio then read 8 to 30. The ghost test also missed them: it needed a second
+lens, not a second direction. The chief direction is now the median, and a ray
+through no lens or more than STRAY_DEG (10 deg) from its lens's direction is
+stray light: out of every lens metric, a ghost pixel, and a "stray" fraction.
 
 ## The pipeline has no dispersion
 

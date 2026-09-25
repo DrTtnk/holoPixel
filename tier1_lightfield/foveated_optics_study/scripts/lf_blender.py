@@ -34,7 +34,7 @@ Modes:
              panel pixel each camera ray lands on, plus each view's world ray
              directions. Cameras use a lens shift to frame the panel.
   evaluate   per view, saved to disk: the panel pixel each camera ray reaches
-             (panel emits (1, i + 1, j + 1)), and the lens it enters (second
+             (panel emits (0, i + 1, j + 1)), and the lens it enters (second
              render, MLA opaque, emitting lens + 1 from its face attribute).
              Cameras keep a fixed orientation, so one direction render serves
              every view.
@@ -62,6 +62,7 @@ def setup(cfg):
     u = sc.unit_settings
     u.system, u.scale_length, u.length_unit = "METRIC", 0.001, "MILLIMETERS"
     sc.render.engine = "CYCLES"
+    sc.render.use_persistent_data = True         # keep the BVH between the many renders of one scene
     prefs = bpy.context.preferences.addons["cycles"].preferences
     prefs.compute_device_type = "OPTIX"
     prefs.get_devices()
@@ -259,7 +260,11 @@ def lens_id_material():
         nt.links.new(a.outputs["Fac"], add.inputs[0])
         nt.links.new(add.outputs["Value"], em.inputs["Color"])
         return em.outputs["Emission"]
-    return node_material("MLA_lens_id", build)
+    mat = node_material("MLA_lens_id", build)
+    # seen by camera rays only: as a light, each of the ~10 M lenslet faces would
+    # enter a light tree that Cycles rebuilds for every render (~20 s each)
+    mat.cycles.emission_sampling = "NONE"
+    return mat
 
 
 def add_remapper(cfg):
@@ -482,22 +487,23 @@ def _decode(channel, what, k):
 def evaluate(cfg, cam, out_dir):
     """Per view: the panel pixel each camera ray reaches (pix_k, flat j*N+i), and
     the lens it enters (entered_k), read from a second render in which the MLA
-    is opaque and emits its own lens id."""
+    is opaque and emits its own lens id. All pixel renders first, then all lens
+    renders: the material changes once, not twice per view."""
     sc = bpy.context.scene
     sc.cycles.samples = 1
     sc.cycles.filter_width = 0.01
     n = cfg["panel_pixels"]
     mla = bpy.data.objects["MLA"]
-    glass_mat, id_mat = mla.data.materials[0], lens_id_material()
     for k, view in enumerate(cfg["views_mm"]):
         place(cam, view, None)
         a = render(out_dir / f"eval_{k}.exr")
         i, j = _decode(a[:, :, 1], "pixel column", k), _decode(a[:, :, 2], "pixel row", k)
         np.save(out_dir / f"pix_{k}.npy", np.where((i >= 0) & (j >= 0), j * n + i, -1).astype(np.int32))
-        mla.data.materials[0] = id_mat
+    mla.data.materials[0] = lens_id_material()
+    for k, view in enumerate(cfg["views_mm"]):
+        place(cam, view, None)
         a = render(out_dir / f"entered_{k}.exr")
         np.save(out_dir / f"entered_{k}.npy", _decode(a[:, :, 0], "entered lens", k))
-        mla.data.materials[0] = glass_mat
     hide_all_meshes()
     direction_world()
     place(cam, cfg["views_mm"][0], None)
@@ -544,7 +550,9 @@ def main():
     if cfg["mode"] == "calibrate":
         rgb = np.stack([i, j, np.ones_like(i)], axis=-1).astype(np.float32)
     elif cfg["mode"] == "evaluate":
-        rgb = np.stack([np.ones_like(i), i + 1, j + 1], axis=-1).astype(np.float32)
+        # red 0: in the lens-id render (MLA opaque, emitting lens + 1) a ray that
+        # reaches the panel through no lens reads 0, i.e. no lens, not lens 0
+        rgb = np.stack([np.zeros_like(i), i + 1, j + 1], axis=-1).astype(np.float32)
     else:  # display, build
         rgb = np.load(cfg["panel_image_npy"])
     add_panel(cfg, rgb)

@@ -114,3 +114,65 @@ def test_glass_with_one_flipped_face_is_rejected(tmp_path):
              surf0_faces=bad)
     with pytest.raises(ValueError, match="inconsistent"):
         ev.validate_surfaces(tmp_path / "bad.npz")
+
+
+def _unit(v):
+    v = np.asarray(v, dtype=float)
+    return v / np.linalg.norm(v)
+
+
+# lens 0: four rays near +y on pixel 5 in every view; lens 1, its neighbour, one ray on pixel 9
+_LENS0 = [_unit([0.0, 1.0, 0.0]), _unit([0.0, 1.0, 0.0]), _unit([-1e-4, 1.0, 0.0]), _unit([1e-4, 1.0, 0.0])]
+_LENS1 = _unit([1e-3, 1.0, 0.0])
+_STRAY = _unit([0.5, 1.0, 0.0])                                       # 27 deg away: no pupil parallax reaches it
+
+
+def _stray_case(tmp_path, stray_lens, stray_pixel):
+    """Every view: lens 0's four rays and lens 1's one; the pupil-centre view
+    also has one ray from _STRAY that enters stray_lens (-1: no lens) and lands
+    on stray_pixel. Returns the report and the per-lens arrays."""
+    views = lp.hex_views_mm(0.5, 2.0)
+    centre = int(np.argmin(np.linalg.norm(views, axis=1)))
+    direction = np.array([_LENS0 + [_STRAY, _LENS1]])
+
+    def per_view(k):
+        at_centre = k == centre
+        return ([[0, 0, 0, 0, stray_lens if at_centre else -1, 1]],
+                [[5, 5, 5, 5, stray_pixel if at_centre else -1, 9]])
+
+    _write(tmp_path, views, direction, per_view)
+    rep = ev.metrics(tmp_path, views, _centres(), PIXELS)
+    return rep, dict(np.load(tmp_path.parent / "per_lens.npz")), len(views)
+
+
+def test_a_stray_ray_through_a_lens_is_a_ghost_and_does_not_move_the_lens(tmp_path):
+    """A ray far from its lens's direction (more than STRAY_DEG) is stray light:
+    its pixel shows wrong content, so it is a ghost of that lens even though no
+    other lens reaches the pixel, and it must not pull the lens's direction."""
+    rep, per, n = _stray_case(tmp_path, stray_lens=0, stray_pixel=11)
+    assert per["mean"][0] == pytest.approx([0.0, 1.0, 0.0], abs=1e-12)
+    ghost = dict(zip(per["lens"].tolist(), per["ghost"].tolist()))
+    assert ghost[0] == pytest.approx(1.0 / (4 * n + 1)) and ghost[1] == 0.0
+    assert rep["stray"]["fraction"] == pytest.approx(1.0 / (5 * n + 1))
+
+
+def test_a_ray_that_reaches_the_panel_through_no_lens_makes_its_pixel_a_ghost(tmp_path):
+    """A ray that lands on lens 0's pixel without passing through any lens: the
+    eye sees that pixel from a second, wrong direction, so all of lens 0's rays
+    there are ghosts; the stray ray adds nothing to the lens's blur."""
+    clean, clean_per, n = _stray_case(tmp_path, stray_lens=-1, stray_pixel=-1)
+    rep, per, _ = _stray_case(tmp_path, stray_lens=-1, stray_pixel=5)
+    ghost = dict(zip(per["lens"].tolist(), per["ghost"].tolist()))
+    assert ghost[0] == 1.0 and ghost[1] == 0.0
+    assert rep["stray"]["fraction"] == pytest.approx(1.0 / (5 * n + 1))
+    assert clean["stray"]["fraction"] == 0.0
+    assert np.array_equal(per["blur_rad"], clean_per["blur_rad"])
+
+
+def test_group_median_is_numpys_median_of_each_group():
+    rng = np.random.default_rng(5)
+    keys = rng.integers(0, 40, 1000)
+    values = rng.normal(size=1000)
+    got = ev._group_median(keys, values, 45)
+    for k in range(45):
+        assert got[k] == (np.median(values[keys == k]) if (keys == k).any() else 0.0)
