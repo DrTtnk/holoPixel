@@ -86,8 +86,11 @@ python ../scripts/hmd_encoded.py <design_dir> <out_dir> --work <scratch>   # --f
 # one display scene per design, in colour: dispersive glass (N-LASF46B lens, silica lenslets,
 # narrow-band R G B), panel content through per-channel ST-maps; then all scenes in one file
 python ../scripts/design_scenes.py scene <name> pancake freeform_mirror/results_pancake/best_pancake_el1_glass_spline4.json <out>
+python ../scripts/design_scenes.py targets <out>             # once: the depth scene (sphere 0.35 m, cube 0.7 m, backdrop 6 m) per pupil view
 python ../scripts/design_scenes.py blend <name> <out>        # save the scene again from its calibration
+python ../scripts/design_scenes.py scene-panel <name> <out>  # encode the depth scene for an already calibrated design
 blender -b --factory-startup --python ../scripts/combine_scenes.py -- <out>/designs.blend <name>=<out>/<name>/<name>.blend ...
+# in the file: EYE (fisheye ~160 deg) and FOVEA (12 deg) cameras with a 4 mm pupil; the panel's CONTENT_SWITCH: 0 charts, 1 depth scene
 # foveal inset: the whole panel over +/- 10 deg through a moulded singlet or achromat (CPU)
 python foveal_inset/inset_study.py <out>
 ```

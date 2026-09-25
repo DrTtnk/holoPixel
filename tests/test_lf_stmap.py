@@ -77,3 +77,31 @@ def test_each_channel_shows_its_own_map_and_the_fovea_its_window(tmp_path):
     outside = slice(int(RES * 0.02), int(RES * 0.12))                  # columns at tx ~ -13 deg: wide texture only
     row = int(np.argmin(np.abs(angle - FOVEA_LINE_TZ)))
     assert image[row - 3:row + 4, outside, 1].max() < 0.05
+
+
+@pytest.mark.parametrize("switch", [0.0, 1.0])
+def test_the_content_switch_picks_the_grids_or_the_scene_panel(tmp_path, switch):
+    """CONTENT_SWITCH 0 shows the ST-map grids, 1 the baked scene panel image
+    (one texel per panel pixel)."""
+    wide, fovea = np.zeros((90, 90, 3), np.float32), np.zeros((100, 100, 3), np.float32)
+    wide[...] = (0.9, 0.1, 0.1)
+    np.save(tmp_path / "wide.npy", wide)
+    np.save(tmp_path / "fovea.npy", fovea + wide[:1, :1])
+    scene = np.zeros((N, N, 3), np.float32)
+    scene[...] = (0.1, 0.3, 0.8)
+    np.save(tmp_path / "scene.npy", scene)
+    paths = []
+    for c in range(3):
+        paths.append(str(tmp_path / f"st{c}.npy"))
+        np.save(paths[-1], _stmap(0.0))
+    cfg = {"mode": "display", "index": 1.5,
+           "panel_pose": {"origin_mm": [0.0, P + L, 0.0], "basis": [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]},
+           "gap_um": 0.0, "panel_pixels": N, "pixel_um": PIXEL_UM,
+           "camera": {"resolution": 64, "fov_deg": FOV_DEG}, "views_mm": [[0.0, 0.0]],
+           "tmp_dir": str(tmp_path / "exr"), "out_npz": str(tmp_path / "out.npz"),
+           "panel_stmap": {"stmaps": paths, "wide_npy": str(tmp_path / "wide.npy"), "wide_half_deg": WIDE_HALF,
+                           "fovea_npy": str(tmp_path / "fovea.npy"), "fovea_half_deg": FOVEA_HALF,
+                           "scene": {"npy": str(tmp_path / "scene.npy"), "switch": switch}},
+           "display": {"samples": 4, "filter_width_px": 1.0, "aperture_radius_mm": 0.0, "focus_distance_mm": 1e6}}
+    centre = lp.run_blender(cfg, tmp_path)["images"][0][32, 32]
+    assert centre == pytest.approx((0.1, 0.3, 0.8) if switch else (0.9, 0.1, 0.1), abs=1e-3)

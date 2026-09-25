@@ -2,9 +2,13 @@
 
     blender -b --factory-startup --python combine_scenes.py -- <out.blend> <name>=<scene.blend> ...
 
-Each scene keeps its remapper, lenslet array, ST-map panel and wide pinhole
-camera, and gains a foveal pinhole camera (FOVEA_FOV_DEG) at the same pupil
-centre. Scenes whose lenslet meshes are identical share one mesh block, and the
+Each scene keeps its remapper, lenslet array and ST-map panel. Its camera
+becomes the eye: a fisheye over about the monocular field of view (EYE_FOV_DEG
+across, EYE_RES), with a PUPIL_MM pupil; a second, foveal camera (FOVEA_FOV_DEG,
+perspective) has the same pupil. Both focus at infinity; set the focus distance
+to look at the depth scene's sphere (0.35 m) or cube (0.7 m). The panel's
+CONTENT_SWITCH value picks the resolution charts (0) or the depth scene (1).
+Scenes whose lenslet meshes are identical share one mesh block, and the
 content textures, the same in every scene, are shared too.
 """
 import sys
@@ -13,7 +17,20 @@ import bpy
 import numpy as np
 
 FOVEA_FOV_DEG = 12.0
+EYE_FOV_DEG = 160.0               # monocular field: ~160 deg across, ~130 deg high
+EYE_RES = (1600, 1300)            # 0.1 deg per pixel on the fisheye
+PUPIL_MM = 4.0
+FOCUS_MM = 1e6                    # infinity
 SAMPLES = 64
+
+
+def _pupil(cam):
+    """A PUPIL_MM aperture focused at FOCUS_MM. Cycles: radius [scene units] =
+    lens[mm] * 1e-3 / (2 * fstop), whatever the unit scale (useful_knowledge.md)."""
+    cam.data.dof.use_dof = True
+    cam.data.dof.aperture_fstop = cam.data.lens * 1e-3 / PUPIL_MM
+    cam.data.dof.focus_distance = FOCUS_MM
+    cam.data.dof.aperture_blades = 0
 
 
 def _mesh_key(mesh):
@@ -34,13 +51,19 @@ def main():
             dst.scenes = list(src.scenes)
         scene = dst.scenes[0]
         scene.name = name
-        wide = scene.camera
-        wide.name = f"{name}_WIDE_CAMERA"
-        fovea = wide.copy()
-        fovea.data = wide.data.copy()
+        eye = scene.camera
+        eye.name = f"{name}_EYE_CAMERA"
+        fovea = eye.copy()
+        fovea.data = eye.data.copy()
         fovea.name = f"{name}_FOVEA_CAMERA"
         fovea.data.angle = np.radians(FOVEA_FOV_DEG)
         scene.collection.objects.link(fovea)
+        eye.data.type = "PANO"
+        eye.data.panorama_type = "FISHEYE_EQUIDISTANT"
+        eye.data.fisheye_fov = np.radians(EYE_FOV_DEG)
+        for cam in (eye, fovea):
+            _pupil(cam)
+        scene.render.resolution_x, scene.render.resolution_y = EYE_RES
         scene.cycles.samples = SAMPLES
         scene.cycles.filter_width = 1.0
         for obj in scene.objects:
@@ -49,6 +72,8 @@ def main():
         for img in bpy.data.images:
             if img.name.startswith("STMAP_"):
                 img.name = f"{name}_{img.name}"
+            elif img.name.split(".")[0] == "CONTENT_scene_panel":
+                img.name = f"{name}_SCENE_PANEL"          # per design: the depth scene encoded for its optics
     bpy.data.scenes.remove(empty)
     shared = {}
     for mesh in list(bpy.data.meshes):

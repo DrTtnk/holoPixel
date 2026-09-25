@@ -398,10 +398,13 @@ def stmap_colour(st):
     """Panel colour through per-channel ST-maps. stmaps[c] holds, per panel pixel,
     (u, v, seen): the content coordinate of the field direction the pixel must
     show in channel c, over +/- wide_half_deg. Inside +/- fovea_half_deg the
-    fovea texture (finer) is shown instead of the wide one."""
+    fovea texture (finer) is shown instead of the wide one. With st["scene"]
+    ({"npy", "switch"}), a Value node CONTENT_SWITCH mixes in a baked panel
+    image (one texel per panel pixel): 0 the ST-map content, 1 the image."""
     stmaps = [float_image(f"STMAP_{c}", np.load(path)) for c, path in zip("RGB", st["stmaps"])]
     wide, fovea = float_image("CONTENT_wide", np.load(st["wide_npy"])), float_image("CONTENT_fovea",
                                                                                     np.load(st["fovea_npy"]))
+    scene = float_image("CONTENT_scene_panel", np.load(st["scene"]["npy"])) if "scene" in st else None
     k = st["wide_half_deg"] / st["fovea_half_deg"]
     edge = 0.5 / k                                                     # the fovea's half-width in wide coordinates
 
@@ -425,7 +428,22 @@ def stmap_colour(st):
         rgb = nt.nodes.new("ShaderNodeCombineColor")
         for socket, value in zip(rgb.inputs, channels):
             nt.links.new(value, socket)
-        return rgb.outputs["Color"]
+        if scene is None:
+            return rgb.outputs["Color"]
+        switch = nt.nodes.new("ShaderNodeValue")
+        switch.name = switch.label = "CONTENT_SWITCH"
+        switch.outputs[0].default_value = float(st["scene"]["switch"])
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = scene
+        tex.interpolation = "Closest"
+        tex.extension = "CLIP"
+        nt.links.new(uv, tex.inputs["Vector"])
+        mix = nt.nodes.new("ShaderNodeMix")
+        mix.data_type = "RGBA"
+        nt.links.new(switch.outputs[0], mix.inputs["Factor"])
+        nt.links.new(rgb.outputs["Color"], mix.inputs["A"])
+        nt.links.new(tex.outputs["Color"], mix.inputs["B"])
+        return mix.outputs["Result"]
     return colour
 
 
@@ -516,6 +534,18 @@ def target(cfg, cam, tmp):
     return {"images": np.stack(images)}
 
 
+def target_views(cfg, cam, tmp):
+    """The virtual content alone along the evaluate cameras' rays (no lens shift):
+    tmp/target_k.npy per view, (res, res, 3), row 0 at the bottom."""
+    sc = bpy.context.scene
+    sc.cycles.samples = 1
+    sc.cycles.filter_width = 0.01
+    for k, view in enumerate(cfg["views_mm"]):
+        place(cam, view, None)
+        np.save(tmp / f"target_{k}.npy", render(tmp / f"target_{k}.exr")[:, :, :3])
+    return {"n_views": np.array(len(cfg["views_mm"]))}
+
+
 def add_camera(cfg):
     cam = bpy.data.objects.new("PUPIL_CAMERA", bpy.data.cameras.new("PUPIL_CAMERA"))
     bpy.context.scene.collection.objects.link(cam)
@@ -524,7 +554,7 @@ def add_camera(cfg):
     cam.data.sensor_fit = "HORIZONTAL"
     cam.data.angle = math.radians(cfg["camera"]["fov_deg"])
     cam.data.clip_start = 0.01
-    cam.data.clip_end = 1000.0
+    cam.data.clip_end = 1e5                      # content out to 100 m
     return cam
 
 
@@ -675,9 +705,9 @@ def main():
     tmp = Path(cfg["tmp_dir"])
     tmp.mkdir(parents=True, exist_ok=True)
     setup(cfg)
-    if cfg["mode"] == "target":
+    if cfg["mode"] in ("target", "target_views"):
         add_content(cfg["content"])
-        result = target(cfg, add_camera(cfg), tmp)
+        result = (target if cfg["mode"] == "target" else target_views)(cfg, add_camera(cfg), tmp)
         np.savez_compressed(cfg["out_npz"], **result)
         print(f"LF_BLENDER_DONE {cfg['mode']} {cfg['out_npz']}")
         return

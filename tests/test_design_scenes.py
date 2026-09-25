@@ -55,3 +55,38 @@ def test_a_channel_design_carries_that_channels_glass_index(tmp_path):
         assert json.loads((out / "design.json").read_text()) == {"remapper_npz": "remapper.npz", "x": 1}
     dispersive = np.load(ds.dispersive_remapper(design, tmp_path / "disp.npz"))
     assert tuple(dispersive["surf1_index"]) == pytest.approx(dp.channel_indices(1.9, ds.LENS_MATERIAL), rel=1e-12)
+
+
+def test_a_scene_panel_channel_is_the_mean_target_colour_of_the_rays_that_reach_each_pixel(tmp_path):
+    """View 0 sees colours (1, .5, .2) and (0, 0, 1) on camera pixels 0 and 1,
+    view 1 sees (.2, .4, .6) on pixel 0. Both views' pixel 0 land on panel pixel
+    3: channel c of panel pixel 3 is the mean of channel c of the two colours
+    (the light-field encoding, with parallax: each pupil point sees its own)."""
+    views, targets = tmp_path / "views", tmp_path / "targets"
+    views.mkdir()
+    targets.mkdir()
+    cases = [([[3, 6]], [[[1.0, 0.5, 0.2], [0.0, 0.0, 1.0]]]),
+             ([[3, -1]], [[[0.2, 0.4, 0.6], [9.0, 9.0, 9.0]]])]
+    for k, (pix, colours) in enumerate(cases):
+        np.save(views / f"pix_{k}.npy", np.asarray(pix, dtype=np.int32))
+        np.save(targets / f"target_{k}.npy", np.asarray(colours, dtype=np.float32))
+    for c in range(3):
+        panel = ds.encode_channel(views, targets, c, panel_pixels=4)
+        assert panel.shape == (4, 4)
+        assert panel[0, 3] == pytest.approx((np.array([1.0, 0.5, 0.2]) + np.array([0.2, 0.4, 0.6]))[c] / 2, abs=1e-7)
+        assert panel[1, 2] == pytest.approx([0.0, 0.0, 1.0][c], abs=1e-7)
+        assert np.count_nonzero(panel) == (2 if c == 2 else 1)
+
+
+def test_the_depth_scene_is_the_viz_scene_scaled_about_the_pupil():
+    """Every angular size is kept: centres move away from the pupil by SCENE_SCALE,
+    sizes grow by it, the object-space checker keeps its squares per object."""
+    import build_viz_scene as bv
+    for a, b in zip(bv.CONTENT_3D, ds.depth_scene()):
+        assert b["type"] == a["type"]
+        pupil = np.array([0.0, ds.lp.PUPIL_Y_MM, 0.0])
+        assert np.array(b["center"]) - pupil == pytest.approx(ds.SCENE_SCALE * (np.array(a["center"]) - pupil))
+        for key in ("size", "radius"):
+            if key in a:
+                assert b[key] == pytest.approx(ds.SCENE_SCALE * a[key])
+        assert b["checker_scale"] == pytest.approx(a["checker_scale"] / ds.SCENE_SCALE)
