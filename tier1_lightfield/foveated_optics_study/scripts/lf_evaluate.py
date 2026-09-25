@@ -140,7 +140,7 @@ def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_
     mesh, gap, lenslets = lenslet_array(design, panel_pixels * PIXEL_UM, subdivisions)
     work.mkdir(parents=True, exist_ok=True)
     np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
-             face_lens=mesh.face_lens)
+             face_lens=mesh.face_lens, face_wall=mesh.face_lens == mla_mesh.WALL)
     views = lp.hex_views_mm(view_spacing_mm, 2.0)
     cfg = {
         "mode": "evaluate", "mla_npz": str(work / "mla_mesh.npz"), "index": INDEX,
@@ -245,6 +245,7 @@ def metrics(view_dir, views, centres, panel_pixels):
     good = ~stray(idx, ent)
     idx, pix, ent = idx[good], pix[good], ent[good]
     count = np.bincount(ent, minlength=n_lens)
+    chief &= count > 0                                                 # every centre ray stray: no direction
     pitch = np.where(chief, ft.target_pitch_rad(*np.radians(_field_deg(mean))), np.inf)
     uv = np.column_stack([(pix % panel_pixels + 0.5) * PIXEL_UM, (pix // panel_pixels + 0.5) * PIXEL_UM])
     uv -= panel_pixels * PIXEL_UM / 2

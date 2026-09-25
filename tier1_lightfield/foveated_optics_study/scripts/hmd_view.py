@@ -23,6 +23,7 @@ import numpy as np  # noqa: E402
 
 import lf_evaluate as ev  # noqa: E402
 import lf_pipeline as lp  # noqa: E402
+import mla_mesh  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
 FOV_DEG = 90.0
@@ -71,7 +72,7 @@ def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, sam
     if not plain:
         mesh, gap, _ = ev.lenslet_array(design, spec.PANEL_MM * 1e3, 2)
         np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
-                 face_lens=mesh.face_lens)
+                 face_lens=mesh.face_lens, face_wall=mesh.face_lens == mla_mesh.WALL)
     np.save(work / "panel.npy", test_chart() if panel_rgb is None else panel_rgb.astype(np.float32))
     blend = out_dir / f"{name}.blend"
     cfg = {"mode": "display", "index": spec.LENS_INDEX,

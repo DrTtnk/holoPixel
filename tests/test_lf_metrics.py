@@ -176,3 +176,25 @@ def test_group_median_is_numpys_median_of_each_group():
     got = ev._group_median(keys, values, 45)
     for k in range(45):
         assert got[k] == (np.median(values[keys == k]) if (keys == k).any() else 0.0)
+
+
+def test_a_lens_with_only_stray_centre_rays_has_no_direction(tmp_path):
+    """Lens 2 is seen at the pupil centre by two rays 30 deg apart: their median
+    lies 15 deg from both, so both are stray and the lens has no chief direction;
+    it must drop out, not carry NaN offsets."""
+    views = lp.hex_views_mm(0.5, 2.0)
+    centre = int(np.argmin(np.linalg.norm(views, axis=1)))
+    a, b = _unit([np.tan(np.radians(-15.0)), 1.0, 0.0]), _unit([np.tan(np.radians(15.0)), 1.0, 0.0])
+    direction = np.array([_LENS0 + [_LENS1, a, b]])
+    centres = np.array([[0.0, 0.0], [np.sqrt(3.0) * ev.SIDE_UM, 0.0], [0.0, 3.0 * ev.SIDE_UM]])
+
+    def per_view(k):
+        seen = k == centre
+        return ([[0, 0, 0, 0, 1, 2 if seen else -1, 2 if seen else -1]],
+                [[5, 5, 5, 5, 9, 13 if seen else -1, 14 if seen else -1]])
+
+    _write(tmp_path, views, direction, per_view)
+    ev.metrics(tmp_path, views, centres, PIXELS)
+    per = np.load(tmp_path.parent / "per_lens.npz")
+    assert 2 not in per["lens"].tolist()
+    assert np.all(np.isfinite(per["landing_um"]))

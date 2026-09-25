@@ -243,6 +243,11 @@ def add_mla(cfg):
     if "face_lens" in m:
         attr = obj.data.attributes.new("lens", "FLOAT", "FACE")
         attr.data.foreach_set("value", m["face_lens"].astype(np.float32))
+        # the steps between lenses are black (a black matrix); slot 0 stays the
+        # lens glass, which evaluate() swaps for the lens-id material
+        obj.data.materials.append(absorber("MLA_wall"))
+        slot = m["face_wall"].astype(np.int32)
+        obj.data.polygons.foreach_set("material_index", slot)
     return obj
 
 

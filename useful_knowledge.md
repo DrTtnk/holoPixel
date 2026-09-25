@@ -826,3 +826,14 @@ colour (F-C shift of each lens's direction) of 18 arcmin median, 28 arcmin p90,
 up to ~40 arcmin in two lobes at tz = +-11 deg: 3.3x the blur tolerance median.
 Silica lenslets add nothing measurable to it (the lens directions are set by
 the remapper) and change the blur by only ~2 %.
+
+## Clear walls in the variable MLA were the main stray-light source
+
+Once stray light was counted, 99 % of it on the spline pancake was rays that
+entered the variable lenslet array through the vertical steps between lenses
+of different height (7 % of the lens-face area) or through its clear outer
+border, spread over the whole field. Every wall is now mla_mesh.WALL and renders
+black (a black matrix and mount); only the floor stays glass. Ghost mean
+0.044 -> 0.012, p90 0.148 -> 0.000; what stray light is left (0.28 %) enters
+sideways through the 33 um panel gap at the very edge. A field stop near the
+eye cannot do this job: the 4 mm pupil blurs its edge over ~20 deg.

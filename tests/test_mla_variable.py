@@ -112,3 +112,28 @@ def test_the_vertex_profile_passes_through_every_lens_vertex(mesh):
     c = mesh.mesh.centres
     profile = mla_mesh.variable_vertex_profile_um(c[:, 0], c[:, 1], PANEL, SIDE, focal, INDEX, T_MIN)
     np.testing.assert_allclose(profile, mesh.centre_height_um, atol=1e-9)
+
+
+def test_every_wall_is_labelled_a_wall_and_only_the_floor_is_not(mesh):
+    """The steps between neighbouring lenses and the outer border carry
+    mla_mesh.WALL (the renderer blackens them: a black matrix and a black mount);
+    only the floor, facing the panel, carries -1."""
+    m = mesh.mesh
+    v = m.verts[m.faces]
+    normal = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+    normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+    wall = m.face_lens == mla_mesh.WALL
+    assert wall.sum() > 0 and np.max(np.abs(normal[wall, 2])) < 1e-9
+    border = np.all(np.abs(v[:, :, :2]).max(axis=2) >= PANEL / 2 - 1e-9, axis=1) & (m.face_lens < 0)
+    floor = np.all(v[:, :, 2] == 0.0, axis=1)
+    assert border.sum() > 0 and np.all(m.face_lens[border] == mla_mesh.WALL)
+    assert np.all(m.face_lens[floor] == -1) and np.all(floor[m.face_lens == -1])
+
+
+def test_the_uniform_array_border_is_a_wall_too():
+    radius = mla.radius_for_focal_length_um(150.0, INDEX)
+    m = mla_mesh.build(panel_um=PANEL, side_um=SIDE, radius_um=radius, min_thickness_um=T_MIN, subdivisions=3)
+    v = m.verts[m.faces]
+    floor = np.all(v[:, :, 2] == 0.0, axis=1)
+    assert np.all(m.face_lens[(m.face_lens < 0) & ~floor] == mla_mesh.WALL)
+    assert np.all(m.face_lens[floor] == -1)

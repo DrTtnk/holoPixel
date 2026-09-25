@@ -20,12 +20,16 @@ from scipy.spatial import cKDTree
 import mla_design as mla
 
 
+WALL = -2                     # face_lens of a wall: rendered black (a black matrix and mount)
+
+
 @dataclass(frozen=True)
 class MlaMesh:
     verts: np.ndarray         # (V, 3) um
     faces: np.ndarray         # (F, 3) int, wound outwards
     loop_normals: np.ndarray  # (3F, 3) unit, in face-corner order
-    face_lens: np.ndarray     # (F,) owning lens index, -1 for wall and bottom faces
+    face_lens: np.ndarray     # (F,) owning lens index; WALL for every wall (the steps between
+                              # lenses and the outer border), -1 for the floor
     centres: np.ndarray       # (L, 2) um
     centre_thickness: float   # um
 
@@ -119,7 +123,7 @@ def build(panel_um, side_um, radius_um, min_thickness_um, subdivisions):
     faces = np.concatenate([top_faces, walls, floor]).astype(np.int64)
 
     _, owner = cKDTree(centres).query(uv[top_faces].mean(axis=1))
-    face_lens = np.concatenate([owner, np.full(len(walls) + len(floor), -1)])
+    face_lens = np.concatenate([owner, np.full(len(walls), WALL), np.full(len(floor), -1)])
 
     corners = verts[faces]
     flat = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
@@ -287,7 +291,8 @@ def build_variable(panel_um, side_um, focal_of_position, index, min_thickness_um
     verts = np.concatenate(verts)
     faces = np.concatenate([top_faces, np.array(walls, dtype=np.int64).reshape(-1, 3),
                             np.array(border, dtype=np.int64), floor]).astype(np.int64)
-    face_lens = np.concatenate([owner, np.full(len(faces) - len(top_faces), -1)])
+    face_lens = np.concatenate([owner, np.full(len(faces) - len(top_faces) - len(floor), WALL),
+                                np.full(len(floor), -1)])
 
     corners = verts[faces]
     flat = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
