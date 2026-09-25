@@ -754,3 +754,53 @@ an analytic normal there is up to 25 deg off the real facet.
 `pkill -f "pytest tests -q"` inside a Bash tool call killed that call's own
 shell (its command line contains the pattern), so the edits after it never ran.
 Stop background work with its task id, or pgrep first and kill by PID.
+
+## The session scratchpad under /tmp does not survive a reboot
+
+The overnight chain script and the smooth baselines lived in the session
+scratchpad (/tmp/claude-1000/...). A reboot cleared /tmp, and the chain failed
+at once; it was rebuilt from the transcript and the baselines were run again.
+Long runs, seeds and baselines now go in the git-ignored `scratchpad/` at the
+repository root.
+
+## The search did not constrain the lens beyond its footprint
+
+The 4- and 8-cell spline folds could not be exported: "surfaces 1, 2: the back
+crosses the front". Along every traced ray the lens was 0.8 to 2.8 mm thick,
+but it thinned to a knife edge just above its footprint, and the export grid
+(footprint plus MARGIN_MM, rectangle corners) reached the crossing. A round
+outline (disc=True) reached it further (y ~15 mm against ~13 mm) and made it
+worse. The search checked glass only along rays, so it could not see the rim.
+Now the export sets the back MIN_GLASS_MM behind the front where the lens would
+be thinner outside the convex hull of the hits, and the fold space term adds
+the rim thickness (CONE_MARGIN_MM beyond each hit, along the front axis).
+
+## A ray on a shared mesh edge can pass between the two triangles
+
+`lf_evaluate._axis_hit_mm` (Moller-Trumbore with u, v >= 0 exactly) missed 12
+of 10647 traced segments on an exported spline fold: every one at local x = 0,
+where the odd 161-column export grid puts a vertex column on the symmetry
+plane. The ray then passed through the front and met the back 1.1 to 3.5 mm
+later. A 1e-9 widening of the barycentric test fixed it. A synthetic sheet with
+the same grid did not reproduce the miss, so the regression test is the real
+exported design (test_export_fold, stored_spline).
+
+## Cycles evaluation spends 90 % of its time off the GPU
+
+lf_evaluate ran at ~10 s per view with the GPU at 0 % almost always: the
+render itself takes ~1 s. `render.use_persistent_data` is not set, and the
+lenslet material changes (glass, lens id, glass) inside the view loop, so
+Cycles rebuilds the 1.2 GB lenslet BVH and shaders for each of the 123 renders.
+Also: several evaluations run in parallel fit easily (9 GB RAM each, 2 GB VRAM).
+
+## The pipeline has no dispersion
+
+Neither the tracer nor Cycles models colour: the lenslets render at one index
+(screen_spec.LENS_INDEX = 1.5) and the remapper glass at its design index (1.9).
+A probe (scratchpad/colour) rendered the 4-cell spline pancake at the F and C
+lines, with N-LASF46B (Abbe 31) for the lens and fused silica for the lenslets,
+each index scaled to keep its design power at d. The lens alone gives a lateral
+colour (F-C shift of each lens's direction) of 18 arcmin median, 28 arcmin p90,
+up to ~40 arcmin in two lobes at tz = +-11 deg: 3.3x the blur tolerance median.
+Silica lenslets add nothing measurable to it (the lens directions are set by
+the remapper) and change the blur by only ~2 %.

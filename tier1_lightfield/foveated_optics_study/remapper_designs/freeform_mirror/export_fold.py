@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.spatial import Delaunay
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "scripts"))
@@ -149,6 +150,14 @@ def _sag_range(batch, s, hits):
     return float(z.min()) - MARGIN_MM, float(z.max()) + MARGIN_MM
 
 
+def beyond_footprint(batch, s, points, hits):
+    """Mask of the points whose local x, y on surface s lie outside the convex
+    hull of the hits and of their mirror images (x -> -x: the search traces
+    one half of the field)."""
+    both = np.concatenate([hits, hits * np.array([-1.0, 1.0, 1.0])])
+    return Delaunay(_local(batch, s, both)[:, :2]).find_simplex(_local(batch, s, points)[:, :2]) < 0
+
+
 def _solid(batch, s_front, s_back, hits_front, hits_back, disc=False, front_floor=-np.inf):
     # the outline must hold both footprints (rays cross the glass obliquely),
     # so project the back hits onto the front's local x, y along its axis; each
@@ -162,6 +171,14 @@ def _solid(batch, s_front, s_back, hits_front, hits_back, disc=False, front_floo
     vb, nb, cb = _surface(batch, s_back, bx, by, _sag_range(batch, s_back, hits_back))
     _, axes_f = _frame(batch, s_front)
     thickness = (vb - vf) @ axes_f[2]                                  # one sign: the light may run either way
+    # beyond the footprint nothing constrains the glass: where it thins below
+    # MIN_GLASS_MM the back is set MIN_GLASS_MM behind the front (a flat facet)
+    sign = np.sign(np.median(thickness))
+    thin = beyond_footprint(batch, s_front, vf, np.concatenate([hits_front, hits_back])) \
+        & (sign * thickness < fs.MIN_GLASS_MM)
+    vb[thin] = vf[thin] + sign * fs.MIN_GLASS_MM * axes_f[2]
+    cb = cb | thin
+    thickness = (vb - vf) @ axes_f[2]
     if not (thickness.min() > 0.0 or thickness.max() < 0.0):
         raise ValueError(f"surfaces {s_front}, {s_back}: the back crosses the front")
     N = GRID * GRID

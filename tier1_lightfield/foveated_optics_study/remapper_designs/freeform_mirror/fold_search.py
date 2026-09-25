@@ -29,7 +29,8 @@ Merit, in the units the acceptance evaluator (lf_evaluate.py) uses:
           a pixel must not be seen from two directions.
   space   no hardware (corrector hits, panel corners) inside the eye's view
           cone to the mirror, nearer the pupil than CLEARANCE_MM, or behind
-          the face plane MIN_Z_MM; glass at least MIN_GLASS_MM along every ray.
+          the face plane MIN_Z_MM; glass at least MIN_GLASS_MM along every ray
+          and on each lens's rim, CONE_MARGIN_MM beyond its footprint.
 """
 from __future__ import annotations
 
@@ -527,6 +528,8 @@ def fold_constraints(batch, diag, alive, lay, x):
                 + torch.relu(MIN_Z_MM - p[..., 2]) ** 2)
 
     space = (violation(hw) * live).sum((1, 2, 3)) + violation(corners).sum(1)
+    for e in range(lay["n_el"]):                                       # glass on each lens's rim, beyond its footprint
+        space = space + rim_violation(*rim_thickness(batch, pts, alive, 1 + 2 * e, 2 + 2 * e)[1:])
     # Baffle (baffle_geometry): a black plate on the plane just above the view
     # cone, from the face plane to the far edge of the hardware, and a wall in the
     # face plane. The return rays (mirror -> first corrector) must cross the plane
@@ -542,6 +545,52 @@ def fold_constraints(batch, diag, alive, lay, x):
     barrier = barrier + (torch.relu(diag["sin2t"][:, :-1] - SIN2_MAX) ** 2 * live).sum((1, 2, 3))
     barrier = barrier + (torch.relu(DOMAIN_MIN - diag["domain"]) ** 2 * alive[:, None].double()).sum((1, 2, 3))
     return space, barrier
+
+
+def rim_thickness(batch, pts, alive, s_front, s_back):
+    """Glass thickness of a lens along its front surface's local axis, at its
+    live front hits and on its rim: CONE_MARGIN_MM beyond each hit (and its
+    mirror image x -> -x), outwards from the footprint's centre in the front's
+    local x, y. The back is met along that axis, as the exporter builds the
+    solid. Returns the rim points (B, N, 2) front-local, the rim thickness
+    (B, N), its valid mask (B, N) and the thickness sign at the hits (B,): the
+    light may run through the lens either way."""
+    frame = lambda s: (torch.stack([torch.zeros_like(batch.y[:, s]), batch.y[:, s], batch.z[:, s]], -1)[:, None],  # noqa: E731
+                       batch.rx[:, s, None])
+    o_f, a_f = frame(s_front)
+    o_b, a_b = frame(s_back)
+    hits = ot._rot_x(pts[:, s_front].reshape(pts.shape[0], -1, 3) - o_f, -a_f)[..., :2]
+    hits = torch.cat([hits, hits * torch.tensor([-1.0, 1.0], dtype=hits.dtype, device=hits.device)], 1)
+    live = alive.reshape(alive.shape[0], -1).repeat(1, 2).double()
+    centre = (hits * live[..., None]).sum(1, keepdim=True) / live.sum(1).clamp(min=1.0)[:, None, None]
+    out = hits - centre
+    rim = hits + CONE_MARGIN_MM * out / torch.linalg.norm(out, dim=-1, keepdim=True).clamp(min=1e-9)
+    xy = torch.cat([hits, rim], 1)
+    shape = lambda s: (batch.c[:, s, None], batch.k[:, s, None], batch.xy[:, s, None])  # noqa: E731
+    f, _, _, ok_f = ot.sag(xy[..., 0], xy[..., 1], *shape(s_front))
+    axis = ot._rot_x(torch.tensor([0.0, 0.0, 1.0], dtype=xy.dtype, device=xy.device).expand_as(o_f), a_f)
+    g = ot._rot_x(torch.cat([xy, f[..., None]], -1), a_f) + o_f
+    ob, db = ot._rot_x(g - o_b, -a_b), ot._rot_x(axis, -a_b).expand_as(g)
+    c, k, C = shape(s_back)
+    with torch.no_grad():
+        t = -ob[..., 2] / db[..., 2]
+        for _ in range(ot.NEWTON_STEPS - ot.GRAD_STEPS):
+            t = ot._newton_fused(ob.detach(), db.detach(), c.detach(), k.detach(), C.detach(), t)
+        t = torch.where(torch.isfinite(t), t, torch.zeros_like(t))
+    for _ in range(ot.GRAD_STEPS):
+        t = ot._newton_fused(ob, db, c, k, C, t)
+    q = ob + t[..., None] * db
+    f_b, _, _, ok_b = ot.sag(q[..., 0], q[..., 1], c, k, C)
+    valid = ok_f & ok_b & ((q[..., 2] - f_b).abs() < 1e-9) & torch.cat([live, live], 1).bool()
+    n = hits.shape[1]
+    t_hit = torch.where(valid[:, :n], t[:, :n], torch.zeros_like(t[:, :n]))
+    sign = torch.sign(t_hit.sum(1)).detach()
+    return rim, t[:, n:], valid[:, n:], sign
+
+
+def rim_violation(t, valid, sign):
+    """Squared shortfall below MIN_GLASS_MM of the rim thickness, summed (B,)."""
+    return (torch.relu(MIN_GLASS_MM - sign[:, None] * t) ** 2 * valid.double()).sum(1)
 
 
 def merit(x, indices, lay, ctx):

@@ -77,7 +77,9 @@ def _ecc(d):
 
 
 def _axis_hit_mm(verts, faces, origin, direction):
-    """Nearest positive ray/triangle hit (Moller-Trumbore), inf when none."""
+    """Nearest positive ray/triangle hit (Moller-Trumbore), inf when none. The
+    barycentric test is widened by 1e-9 so a ray exactly on a shared edge
+    cannot pass between its two triangles by rounding."""
     a, b, c = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
     e1, e2 = b - a, c - a
     p = np.cross(direction, e2)
@@ -89,7 +91,8 @@ def _axis_hit_mm(verts, faces, origin, direction):
     q = np.cross(s, e1)
     v = np.einsum("j,ij->i", direction, q) * inv
     t = np.einsum("ij,ij->i", e2, q) * inv
-    hit = ok & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 1e-9)
+    eps = 1e-9
+    hit = ok & (u >= -eps) & (v >= -eps) & (u + v <= 1.0 + eps) & (t > 1e-9)
     return float(t[hit].min()) if hit.any() else math.inf
 
 

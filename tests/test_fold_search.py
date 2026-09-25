@@ -230,3 +230,56 @@ def test_the_spline_grid_covers_the_mirror_footprint_with_a_cell_to_spare(spline
     e = 1e-9                                                                # the first free control sits on the edge
     assert x0 + h <= -np.abs(loc_x).max() + e and x0 + (nx - 2) * h >= np.abs(loc_x).max() - e
     assert y0 + h <= loc_y.min() + e and y0 + (ny - 2) * h >= loc_y.max() - e
+
+
+@pytest.fixture(scope="module")
+def knife_edge(device):
+    """A searched spline fold whose lens thins to a knife edge just beyond its footprint."""
+    import json
+    entry = json.loads((HERE / "results_fold" / "best_fold_el1_glass_spline4.json").read_text())[0]
+    lay = fs.entry_layout(entry)
+    x = torch.tensor([entry["x"]], dtype=torch.float64, device=device)
+    idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=device)
+    return lay, x, idx
+
+
+def _traced(lay, x, idx, device):
+    batch = fs.to_batch(x, idx, lay)
+    ctx = fs.context(device)
+    _, _, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+    return batch, diag, alive
+
+
+def test_the_rim_thickness_is_the_exporters_along_the_front_axis(knife_edge, device):
+    sys.path.insert(0, str(HERE.parents[1] / "scripts"))
+    import export_fold as ef
+    lay, x, idx = knife_edge
+    batch, diag, alive = _traced(lay, x, idx, device)
+    rim, t, valid, _ = fs.rim_thickness(batch, diag["points"], alive, 1, 2)
+    cb = ef.cpu_batch(batch)
+    rim, t, valid = rim[0].detach().cpu().numpy(), t[0].detach().cpu().numpy(), valid[0].cpu().numpy()
+    gx, gy = rim[valid, 0], rim[valid, 1]
+    f, _, _ = ef._sag(cb, 1, gx, gy)
+    bx, by = ef._back_along_front_axis(cb, 1, 2, gx, gy)
+    fb, _, _ = ef._sag(cb, 2, bx, by)
+    front = ef._global(cb, 1, np.stack([gx, gy, f], -1))
+    back = ef._global(cb, 2, np.stack([bx, by, fb], -1))
+    assert valid.mean() > 0.9
+    assert np.allclose((back - front) @ ef._frame(cb, 1)[1][2], t[valid], atol=1e-9)
+
+
+def test_the_space_term_sees_a_knife_edge_rim_and_not_a_thick_one(knife_edge, device):
+    """The stored design's lens crosses itself just beyond its footprint; the
+    same lens made 3 mm thicker keeps MIN_GLASS_MM on its whole rim."""
+    lay, x, idx = knife_edge
+    thick = x.clone()
+    thick[:, lay["elements"][0]["pose"].start + 3] += 3.0
+    rims = []
+    for design in (x, thick):
+        batch, diag, alive = _traced(lay, design, idx, device)
+        _, t, valid, sign = fs.rim_thickness(batch, diag["points"], alive, 1, 2)
+        rims.append(fs.rim_violation(t, valid, sign))
+    assert float(rims[0]) > 0.0 and float(rims[1]) == 0.0
+    batch, diag, alive = _traced(lay, x, idx, device)
+    space, _ = fs.fold_constraints(batch, diag, alive, lay, x)
+    assert float(space) >= float(rims[0])                              # the rim enters the space term

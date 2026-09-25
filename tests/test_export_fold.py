@@ -20,10 +20,11 @@ import lf_evaluate as ev  # noqa: E402
 import offaxis_tracer as ot  # noqa: E402
 
 
-@pytest.fixture(scope="module", params=["random_seed", "spline_mirror"])
+@pytest.fixture(scope="module", params=["random_seed", "spline_mirror", "stored_spline"])
 def exported(request, tmp_path_factory):
-    """A random live seed, and a stored design whose mirror carries a B-spline
-    with random 0.02 mm controls: the exported mirror must include it."""
+    """A random live seed, a stored design whose mirror carries a B-spline
+    with random 0.02 mm controls (the exported mirror must include it), and a
+    searched spline design whose lens thins to a knife edge beyond its footprint."""
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if request.param == "random_seed":
         rng = np.random.default_rng(4)
@@ -33,6 +34,11 @@ def exported(request, tmp_path_factory):
         x, idx, _ = fs.live_seeds(lay, 1, "resin", rng, dev, fs.context(dev), lo, hi, chunk=64)
         entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin",
                  "flip_u": flip_u, "flip_v": flip_v, "spline": {}}
+    elif request.param == "stored_spline":
+        entry = json.loads((HERE / "results_fold" / "best_fold_el1_glass_spline4.json").read_text())[0]
+        lay = fs.entry_layout(entry)
+        x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
+        idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
     else:
         entry = json.loads((HERE / "results_fold" / "best_fold_el1_glass.json").read_text())[0]
         grid, shape = fs.mirror_spline_grid(entry, dev, cells=4)
@@ -46,17 +52,32 @@ def exported(request, tmp_path_factory):
     batch = fs.to_batch(x, idx, lay)
     ctx = fs.context(dev)
     _, _, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
-    return out, np.load(out / "remapper.npz"), diag["points"][0].cpu().numpy(), alive[0].cpu().numpy()
+    return (out, np.load(out / "remapper.npz"), diag["points"][0].cpu().numpy(), alive[0].cpu().numpy(),
+            ef.cpu_batch(batch))
 
 
 def test_the_corrector_is_valid_glass_the_mirror_a_sheet_and_the_baffle_black(exported):
-    out, r, _, _ = exported
+    out, r, _, _ = exported[:4]
     assert [str(r[f"surf{k}_kind"]) for k in range(int(r["n_surfaces"]))] == ["mirror", "glass", "absorber"]
     ev.validate_surfaces(out / "remapper.npz")
 
 
+def test_the_lens_is_at_least_min_glass_thick_beyond_its_footprint(exported):
+    """Beyond the traced footprint the exporter keeps the glass MIN_GLASS_MM
+    thick along the front axis; inside it the surfaces are the traced ones."""
+    _, r, pts, _, batch = exported
+    n = ef.GRID * ef.GRID
+    v = (r["surf1_verts"] - np.array([0.0, ef.lp.PUPIL_Y_MM, 0.0])) @ ef.TRACER_TO_WORLD.T   # tracer frame
+    front, back = v[:n], v[n:2 * n]
+    hits = np.concatenate([pts[1].reshape(-1, 3), pts[2].reshape(-1, 3)])
+    outside = ef.beyond_footprint(batch, 1, front, hits)
+    t = np.abs((back - front) @ ef._frame(batch, 1)[1][2])
+    assert outside.any() and not outside.all()
+    assert t[outside].min() >= fs.MIN_GLASS_MM - 1e-9
+
+
 def test_loop_normals_follow_the_faces(exported):
-    _, r, _, _ = exported
+    _, r, _, _ = exported[:4]
     for k in range(int(r["n_surfaces"]) - 1):                              # the baffle is flat, no normals
         v, f, n = r[f"surf{k}_verts"], r[f"surf{k}_faces"], r[f"surf{k}_normals"].reshape(-1, 3, 3)
         geo = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
@@ -67,7 +88,7 @@ def test_loop_normals_follow_the_faces(exported):
 def test_traced_segments_meet_the_exported_meshes_where_the_tracer_says(exported):
     """Cast every traced segment (pupil -> mirror -> corrector front) against the
     world-frame meshes: the first hit must be at the traced length."""
-    _, r, pts, alive = exported
+    _, r, pts, alive = exported[:4]
     assert alive.all()
     rng = np.random.default_rng(0)
     F, P = pts.shape[1], pts.shape[2]
@@ -86,7 +107,7 @@ def test_the_lens_vertices_lie_on_the_image_surface_and_face_the_light(exported)
     """The variable-focal array stands with its lens vertices on the design's
     image surface: every traced image point sits at w = h(r) above the array's
     flat face, h the array's own vertex profile, and the light arrives against w."""
-    out, _, pts, _ = exported
+    out, _, pts, _ = exported[:4]
     design = json.loads((out / "design.json").read_text())
     assert design["lenslets"] == "variable_retina" and "focal_um" not in design
     flip_v = design["lenslet_flip_v"]
@@ -108,7 +129,7 @@ def test_the_lens_vertices_lie_on_the_image_surface_and_face_the_light(exported)
 def test_the_exported_optics_cover_both_halves_of_the_field(exported):
     """The search traces theta_x >= 0 only; the mirrored rays (x -> -x) must
     meet the exported meshes too."""
-    _, r, pts, _ = exported
+    _, r, pts, _ = exported[:4]
     rng = np.random.default_rng(1)
     F, P = pts.shape[1], pts.shape[2]
     flip = np.array([-1.0, 1.0, 1.0])
@@ -123,7 +144,7 @@ def test_the_exported_optics_cover_both_halves_of_the_field(exported):
 def test_the_baffle_hides_the_hardware_from_the_pupil(exported):
     """Every line of sight from any pupil sample point to a hardware vertex that
     lies above the baffle plane and in front of the face plane meets the baffle first."""
-    _, r, _, _ = exported
+    _, r, _, _ = exported[:4]
     k = int(r["n_surfaces"]) - 1
     assert str(r[f"surf{k}_kind"]) == "absorber"
     bv, bf = r[f"surf{k}_verts"], r[f"surf{k}_faces"]
