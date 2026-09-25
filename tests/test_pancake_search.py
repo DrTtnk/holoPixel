@@ -169,3 +169,16 @@ def test_a_search_seeded_from_a_splined_design_keeps_its_grid(device):
     assert smooth["spline"]["shape"] == tuple(fs.mirror_spline_grid(json.loads(STORED.read_text())[0], device,
                                                                      4, "pancake")[1])
     assert "spline" not in fs.seeded_layout(base, [STORED], 0, device)
+
+
+def test_a_stored_design_of_another_field_is_refused(device):
+    import json
+    entry = json.loads(STORED.read_text())[0]
+    lay = fs.layout(1, entry["flip_u"], entry["flip_v"], family="pancake")
+    other = STORED.parent.parent / "other_field.json"
+    other.write_text(json.dumps([{**entry, "field_deg": [100.0, 80.0]}]))
+    try:
+        with pytest.raises(ValueError, match="field"):
+            fs.stored_seeds([other], lay, "glass", device, fs.context(device))
+    finally:
+        other.unlink()

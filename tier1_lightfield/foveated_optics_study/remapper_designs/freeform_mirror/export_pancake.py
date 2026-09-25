@@ -135,6 +135,7 @@ def export(best_json, out_dir, rank=0, device="cuda"):
     basis = np.stack([u, v, w]) @ ef.TRACER_TO_WORLD
     origin = ef.to_world(o) - float(vl.vertex_height_um(0.0, 0.0, array_flip)) * 1e-3 * basis[2]
     design = {"lenslets": fs.LENSLETS, "lenslet_flip_v": array_flip, "remapper_npz": "remapper.npz",
+              "field_deg": entry["field_deg"],
               "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
               "source": {"design": Path(best_json).name, "rank": rank, "material": entry["material"],
                          "family": "pancake"}}

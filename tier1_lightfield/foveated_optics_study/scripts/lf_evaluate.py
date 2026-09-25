@@ -44,7 +44,7 @@ import variable_lenslets as vl
 
 SIDE_UM, PIXEL_UM, INDEX, MIN_THICKNESS_UM = (spec.LENS_SIDE_UM, spec.PIXEL_UM, spec.LENS_INDEX,
                                               spec.LENS_MIN_THICKNESS_UM)
-FOV_X_DEG, FOV_Z_DEG = 35.0, 22.5
+FOV_X_DEG, FOV_Z_DEG = spec.FIELD_HALF_DEG
 HEX_RMS_PITCH = math.sqrt(5.0 / 12.0) / math.sqrt(3.0)
 # A ray this far from its lens's chief direction is stray light, not the lens's
 # light field: pupil parallax keeps a lens's own rays within ~5 deg (99.99 % of
@@ -136,6 +136,9 @@ def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_
     mesh, air gap, lenslet summary and the views."""
     design_dir, work = Path(design_dir), Path(work)
     design = json.loads((design_dir / "design.json").read_text())
+    if design["field_deg"] != spec.FIELD_DEG:
+        raise ValueError(f"{design_dir}: the design was made for a {design['field_deg']} deg field, "
+                         f"not this run's {spec.FIELD_DEG} (HOLOPIXEL_FIELD_DEG)")
     remapper = (design_dir / design["remapper_npz"]).resolve()
     validate_surfaces(remapper)
     mesh, gap, lenslets = lenslet_array(design, panel_pixels * PIXEL_UM, subdivisions)

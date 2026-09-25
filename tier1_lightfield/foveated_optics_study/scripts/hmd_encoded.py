@@ -15,6 +15,7 @@ with square-wave gratings of 1-16 arcmin period (the blur ruler).
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import matplotlib
@@ -28,7 +29,7 @@ import lf_evaluate as ev  # noqa: E402
 import lf_pipeline as lp  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
-HALF_DEG = 45.0
+HALF_DEG = max(45.0, 5.0 * math.ceil((spec.FIELD_HALF_DEG[0] + 10.0) / 5.0))   # the chart: the field and a margin
 CHART_PX = 2700
 FOVEAL_HALF_DEG = 5.0
 FOVEAL_PX = 3600                 # 1/6 arcmin per chart pixel

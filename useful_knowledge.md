@@ -848,3 +848,14 @@ did, and a 64-sample display render was mostly colour noise. A wedge-prism
 test (2 surfaces) had passed and hid it. Now the index is chosen by a
 view-layer attribute ("channel"): three view layers render with fixed indices
 and the compositor takes channel c from layer c. Deterministic and clean.
+
+## The panel does not limit the field of view; the optics do
+
+With the retina-matched map (panel radius = integral of p(0)/p(theta)), the
+2560 px panel gives the fovea a 0.89 arcmin lens pitch at 70 x 45 deg (21 % of
+the monocular field), 1.02 arcmin at 100 x 80 (48 %) and 1.07 at 120 x 100
+(68 %): the retina's pitch grows so fast that the periphery costs few lenses.
+A first 100 x 80 glass pancake (random seeds, 90 iterations, not converged)
+reached only ~76 deg across (coverage 0.65), blur 8x, ghosts 0.039 (rank 2),
+with the fovea's magnification the weak point again. The field is now a
+parameter (HOLOPIXEL_FIELD_DEG), recorded in results and designs and checked.

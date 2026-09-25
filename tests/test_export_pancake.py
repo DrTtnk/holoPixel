@@ -33,7 +33,7 @@ def exported(request, tmp_path_factory):
         lay = fs.layout(1, *flips, family="pancake")
         x, idx, _ = fs.live_seeds(lay, 1, "resin", rng, dev, fs.context(dev), lo, hi, chunk=256)
         entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin",
-                 "flip_u": flips[0], "flip_v": flips[1], "spline": {}}
+                 "flip_u": flips[0], "flip_v": flips[1], "spline": {}, "field_deg": fs.spec.FIELD_DEG}
     elif request.param == "spline_glass":
         entry = json.loads((HERE / "results_pancake" / "best_pancake_el1_glass.json").read_text())[0]
         grid, shape = fs.mirror_spline_grid(entry, dev, cells=4, family="pancake")

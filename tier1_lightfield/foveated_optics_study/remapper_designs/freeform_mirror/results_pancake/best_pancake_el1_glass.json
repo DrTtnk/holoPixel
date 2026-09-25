@@ -1021,6 +1021,10 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  }
 ]

@@ -83,5 +83,6 @@ def build_design_json(params, design_dir, remapper_name="remapper.npz"):
     focal_um = float(params["focal_um"].detach())
     design = {"focal_um": focal_um, "panel_pose": {"origin_mm": origin, "basis": basis},
              "remapper_npz": remapper_name}
+    design["field_deg"] = [70.0, 45.0]  # searched for the 70 x 45 deg field (lf_evaluate refuses another)
     (Path(design_dir) / "design.json").write_text(json.dumps(design, indent=1))
     return design

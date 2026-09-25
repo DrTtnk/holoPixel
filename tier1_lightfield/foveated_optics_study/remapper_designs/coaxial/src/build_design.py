@@ -101,6 +101,7 @@ def export(params: "d.Params", out_dir: Path, focal_um=43.0, n_r=48, n_phi=96, m
                        "basis": [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]},
         "remapper_npz": "remapper.npz",
     }
+    design["field_deg"] = [70.0, 45.0]  # searched for the 70 x 45 deg field (lf_evaluate refuses another)
     (out_dir / "design.json").write_text(json.dumps(design, indent=1))
     print(f"exported {surf_k} glass elements, image_y={float(image_y):.4f} mm, total glass volume {total_vol:.1f} mm^3")
     return design, remapper_path

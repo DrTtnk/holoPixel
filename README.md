@@ -61,7 +61,9 @@ eye's pupil. `lf_evaluate.py <design_dir>` is the shared acceptance evaluator
 for remapper designs (contract in its docstring); its blur is the per-pixel
 beam width at the eye.
 
-Remapper design searches (GPU, float64), under `remapper_designs/`:
+Remapper design searches (GPU, float64), under `remapper_designs/`. The target field of view is
+`HOLOPIXEL_FIELD_DEG` (`<width>x<height>` degrees, default `70x45`); results and designs record it, and a
+design is refused under another field (the older families are fixed at 70 x 45):
 
 ```bash
 cd tier1_lightfield/foveated_optics_study/remapper_designs

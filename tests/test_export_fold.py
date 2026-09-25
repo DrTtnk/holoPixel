@@ -33,7 +33,7 @@ def exported(request, tmp_path_factory):
         lay = fs.layout(1, flip_u, flip_v)
         x, idx, _ = fs.live_seeds(lay, 1, "resin", rng, dev, fs.context(dev), lo, hi, chunk=64)
         entry = {"n_el": 1, "x": x[0].tolist(), "indices": idx[0].tolist(), "material": "resin",
-                 "flip_u": flip_u, "flip_v": flip_v, "spline": {}}
+                 "flip_u": flip_u, "flip_v": flip_v, "spline": {}, "field_deg": fs.spec.FIELD_DEG}
     elif request.param == "stored_spline":
         entry = json.loads((HERE / "results_fold" / "best_fold_el1_glass_spline4.json").read_text())[0]
         lay = fs.entry_layout(entry)

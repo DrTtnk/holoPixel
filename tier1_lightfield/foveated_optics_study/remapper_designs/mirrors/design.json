@@ -24,5 +24,9 @@
    ]
   ]
  },
- "remapper_npz": "remapper.npz"
+ "remapper_npz": "remapper.npz",
+ "field_deg": [
+  70.0,
+  45.0
+ ]
 }

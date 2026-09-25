@@ -53,12 +53,16 @@ import offaxis_tracer as ot  # noqa: E402
 import screen_spec as spec  # noqa: E402
 
 INDEX_SETS = {"resin": (1.49, 1.51, 1.53), "glass": (1.72, 1.80, 1.90)}
-FIELDS_X_DEG = (0.0, 1.0, 2.5, 5.0, 10.0, 17.0, 24.0, 30.0, 35.0)
-FIELDS_Y_DEG = (-22.5, -15.0, -8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0, 15.0, 22.5)
+_HX, _HZ = spec.FIELD_HALF_DEG
+# the sampled fields of the 70 x 45 layout: fixed around the fovea, the outer ones
+# spread linearly out to the field's edge (the identity at 70 x 45)
+FIELDS_X_DEG = (0.0, 1.0, 2.5, 5.0) + tuple(5.0 + (f - 5.0) * (_HX - 5.0) / 30.0 for f in (10.0, 17.0, 24.0, 30.0, 35.0))
+_FY = (0.0, 1.0, 2.0, 4.0) + tuple(4.0 + (f - 4.0) * (_HZ - 4.0) / 18.5 for f in (8.0, 15.0, 22.5))
+FIELDS_Y_DEG = tuple(-f for f in _FY[:0:-1]) + _FY
 FD_DEG = 0.1
 PUPIL_SPACING_MM = 0.4
 LENSLETS = "variable_retina"     # lens focal length follows the local F (foveation_target)
-TOP_FIELD_DEG = 22.5
+TOP_FIELD_DEG = _HZ
 CONE_MARGIN_MM = 2.0            # rim of an element beyond its footprint, plus air
 BAFFLE_OFFSET_MM = 0.5          # baffle plane above the top ray of the view cone
 BAFFLE_CLEAR_MM = 1.0           # return rays cross the baffle plane this far beyond the hardware
@@ -702,6 +706,9 @@ def stored_seeds(paths, lay, material, device, ctx):
                                                                        material):
                 raise ValueError(f"{path}: rank {e.get('rank', 0)} is not a {lay['n_el']}-element {material} design "
                                  f"with flips ({lay['flip_u']}, {lay['flip_v']})")
+            if e["field_deg"] != spec.FIELD_DEG:
+                raise ValueError(f"{path}: rank {e.get('rank', 0)} was searched for a {e['field_deg']} deg field, "
+                                 f"not this run's {spec.FIELD_DEG} (HOLOPIXEL_FIELD_DEG)")
             if e["spline"] and ("spline" not in lay or
                                 (tuple(e["spline"]["grid"]), tuple(e["spline"]["shape"]))
                                 != (lay["spline"]["grid"], lay["spline"]["shape"])):
@@ -811,7 +818,8 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
                     "flip_u": lay["flip_u"], "flip_v": lay["flip_v"],
                     "spline": ({"grid": lay["spline"]["grid"], "shape": lay["spline"]["shape"]}
                                if "spline" in lay else {}),
-                    "material": material, "prescription": to_prescription(x[b].detach(), indices[b], lay)})
+                    "material": material, "field_deg": spec.FIELD_DEG,
+                    "prescription": to_prescription(x[b].detach(), indices[b], lay)})
     tag = f"{family}_el{n_el}_{material}{tag_suffix}"
     (Path(out_dir) / f"best_{tag}.json").write_text(json.dumps(out, indent=1))
     top = out[0]

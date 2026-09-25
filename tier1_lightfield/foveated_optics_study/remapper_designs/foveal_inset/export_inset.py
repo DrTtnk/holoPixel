@@ -52,6 +52,7 @@ def export(report_json, name, out_dir):
     design = {"lenslets": "none", "remapper_npz": "remapper.npz",
               "panel_pose": {"origin_mm": [0.0, sc.PUPIL_Y + float(z[-1]), 0.0], "basis": PANEL_BASIS},
               "source": {"report": Path(report_json).name, "design": name}}
+    design["field_deg"] = [70.0, 45.0]  # searched for the 70 x 45 deg field (lf_evaluate refuses another)
     (out / "design.json").write_text(json.dumps(design, indent=1))
     return out
 

@@ -52,6 +52,7 @@ def export(candidate_json, out_dir, rank=0, focal_um=ft.lenslet_focal_um(), devi
               "source": {"candidate": str(Path(candidate_json).name), "rank": rank,
                          "spot_in_tolerance_per_field": entry["spot_in_tolerance_per_field"],
                          "fields_deg": entry["fields_deg"]}}
+    design["field_deg"] = [70.0, 45.0]  # searched for the 70 x 45 deg field (lf_evaluate refuses another)
     (out / "design.json").write_text(json.dumps(design, indent=1))
     return out
 

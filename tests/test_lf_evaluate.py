@@ -15,6 +15,7 @@ import foveation_target as ft  # noqa: E402
 import lf_evaluate as ev  # noqa: E402
 import lf_pipeline as lp  # noqa: E402
 import mla_design as mla  # noqa: E402
+import screen_spec as spec  # noqa: E402
 
 pytestmark = pytest.mark.blender
 
@@ -33,7 +34,7 @@ def write_design(path, pose, surfaces):
         for key, value in (extra[0] if extra else {}).items():
             data[f"surf{k}_{key}"] = value
     np.savez(path / "remapper.npz", **data)
-    (path / "design.json").write_text(json.dumps({"focal_um": FOCAL, "panel_pose": pose,
+    (path / "design.json").write_text(json.dumps({"focal_um": FOCAL, "panel_pose": pose, "field_deg": spec.FIELD_DEG,
                                                   "remapper_npz": "remapper.npz"}))
     return path
 

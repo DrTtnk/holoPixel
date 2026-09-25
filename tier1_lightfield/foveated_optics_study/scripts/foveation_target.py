@@ -33,7 +33,7 @@ import screen_spec as spec
 from retina_model import one_mosaic_spacing_deg
 
 HALF_PANEL_MM = spec.PANEL_MM / 2.0
-FIELD_HALF_DEG = (35.0, 22.5)
+FIELD_HALF_DEG = spec.FIELD_HALF_DEG
 LENS_NEIGHBOUR_MM = spec.LENS_PITCH_UM * 1e-3
 WAVELENGTH_MM = 0.55e-3
 # RMS radius (sqrt(2) sigma) of the least-squares Gaussian fit to the Airy pattern:

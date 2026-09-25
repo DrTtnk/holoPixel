@@ -41,6 +41,7 @@ def build(params_path, out_dir=HERE, nx=61, nu=61, focal_um=FOCAL_UM, gap_mm=GAP
     design_json = {"focal_um": focal_um,
                    "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
                    "remapper_npz": "remapper.npz"}
+    design_json["field_deg"] = [70.0, 45.0]  # searched for the 70 x 45 deg field (lf_evaluate refuses another)
     (out_dir / "design.json").write_text(json.dumps(design_json, indent=1))
     print(f"wrote {out_dir/'design.json'} and {out_dir/'remapper.npz'}: "
          f"{len(verts)} verts, {len(faces)} faces, {int(mirror_faces.sum())} mirror faces")

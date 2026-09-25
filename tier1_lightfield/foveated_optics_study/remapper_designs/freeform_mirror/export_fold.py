@@ -281,13 +281,14 @@ def export_entry(entry, out_dir, device="cuda", source={}):
     origin = to_world(o) - centre_height_um * 1e-3 * basis[2]
     design = {"lenslets": fs.LENSLETS, "lenslet_flip_v": lay["flip_v"], "remapper_npz": "remapper.npz",
               "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
-              "source": {**source, "material": entry["material"]}}
+              "field_deg": entry["field_deg"], "source": {**source, "material": entry["material"]}}
     (out / "design.json").write_text(json.dumps(design, indent=1))
     np.savez(out / "rays.npz", **fans(entry, dev))
     return out
 
 
-FAN_FIELDS = ((0.0, 0.0), (0.0, 22.5), (0.0, -22.5), (35.0, 0.0), (35.0, 22.5), (35.0, -22.5), (17.0, 0.0))
+_HX, _HZ = spec.FIELD_HALF_DEG
+FAN_FIELDS = ((0.0, 0.0), (0.0, _HZ), (0.0, -_HZ), (_HX, 0.0), (_HX, _HZ), (_HX, -_HZ), (17.0 * _HX / 35.0, 0.0))
 FAN_PUPIL = tuple((0.0, py) for py in (-1.0, -0.5, 0.0, 0.5, 1.0))
 
 

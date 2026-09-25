@@ -970,7 +970,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 1,
@@ -1943,7 +1947,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 2,
@@ -2916,7 +2924,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 3,
@@ -3889,7 +3901,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 4,
@@ -4862,7 +4878,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 5,
@@ -5835,7 +5855,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 6,
@@ -6808,7 +6832,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 7,
@@ -7781,7 +7809,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 8,
@@ -8754,7 +8786,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 9,
@@ -9727,7 +9763,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 10,
@@ -10700,7 +10740,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 11,
@@ -11673,7 +11717,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 12,
@@ -12646,7 +12694,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 13,
@@ -13619,7 +13671,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 14,
@@ -14592,7 +14648,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 15,
@@ -15565,7 +15625,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 16,
@@ -16538,7 +16602,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 17,
@@ -17511,7 +17579,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 18,
@@ -18484,7 +18556,11 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  },
  {
   "rank": 19,
@@ -19457,6 +19533,10 @@
    "image_surface": "variable_retina",
    "lenslet_flip_v": 1
   },
-  "spline": {}
+  "spline": {},
+  "field_deg": [
+   70.0,
+   45.0
+  ]
  }
 ]
