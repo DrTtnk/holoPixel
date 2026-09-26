@@ -64,7 +64,7 @@ ACCEPT = {
     "fill_p10_min": 0.8,
     "ghost_mean_max": 0.05,
     "throughput_min": 0.9,
-    "eye_relief_min_mm": 20.0,
+    "eye_relief_min_mm": 15.0,        # the pancake search minimum (pancake_search.EYE_RELIEF_MIN_MM)
     "clearance_min_mm": 15.0,
 }
 

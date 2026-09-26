@@ -253,3 +253,10 @@ def test_the_lens_domain_covers_the_exported_disc(device):
         closed = batch._replace(k=batch.k.clone())
         closed.k[0, 3] = 1.0 / (float(batch.c[0, 3]) ** 2 * 64.0) - 1.0          # domain edge at r = 8 mm
         assert float(ps.lens_domain_violation(closed, diag["points"], alive, lay)[0]) > 0.0
+
+
+def test_the_evaluator_accepts_the_eye_relief_the_search_allows():
+    """The user accepts 15-18 mm of eye relief (2026-09-26): the evaluator's pass
+    mark and the pancake search's minimum are the same number."""
+    import lf_evaluate as ev
+    assert ev.ACCEPT["eye_relief_min_mm"] == ps.EYE_RELIEF_MIN_MM
