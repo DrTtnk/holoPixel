@@ -91,7 +91,7 @@ def test_a_design_of_another_field_is_refused_before_rendering(tmp_path):
     assert out.returncode != 0 and "field" in out.stderr and "100" in out.stderr
 
 
-@pytest.mark.parametrize("name, field", [("fov84x61", "84x61.3"), ("fov88x66", "88x66")])
+@pytest.mark.parametrize("name, field", [("fov84x61", "84x61.3"), ("fov88x66", "88x66"), ("fov100x80", "100x80")])
 def test_the_stored_wide_pancakes_hold_under_their_own_field(name, field):
     """The 2-lens field-continuation results keep every ray under their own field
     (stored_seeds refuses one that loses rays) and their Cycles-evaluated ranks 0
