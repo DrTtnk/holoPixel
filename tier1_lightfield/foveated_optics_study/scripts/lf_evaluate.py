@@ -15,14 +15,14 @@ surf{k}_faces (M, 3), surf{k}_normals (3M, 3) optional loop normals,
 surf{k}_kind in {glass, mirror, absorber}, surf{k}_index (glass only).
 
 Every number comes from Cycles: each pupil camera ray is traced through the
-real geometry to a panel pixel, and a second render reports the lens the ray
-entered. Per lens, the rays that enter it give its field direction (pupil
+real geometry to a panel pixel, and the same render reports the lens the ray
+entered (lf_blender.entry_marking_glass). Per lens, the rays that enter it give its field direction (pupil
 centre), its angular blur (RMS width of the beams of its pixels, what the eye
 perceives; the RMS spread over the whole pupil is kept as a diagnostic), its pupil fill
 (fraction of pupil points that see it) and its landing offset at the panel
 (the chief ray's tilt there). A ghost is a ray landing on a pixel that is also
 reached through a lens more than 3 pitches away, or by stray light (a ray
-through no lens, or more than STRAY_DEG from its lens's direction). Pitches are the foveation
+through no lens top or through two, or more than STRAY_DEG from its lens's direction). Pitches are the foveation
 target's lens pitch at the lens's own field direction. Blur is reported in
 units of what the eye could see there (foveation_target.blur_tolerance_rad:
 the retinal pitch, clipped at the RMS diffraction blur of the 4 mm pupil).
@@ -242,8 +242,8 @@ def metrics(view_dir, views, centres, panel_pixels):
     ray's tilt at the panel, in um). A ghost is a ray whose pixel is also reached
     through a lens more than 3 pitches away: that pixel must serve two field
     directions, so one of them sees wrong content. Stray light (a ray that
-    reaches a pixel through no lens, or more than STRAY_DEG from its lens's
-    chief direction) is left out of every lens metric, makes its pixel a ghost
+    reaches a pixel through no lens top or through two (entered -1), or more
+    than STRAY_DEG from its lens's chief direction) is left out of every lens metric, makes its pixel a ghost
     pixel, and counts as a ghost of the lens it entered.
 
     The per-view passes run on the GPU (fp64). Their float sums are atomic, in

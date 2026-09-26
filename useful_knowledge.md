@@ -1009,3 +1009,10 @@ tests (no normals) turned smooth and refracted wrongly; set `use_smooth`
 explicitly. `normals_split_custom_set` parses a list 3x faster than a numpy
 array (tolist is worth it). A Cycles render releases the GIL: numpy work in a
 Python thread runs alongside it (bpy calls must stay on the main thread).
+
+Merging the evaluator's pixel and lens renders: I told the user that the
+two-lens rays (3e-5 of the rays, now counted as stray) would move the stray
+fraction by 3e-5. True, but the ghost mean moved 6 % (0.0254 -> 0.0271),
+because a stray ray makes its PIXEL a ghost pixel and every ray on that pixel
+becomes a ghost. Estimate a rule change through the metric that aggregates
+it, not through the count of rays it touches.

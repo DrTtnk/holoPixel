@@ -34,8 +34,8 @@ Modes:
              panel pixel each camera ray lands on, plus each view's world ray
              directions. Cameras use a lens shift to frame the panel.
   evaluate   per view, saved to disk: the panel pixel each camera ray reaches
-             (panel emits (0, i + 1, j + 1)), and the lens it enters (second
-             render, MLA opaque, emitting lens + 1 from its face attribute).
+             (panel emits (0, i + 1, j + 1)), and the lens it entered (the same
+             render: the lens tops add ENTRY_FLAG + lens + 1 in red on entry).
              Cameras keep a fixed orientation, so one direction render serves
              every view.
   display    panel emits the given image; renders each view.
@@ -296,25 +296,47 @@ def add_mla(cfg):
     return obj
 
 
-def lens_id_material():
-    """Opaque: emits (lens + 1) of the face hit, 0 on walls and floor (lens -1)."""
+ENTRY_FLAG = 2.0**20    # red added per lens-top entry: above any lens id + 1 (~3e5), exact in float32 up to 2^24
+
+
+def entry_marking_glass(index):
+    """The lenslet glass, emitting in red ENTRY_FLAG + lens + 1 wherever a ray
+    enters a lens top face from outside. The glass is one deterministic closure
+    and the emission is not sampled, so the paths (the pixel ids) are the same
+    as with the plain glass; the red sum tells the entered lens (one entry), or
+    that the ray entered two or more lens tops."""
     def build(nt):
-        a = nt.nodes.new("ShaderNodeAttribute")
-        a.attribute_type = "GEOMETRY"
-        a.attribute_name = "lens"
-        add = nt.nodes.new("ShaderNodeMath")
-        add.operation = "ADD"
-        add.inputs[1].default_value = 1.0
+        glass_out = _glass_closure(nt, glass_index(index))
+        lens = nt.nodes.new("ShaderNodeAttribute")
+        lens.attribute_type = "GEOMETRY"
+        lens.attribute_name = "lens"
+        red = nt.nodes.new("ShaderNodeCombineColor")
+        nt.links.new(_math(nt, "ADD", lens.outputs["Fac"], ENTRY_FLAG + 1.0), red.inputs[0])
+        geo = nt.nodes.new("ShaderNodeNewGeometry")
         em = nt.nodes.new("ShaderNodeEmission")
-        em.inputs["Strength"].default_value = 1.0
-        nt.links.new(a.outputs["Fac"], add.inputs[0])
-        nt.links.new(add.outputs["Value"], em.inputs["Color"])
-        return em.outputs["Emission"]
-    mat = node_material("MLA_lens_id", build)
+        nt.links.new(red.outputs["Color"], em.inputs["Color"])
+        nt.links.new(_math(nt, "SUBTRACT", 1.0, geo.outputs["Backfacing"]), em.inputs["Strength"])
+        add = nt.nodes.new("ShaderNodeAddShader")
+        nt.links.new(glass_out, add.inputs[0])
+        nt.links.new(em.outputs["Emission"], add.inputs[1])
+        return add.outputs["Shader"]
+    mat = node_material("MLA_glass_entry", build)
     # seen by camera rays only: as a light, each of the ~10 M lenslet faces would
     # enter a light tree that Cycles rebuilds for every render (~20 s each)
     mat.cycles.emission_sampling = "NONE"
     return mat
+
+
+def _decode_entered(red, k):
+    """The lens a ray entered from the red sum (entry_marking_glass): -1 for no
+    lens top, and for two or more (such a ray counts as stray light)."""
+    valid = red > 0.5
+    worst = float(np.max(np.abs(red[valid] - np.rint(red[valid])))) if valid.any() else 0.0
+    if worst > 1e-3:
+        raise RuntimeError(f"view {k}: entered-lens sums are not integers (worst {worst}); radiance was scaled")
+    if np.any(valid & (red < ENTRY_FLAG + 0.5)):
+        raise RuntimeError(f"view {k}: an entered-lens sum below the entry flag")
+    return np.where(valid & (red < 2.0 * ENTRY_FLAG), np.rint(red) - ENTRY_FLAG - 1.0, -1).astype(np.int32)
 
 
 def add_remapper(cfg):
@@ -688,10 +710,9 @@ def render_views(views, stem, out_dir):
 
 
 def evaluate(cfg, cam, out_dir):
-    """Per view: the panel pixel each camera ray reaches (pix_k, flat j*N+i), and
-    the lens it enters (entered_k), read from a second render in which the MLA
-    is opaque and emits its own lens id. All pixel renders first, then all lens
-    renders: the material changes once, not twice per view. The views render as
+    """Per view, from one render: the panel pixel each camera ray reaches (pix_k,
+    flat j*N+i, from green and blue) and the lens it entered (entered_k, from red:
+    entry_marking_glass; -1 for no lens top or for two). The views render as
     multi-view batches (view_cameras), the same pixels as one render per view."""
     sc = bpy.context.scene
     sc.cycles.samples = 1
@@ -699,21 +720,17 @@ def evaluate(cfg, cam, out_dir):
     n = cfg["panel_pixels"]
     mla = bpy.data.objects["MLA"]
     views = view_cameras(cam, cfg["views_mm"])
+    mla.data.materials[0] = entry_marking_glass(cfg["index"])
 
-    def save_pix(k, a):
+    def save(k, a):
         i, j = _decode(a[:, :, 1], "pixel column", k), _decode(a[:, :, 2], "pixel row", k)
         np.save(out_dir / f"pix_{k}.npy", np.where((i >= 0) & (j >= 0), j * n + i, -1).astype(np.int32))
-
-    def save_entered(k, a):
-        np.save(out_dir / f"entered_{k}.npy", _decode(a[:, :, 0], "entered lens", k))
+        np.save(out_dir / f"entered_{k}.npy", _decode_entered(a[:, :, 0], k))
 
     # the numpy decoding runs in threads while the next batch renders (a render
     # releases the GIL); bpy itself (the image loads) stays on this thread
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for job in [pool.submit(save_pix, k, a) for k, a in render_views(views, "eval", out_dir)]:
-            job.result()
-        mla.data.materials[0] = lens_id_material()
-        for job in [pool.submit(save_entered, k, a) for k, a in render_views(views, "entered", out_dir)]:
+        for job in [pool.submit(save, k, a) for k, a in render_views(views, "eval", out_dir)]:
             job.result()
     sc.render.use_multiview = False
     sc.camera = cam
