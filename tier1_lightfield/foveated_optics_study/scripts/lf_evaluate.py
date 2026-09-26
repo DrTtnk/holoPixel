@@ -35,6 +35,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import torch
 from scipy.spatial import cKDTree
 
 import foveation_target as ft
@@ -243,7 +244,10 @@ def metrics(view_dir, views, centres, panel_pixels):
     directions, so one of them sees wrong content. Stray light (a ray that
     reaches a pixel through no lens, or more than STRAY_DEG from its lens's
     chief direction) is left out of every lens metric, makes its pixel a ghost
-    pixel, and counts as a ghost of the lens it entered."""
+    pixel, and counts as a ghost of the lens it entered.
+
+    The per-view passes run on the GPU (fp64). Their float sums are atomic, in
+    no fixed order: results agree with a CPU run to ~1e-8, not bit for bit."""
     d = _unit(np.load(view_dir / "direction.npy").astype(np.float64)).reshape(-1, 3)
     n_lens, n_views = len(centres), len(views)
     order = np.argsort(np.linalg.norm(views, axis=1))
@@ -277,45 +281,64 @@ def metrics(view_dir, views, centres, panel_pixels):
     offset = np.stack([np.bincount(ent, weights=uv[:, c], minlength=n_lens) for c in range(2)], axis=1)
     offset[chief] = offset[chief] / count[chief, None] - centres[chief]
 
-    first = np.full(panel_pixels**2, -1, dtype=np.int64)
-    conflict = np.zeros(panel_pixels**2, dtype=bool)
-    pix_sum = np.zeros((panel_pixels**2, 3))
-    pix_n = np.zeros(panel_pixels**2)
-    seen, total, sq_all, delivered = (np.zeros(n_lens) for _ in range(4))
+    dev = torch.device("cuda")
+    gpu = lambda a: torch.as_tensor(a, device=dev)  # noqa: E731
+    n_pix = panel_pixels**2
+    d_g, mean_g, chief_g, pitch_g = gpu(d), gpu(mean), gpu(chief), gpu(pitch)
+    cos_stray = math.cos(math.radians(STRAY_DEG))
+
+    def rays_gpu(k):
+        pix_k = gpu(np.load(view_dir / f"pix_{k}.npy").ravel())
+        ent_k = gpu(np.load(view_dir / f"entered_{k}.npy").ravel())
+        ok = pix_k >= 0
+        return torch.nonzero(ok)[:, 0], pix_k[ok].long(), ent_k[ok].long()
+
+    first = torch.full((n_pix,), -1, dtype=torch.int64, device=dev)
+    conflict = torch.zeros(n_pix, dtype=torch.bool, device=dev)
+    pix_sum = torch.zeros(n_pix, 3, dtype=torch.float64, device=dev)
+    pix_n = torch.zeros(n_pix, dtype=torch.float64, device=dev)
+    seen, total, sq_all, delivered = (torch.zeros(n_lens, dtype=torch.float64, device=dev) for _ in range(4))
     n_stray = n_reach = 0
-    in_fov = _in_fov(d)
+    in_fov = gpu(_in_fov(d))
     n_fov = int(in_fov.sum())
     reached = []                                                       # throughput: in-field rays through a lens
     for k in order:
-        idx, pix, ent = rays(k)
-        reached.append(int(in_fov[idx[ent >= 0]].sum()) / n_fov)
-        di = d[idx]
-        bad = stray(di, ent)
+        idx, pix, ent = rays_gpu(k)
+        lensed = ent >= 0
+        reached.append(int(in_fov[idx[lensed]].sum()) / n_fov)
+        di = d_g[idx]
+        lens = ent.clamp(min=0)
+        bad = ~lensed | (chief_g[lens] & ((di * mean_g[lens]).sum(-1) < cos_stray))   # stray()
         conflict[pix[bad]] = True
         n_stray, n_reach = n_stray + int(bad.sum()), n_reach + len(pix)
-        delivered += np.bincount(ent[ent >= 0], minlength=n_lens)     # every ray a lens sends, stray or not
+        delivered += torch.bincount(ent[lensed], minlength=n_lens)    # every ray a lens sends, stray or not
         di, pix, ent = di[~bad], pix[~bad], ent[~bad]
-        for c in range(3):
-            pix_sum[:, c] += np.bincount(pix, weights=di[:, c], minlength=panel_pixels**2)
-        pix_n += np.bincount(pix, minlength=panel_pixels**2)
-        per_lens = np.bincount(ent, minlength=n_lens)
+        pix_sum.index_add_(0, pix, di)
+        pix_n += torch.bincount(pix, minlength=n_pix)
+        per_lens = torch.bincount(ent, minlength=n_lens)
         seen += per_lens > 0
-        ang = np.arccos(np.clip(np.einsum("ij,ij->i", di, mean[ent]), -1.0, 1.0))
         total += per_lens
-        sq_all += np.bincount(ent, weights=ang**2, minlength=n_lens)
+        ang = torch.arccos(torch.clamp((di * mean_g[ent]).sum(-1), -1.0, 1.0))
+        sq_all.index_add_(0, ent, ang**2)
+        # a pixel's first lens; among one view's rays on a new pixel the last one
+        # in raster order wins, as a numpy assignment would pick it
         new = first[pix] < 0
-        first[pix[new]] = ent[new]
+        last = torch.full((n_pix,), -1, dtype=torch.int64, device=dev)
+        last.scatter_reduce_(0, pix[new], torch.nonzero(new)[:, 0], "amax")
+        taken = last >= 0
+        first[taken] = ent[last[taken]]
         other = first[pix]
-        differs = (other != ent) & chief[ent] & chief[other]
-        far = np.zeros(len(pix), dtype=bool)
-        far[differs] = np.arccos(np.clip(np.einsum("ij,ij->i", mean[ent[differs]], mean[other[differs]]),
-                                         -1.0, 1.0)) > 3.0 * pitch[ent[differs]]
-        conflict[pix[far]] = True
-    ghosts = np.zeros(n_lens)
+        differs = (other != ent) & chief_g[ent] & chief_g[other]
+        e, o = ent[differs], other[differs]
+        far = torch.arccos(torch.clamp((mean_g[e] * mean_g[o]).sum(-1), -1.0, 1.0)) > 3.0 * pitch_g[e]
+        conflict[pix[differs][far]] = True
+    ghosts = torch.zeros(n_lens, dtype=torch.float64, device=dev)
     for k in order:
-        _, pix, ent = rays(k)
-        lensed = ent >= 0
-        ghosts += np.bincount(ent[lensed & conflict[pix]], minlength=n_lens)
+        _, pix, ent = rays_gpu(k)
+        hit_ghost = (ent >= 0) & conflict[pix]
+        ghosts += torch.bincount(ent[hit_ghost], minlength=n_lens)
+    first, pix_sum, pix_n, seen, total, sq_all, delivered, ghosts = (
+        t.cpu().numpy() for t in (first, pix_sum, pix_n, seen, total, sq_all, delivered, ghosts))
 
     valid = chief & (total > 0) & _in_fov(mean)
     lens_spread_rad = np.sqrt(sq_all[valid] / total[valid])

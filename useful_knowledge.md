@@ -993,3 +993,9 @@ all bit-identical on the stored views:
 GPU + CPU rendering was slower (4.7 s) and NOT identical (every view differs).
 cProfile lumps numpy's C work into the calling function's own time: use
 section timers to find the slow lines.
+
+A numpy assignment `a[idx] = v` with repeated indices keeps the LAST value;
+the same assignment on CUDA keeps an arbitrary one. The evaluator's "first
+lens of a pixel" depends on it, so the GPU metrics pick the last ray per pixel
+explicitly (scatter_reduce "amax" of the ray position). Only the float sums
+then differ from the CPU run (atomic order, <= 2e-14 in the report).

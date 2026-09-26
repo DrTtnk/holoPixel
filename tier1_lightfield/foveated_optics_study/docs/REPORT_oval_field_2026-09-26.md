@@ -8,8 +8,9 @@
 - The 2-lens glass pancake at the 100 x 80 ellipse is now the best wide
   design. Its coverage (0.969) is above that of the 84 x 61 rectangle.
 - Wider ellipses fail: from 107.5 x 86 deg the ghosts come back (0.36).
-- The Cycles evaluation is about **1.8x faster**, with the same results:
-  about 10 min became 5.7 min, and `report.json` stays identical.
+- The Cycles evaluation is about **2x faster**: about 10 min became ~5 min.
+  The render and mesh changes are bit-identical. The GPU metrics agree with
+  the CPU ones to 2e-14 in the report.
 
 All numbers come from the Cycles evaluation (`lf_evaluate.py`, 2560 px panel).
 
@@ -83,10 +84,14 @@ map compresses the periphery. It covers 19 % of the lenses.
 | EXR written uncompressed (read back at once) | small gain | |
 | Lenslet mesh: an array rebuilt inside a loop | 76 s | 25 s |
 | Metrics: one pass fewer, no `np.isin` / `np.unique` | 80 s | 53 s |
-| **Whole evaluation (100 x 80)** | **~10 min** | **5.7 min** |
+| Metrics: per-view passes on the GPU (fp64 torch) | 53 s | 16 s |
+| **Whole evaluation (100 x 80)** | **~10 min** | **~5 min** |
 
-- Each change was checked bitwise: the per-view pixel and lens arrays, the
-  lenslet mesh for both flips, and `report.json` end to end.
+- Each CPU change was checked bitwise: the per-view pixel and lens arrays,
+  the lenslet mesh for both flips, and `report.json` end to end (5.7 min).
+- The GPU metrics sum floats with atomic adds, in no fixed order (chosen for
+  speed). Every count-based number is exact; the blur percentiles differ by
+  up to 2e-14 relative, and per-lens blur by up to 6e-11.
 - GPU + CPU rendering was slower (4.7 s a view) and not identical, so it is
   not used.
 - A trap in Blender's multi-view render: a view's camera is found by swapping
@@ -99,5 +104,5 @@ map compresses the periphery. It covers 19 % of the lenses.
    area).
 2. Bring the edge middles back onto the panel (the panel polish of the
    84 x 61 work), for coverage 0.98.
-3. Speed-up: move the metrics' per-view bincounts to the GPU (about 35 s of
-   the remaining 53 s).
+3. Speed-up: the renders are now ~80 % of an evaluation (~1.5 s a view,
+   ~3 min).
