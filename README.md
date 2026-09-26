@@ -71,13 +71,14 @@ cd tier1_lightfield/foveated_optics_study/remapper_designs
 python coaxial_dls/gpu_search.py <out> --elements 5
 python coaxial_dls/export_candidate.py <out>/best_el5_flat.json <design_dir>
 # folded: panel above the eye, freeform mirror, 1-2 freeform correctors
-python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or glass; --ratio-weight 0 frees the mapping
+python freeform_mirror/fold_search.py <out> --elements 1 --material resin   # or glass; --weight ratio=0 frees the mapping
 # seeded from earlier designs, and with a B-spline of K cells on the (half-)mirror (fold and pancake alike)
 python freeform_mirror/fold_search.py <out> --elements 1 --material glass --seed-from freeform_mirror/results_fold/best_fold_el1_glass.json --spline-cells 4
 # a seed that already carries a spline keeps its own grid: give no --spline-cells
 python freeform_mirror/pancake_search.py <out> --elements 1 --material glass --seed-from freeform_mirror/results_pancake/best_pancake_el1_glass_spline4.json
 # field continuation: seeds searched for another field, accepted only on request
 HOLOPIXEL_FIELD_DEG=72x47 python freeform_mirror/pancake_search.py <out> --elements 1 --material glass --seed-from freeform_mirror/results_pancake/best_pancake_el1_glass_spline4.json --seed-other-field
+# --weight NAME=VALUE (repeatable) replaces a merit weight, --tilt-max-deg the chief-ray tilt limit; results record both
 python freeform_mirror/pancake_search.py <out> --elements 1 --material resin   # pancake: polarisation fold, round lens
 python freeform_mirror/export_fold.py <out>/best_fold_el1_resin.json <design_dir>
 python freeform_mirror/export_pancake.py <out>/best_pancake_el1_resin.json <design_dir>

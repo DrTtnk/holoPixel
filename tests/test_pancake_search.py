@@ -215,3 +215,21 @@ def test_a_stored_design_of_another_field_seeds_a_continuation_when_asked(device
     finally:
         other.unlink()
     assert x[0].tolist() == entry["x"] and idx[0].tolist() == entry["indices"]
+
+
+def test_a_run_records_the_merit_weights_it_used(tmp_path, device):
+    """The map weight is a search setting: every result entry records the weights
+    its loss was computed with, so losses of runs with other weights are not
+    compared blindly."""
+    import json
+    weights = fs.weight_overrides(["map=2.5", "tilt=30"])
+    assert weights == {**fs.W, "map": 2.5, "tilt": 30.0}
+    fs.run(tmp_path, 1, "resin", 4, 1, 0, device, family="pancake", weights=weights, tilt_max_deg=20.0)
+    entries = json.loads((tmp_path / "best_pancake_el1_resin.json").read_text())
+    assert all(e["weights"] == weights and e["tilt_max_deg"] == 20.0 for e in entries)
+
+
+@pytest.mark.parametrize("bad", ["mapp=2", "map", "map=x", "=3"])
+def test_a_weight_override_must_name_a_merit_term_and_a_number(bad):
+    with pytest.raises(ValueError):
+        fs.weight_overrides([bad])

@@ -395,7 +395,19 @@ def outside_violation(land, alive):
     return torch.relu(PANEL_HALF_MM + OUT_MARGIN_MM - land.abs().amax(-1)) * alive.double()
 
 
-def context(device, weights=W):
+def weight_overrides(pairs):
+    """["name=value", ...] -> W with those merit weights replaced; a name must be a
+    merit term and a value a number."""
+    out = dict(W)
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        if not sep or name not in W:
+            raise ValueError(f"--weight {pair!r}: give NAME=VALUE with NAME one of {sorted(W)}")
+        out[name] = float(value)
+    return out
+
+
+def context(device, weights=W, tilt_max_deg=TILT_MAX_DEG):
     fields = field_grid()
     pupil = pupil_samples()
     ids, n_cells = pupil_cells(fields, pupil)
@@ -410,7 +422,7 @@ def context(device, weights=W):
     det_t = cell_det(np.stack(ft.field_to_panel_mm(rd[..., 0], rd[..., 1]), -1)[None])[0]
     if not (np.all(det_t > 0) or np.all(det_t < 0)):
         raise ValueError("the target map folds on the dense grid")
-    return {"weights": dict(weights), "fields": t(fields), "fd_fields": t(fd), "pupil": t(pupil), "onehot": onehot,
+    return {"weights": dict(weights), "tilt_max_deg": tilt_max_deg, "fields": t(fields), "fd_fields": t(fd), "pupil": t(pupil), "onehot": onehot,
             "tol": t(ft.blur_tolerance_rad(np.radians(fields[:, 0]), np.radians(fields[:, 1]))),
             "jac_target": t(jac_t), "sv_target": t(np.linalg.svd(jac_t, compute_uv=False)),
             "panel_target": t(panel_t), "n_fields": len(fields),
@@ -487,7 +499,7 @@ def residuals(x, indices, lay, ctx):
     r_map = ((h0 - flip * ctx["panel_target"][None]) / MAP_SCALE_MM
              * torch.sqrt(ctx["weights"]["map"] * okd / F)[..., None])
     cos_t = dir_fd[:, :F, 0, 2].abs()
-    r_tilt = (torch.relu(torch.rad2deg(torch.acos(torch.clamp(cos_t, max=1.0 - 1e-12))) - TILT_MAX_DEG)
+    r_tilt = (torch.relu(torch.rad2deg(torch.acos(torch.clamp(cos_t, max=1.0 - 1e-12))) - ctx["tilt_max_deg"])
               * torch.sqrt(ctx["weights"]["tilt"] * okd / F))
 
     nd = ctx["dense_fields"].shape[0]
@@ -752,8 +764,8 @@ def fd_jacobian(x, indices, lay, ctx, r0, free, lo, hi, h=1e-5, chunk=FD_CHUNK):
     return J
 
 
-def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["ratio"], tag_suffix="", family="fold",
-        seed_from=(), spline_cells=0, seed_other_field=False):
+def run(out_dir, n_el, material, count, iters, seed, device, weights=W, tag_suffix="", family="fold",
+        seed_from=(), spline_cells=0, seed_other_field=False, tilt_max_deg=TILT_MAX_DEG):
     """Batched Levenberg-Marquardt (damped least squares), one damping per
     design. Each iteration tries four dampings and keeps the best step that
     lowers the merit and loses no ray. High-order terms are frozen for the
@@ -767,7 +779,7 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
     if "spline" in lay:
         lo, hi = bounds(lay, device)
         print(f"mirror spline: grid {lay['spline']['grid']}, controls {lay['spline']['shape']}", flush=True)
-    ctx = context(device, {**W, "ratio": ratio_weight})
+    ctx = context(device, weights, tilt_max_deg)
     with torch.no_grad():
         if seed_from:
             x_s, idx_s = stored_seeds(seed_from, lay, material, device, ctx, other_field=seed_other_field)
@@ -825,13 +837,21 @@ def run(out_dir, n_el, material, count, iters, seed, device, ratio_weight=W["rat
                     "flip_u": lay["flip_u"], "flip_v": lay["flip_v"],
                     "spline": ({"grid": lay["spline"]["grid"], "shape": lay["spline"]["shape"]}
                                if "spline" in lay else {}),
-                    "material": material, "field_deg": spec.FIELD_DEG,
+                    "material": material, "field_deg": spec.FIELD_DEG, "weights": ctx["weights"],
+                    "tilt_max_deg": ctx["tilt_max_deg"],
                     "prescription": to_prescription(x[b].detach(), indices[b], lay)})
     tag = f"{family}_el{n_el}_{material}{tag_suffix}"
     (Path(out_dir) / f"best_{tag}.json").write_text(json.dumps(out, indent=1))
     top = out[0]
     print(f"TOP {tag}: loss {top['loss']:.3f} blur {top['blur']:.3f} alive {top['alive_all']:.3f} "
           f"worst-cell blur p90 {np.percentile(top['worst_cell_blur_per_field'], 90):.2f}", flush=True)
+
+
+def add_merit_options(ap):
+    ap.add_argument("--weight", action="append", default=[], metavar="NAME=VALUE",
+                    help=f"replace a merit weight (repeatable), NAME one of {sorted(W)}; ratio=0 frees the mapping")
+    ap.add_argument("--tilt-max-deg", type=float, default=TILT_MAX_DEG,
+                    help="chief rays may reach the lenslet array this far from its normal before the tilt term acts")
 
 
 register("fold", layout=fold_layout, bounds=fold_bounds, random_designs=fold_random_designs,
@@ -846,20 +866,19 @@ def main():
     ap.add_argument("--designs", type=int, default=256)
     ap.add_argument("--iters", type=int, default=90)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--ratio-weight", type=float, default=W["ratio"],
-                    help="weight of the magnification target; 0 leaves the mapping free (diagnostic)")
     ap.add_argument("--tag", default="", help="suffix of the output file name")
     ap.add_argument("--seed-from", nargs="*", default=[], help="best_*.json files whose designs join the seeds")
     ap.add_argument("--spline-cells", type=int, default=0,
                     help="add a B-spline of this many cells across to the mirror (needs --seed-from)")
     ap.add_argument("--seed-other-field", action="store_true",
                     help="accept --seed-from designs searched for another field (a field continuation)")
+    add_merit_options(ap)
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"),
-        ratio_weight=args.ratio_weight, tag_suffix=args.tag, seed_from=args.seed_from, spline_cells=args.spline_cells,
-        seed_other_field=args.seed_other_field)
+        weights=weight_overrides(args.weight), tag_suffix=args.tag, seed_from=args.seed_from,
+        spline_cells=args.spline_cells, seed_other_field=args.seed_other_field, tilt_max_deg=args.tilt_max_deg)
 
 
 if __name__ == "__main__":

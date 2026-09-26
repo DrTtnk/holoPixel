@@ -168,12 +168,14 @@ def main():
                     help="add a B-spline of this many cells across to the half-mirror (needs --seed-from)")
     ap.add_argument("--seed-other-field", action="store_true",
                     help="accept --seed-from designs searched for another field (a field continuation)")
+    fs.add_merit_options(ap)
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     fs.run(args.out_dir, args.elements, args.material, args.designs, args.iters, args.seed, torch.device("cuda"),
            family="pancake", seed_from=args.seed_from, tag_suffix=args.tag, spline_cells=args.spline_cells,
-           seed_other_field=args.seed_other_field)
+           seed_other_field=args.seed_other_field, weights=fs.weight_overrides(args.weight),
+           tilt_max_deg=args.tilt_max_deg)
 
 
 if __name__ == "__main__":
