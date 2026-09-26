@@ -22,17 +22,20 @@ landing error 0.0125 mm).
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
 import torch
 
+import export_fold as ef
 import fold_search as fs
 import offaxis_tracer as ot
 
 EYE_RELIEF_MIN_MM = 15.0
 TRACK_MAX_MM = 40.0          # pupil to lenslet array: the point of a pancake
 HM_R0_MM, LENS_R0_MM = 20.0, 10.0
+LENS_DOMAIN_SCALE = 100.0    # x the barrier weight: 3000, a lens that cannot be built is a failure, not a trade
 LENS_SHAPE_MM = 20.0         # bound of the lens shape parameters: the 70 x 45 best lens back sat at +-10
 
 
@@ -134,9 +137,34 @@ def to_batch(x, indices, lay):
                     image_sag=fs.bowl(x.device, lay["flip_v"], light_along_z=1))
 
 
+def lens_domain_violation(batch, pts, alive, lay):
+    """Squared shortfall below DOMAIN_MIN of each lens face's sag-domain margin
+    1 - (1 + k) c^2 r^2 on the disc the exporter builds the lens over: the front's
+    footprint (every pass, both halves) about its y centre, plus
+    export_fold.MARGIN_MM, taken at the disc's point farthest from the (common)
+    axis. (B,)"""
+    B = pts.shape[0]
+    live = alive.reshape(B, -1)
+    lenses = [((0, 2), (2, 3))] + [((4 + 2 * e,), (4 + 2 * e, 5 + 2 * e)) for e in range(lay["n_el"] - 1)]
+    total = torch.zeros(B, dtype=pts.dtype, device=pts.device)
+    for fronts, faces in lenses:
+        h = torch.cat([pts[:, s].reshape(B, -1, 3) for s in fronts], 1)
+        m = live.repeat(1, len(fronts))
+        y = h[..., 1]
+        cy = 0.5 * (torch.where(m, y, torch.full_like(y, math.inf)).amin(1)
+                    + torch.where(m, y, torch.full_like(y, -math.inf)).amax(1))
+        r = torch.where(m, torch.hypot(h[..., 0], y - cy[:, None]), torch.zeros_like(y)).amax(1) + ef.MARGIN_MM
+        r_axis = r + cy.abs()
+        for s in faces:
+            margin = 1.0 - (1.0 + batch.k[:, s]) * batch.c[:, s] ** 2 * r_axis**2
+            total = total + torch.relu(fs.DOMAIN_MIN - margin) ** 2
+    return total
+
+
 def constraints(batch, diag, alive, lay, x):
     """Space: the lenslet array within TRACK_MAX_MM of the pupil. Barriers: air
-    and glass floors along every ray, TIR and sag-domain margins."""
+    and glass floors along every ray, TIR and sag-domain margins (also over each
+    exported lens disc)."""
     pts = diag["points"]                                                 # (B, S, F, P, 3)
     live = alive[:, None].double()
     space = torch.relu(batch.z[:, -1] - TRACK_MAX_MM) ** 2 * 100.0
@@ -147,6 +175,7 @@ def constraints(batch, diag, alive, lay, x):
     barrier = (torch.relu(floor[None, :, None, None] - seg) ** 2 * live).sum((1, 2, 3))
     barrier = barrier + (torch.relu(diag["sin2t"][:, :-1] - fs.SIN2_MAX) ** 2 * live).sum((1, 2, 3))
     barrier = barrier + (torch.relu(fs.DOMAIN_MIN - diag["domain"]) ** 2 * alive[:, None].double()).sum((1, 2, 3))
+    barrier = barrier + LENS_DOMAIN_SCALE * lens_domain_violation(batch, pts, alive, lay)   # the exported lens keeps its sag domain
     return space, barrier
 
 

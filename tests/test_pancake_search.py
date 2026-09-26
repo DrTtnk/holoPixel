@@ -233,3 +233,23 @@ def test_a_run_records_the_merit_weights_it_used(tmp_path, device):
 def test_a_weight_override_must_name_a_merit_term_and_a_number(bad):
     with pytest.raises(ValueError):
         fs.weight_overrides([bad])
+
+
+def test_the_lens_domain_covers_the_exported_disc(device):
+    """The exporter builds each lens over its front's footprint disc plus
+    export_fold.MARGIN_MM, and every face of the lens must keep its sag domain
+    there. The stored designs export, so their violation is zero; a lens back
+    whose conic closes the domain inside the disc is penalised."""
+    import json
+    ctx = fs.context(device)
+    for path in (STORED, SPLINED):
+        entry = json.loads(path.read_text())[0]
+        lay = fs.entry_layout(entry, "pancake")
+        x = torch.tensor([entry["x"]], dtype=torch.float64, device=device)
+        idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=device)
+        batch = fs.to_batch(x, idx, lay)
+        _, _, alive, diag = ot.trace(batch, ctx["fields"], ctx["pupil"], diagnostics=True)
+        assert float(ps.lens_domain_violation(batch, diag["points"], alive, lay)[0]) == 0.0
+        closed = batch._replace(k=batch.k.clone())
+        closed.k[0, 3] = 1.0 / (float(batch.c[0, 3]) ** 2 * 64.0) - 1.0          # domain edge at r = 8 mm
+        assert float(ps.lens_domain_violation(closed, diag["points"], alive, lay)[0]) > 0.0

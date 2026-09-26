@@ -911,3 +911,21 @@ camera is now CAMERA_FOV_DEG = 2 (max half field + 3 deg), with the resolution
 scaled so its central pixel angle stays that of 76 deg over 2048 px. Lesson:
 when a constant becomes a parameter, grep for every number derived from its old
 value (76 = 2 x (35 + 3)), not only for its name.
+
+## pkill -f and pgrep -f match the shell that runs them
+
+`pkill -f "<pattern>"` inside a longer shell command kills that shell too when
+the pattern appears anywhere in its command line (exit 144, nothing after it
+runs), and `until ! pgrep -f "<pattern>"` waits forever on itself. Find the PID
+in a separate call (ps -eo pid,args, a [b]racketed pattern) and kill by PID.
+
+## The best wide pancakes could not be built: their lens left its sag domain
+
+At 100 x 80 the top-ranked 2-lens designs could not be exported: a lens face's
+conic closed its sag domain inside the disc the exporter builds (the front's
+footprint plus 1 mm), where the traced rays never go. The search only watched
+the domain at the traced hits. pancake_search.lens_domain_violation now checks
+each lens face at the disc's point farthest from the axis; it agrees with the
+exporter rank by rank (positive exactly for the ranks that fail). At the
+barrier weight (30) the search traded it away (still 3 of 5 ranks failed), so
+it is scaled to 3000: a lens that cannot be built is a failure, not a trade.
