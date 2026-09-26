@@ -929,3 +929,14 @@ each lens face at the disc's point farthest from the axis; it agrees with the
 exporter rank by rank (positive exactly for the ranks that fail). At the
 barrier weight (30) the search traded it away (still 3 of 5 ranks failed), so
 it is scaled to 3000: a lens that cannot be built is a failure, not a trade.
+
+## Chief-ray tilt at the lenslets drives the stray light of a wide pancake
+
+At weight 1 the tilt term was ignored: the 96-100 deg pancakes reached 50 deg
+of chief-ray tilt at the image surface in the corners, and their Cycles ghosts
+(0.16-0.39, mostly stray light) filled the periphery. The peripheral lenslets
+are short (~54 um) and the 4 mm pupil subtends ~38 deg there, so a strongly
+tilted beam enters the lenslets far off their axis. A continuation with
+--weight tilt=30 --tilt-max-deg 20 (and --weight map=5) gave, at the same
+field, ghosts 0.001-0.002 and a lower blur: 84 x 61 rank 1 coverage 0.925,
+blur 5.4/9.5, ghost 0.002 (the untilted chain: 0.966, 6.8/12.8, 0.065).

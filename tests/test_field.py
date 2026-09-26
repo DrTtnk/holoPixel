@@ -89,3 +89,22 @@ def test_a_design_of_another_field_is_refused_before_rendering(tmp_path):
             "ev.render_views(d, d / 'work')")
     out = _run(code)
     assert out.returncode != 0 and "field" in out.stderr and "100" in out.stderr
+
+
+@pytest.mark.parametrize("name, field", [("fov84x61", "84x61.3"), ("fov88x66", "88x66")])
+def test_the_stored_wide_pancakes_hold_under_their_own_field(name, field):
+    """The 2-lens field-continuation results keep every ray under their own field
+    (stored_seeds refuses one that loses rays) and their Cycles-evaluated ranks 0
+    and 1 can be built (no lens face leaves its sag domain on the exported disc)."""
+    code = ("import sys, json, torch; sys.path.insert(0, '../remapper_designs/freeform_mirror'); "
+            "import fold_search as fs, pancake_search as ps, offaxis_tracer as ot; "
+            f"p = '../remapper_designs/freeform_mirror/results_pancake/best_pancake_el2_glass_{name}.json'; "
+            "e = json.load(open(p))[0]; dev = torch.device('cuda'); lay = fs.entry_layout(e, 'pancake'); "
+            "ctx = fs.context(dev); x, idx = fs.stored_seeds([p], lay, 'glass', dev, ctx); "
+            "b = fs.to_batch(x[:2], idx[:2], lay); _, _, a, d = ot.trace(b, ctx['fields'], ctx['pupil'], diagnostics=True); "
+            "print(json.dumps([fs.spec.FIELD_DEG, ps.lens_domain_violation(b, d['points'], a, lay).tolist()]))")
+    out = _run(code, field)
+    assert out.returncode == 0, out.stderr
+    got_field, violation = json.loads(out.stdout)
+    assert got_field == [float(v) for v in field.split("x")]
+    assert violation == [0.0, 0.0]
