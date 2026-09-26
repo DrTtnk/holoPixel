@@ -133,16 +133,27 @@ def test_an_unknown_field_shape_is_refused():
     assert out.returncode != 0 and "HOLOPIXEL_FIELD_SHAPE" in out.stderr
 
 
-def test_the_target_map_stretches_the_ellipse_over_the_whole_panel():
-    """The ellipse's image touches the panel's left, right, top and bottom edges."""
-    code = ("import json, numpy as np, screen_spec as s, foveation_target as ft; "
+def test_the_target_map_stretches_the_ellipse_to_the_search_s_panel_limit():
+    """The ellipse's image reaches the search's panel limit on the left, right, top
+    and bottom (foveation_target.EDGE_MARGIN_MM inside the panel edges, the limit
+    fold_search keeps the chief rays in); a rectangle's image keeps the whole panel,
+    as its stored designs were made for."""
+    code = ("import sys, json, numpy as np, screen_spec as s, foveation_target as ft; "
+            "sys.path.insert(0, '../remapper_designs/freeform_mirror'); import fold_search as fs; "
             "tx, tz = np.radians(s.field_boundary_deg(2000)); u, v = ft.field_to_panel_mm(tx, tz); "
-            "print(json.dumps([float(np.abs(u).max()), float(v.min()), float(v.max()), ft.HALF_PANEL_MM]))")
+            "print(json.dumps([float(np.abs(u).max()), float(v.min()), float(v.max()), ft.HALF_PANEL_MM, "
+            "ft.EDGE_MARGIN_MM, fs.PANEL_HALF_MM]))")
     out = _run(code, "112x90", "ellipse")
     assert out.returncode == 0, out.stderr
-    u_max, v_min, v_max, half = json.loads(out.stdout)
-    assert u_max == pytest.approx(half, abs=1e-3)
-    assert (v_min, v_max) == pytest.approx((-half, half), abs=1e-3)
+    u_max, v_min, v_max, half, margin, search_half = json.loads(out.stdout)
+    assert margin == pytest.approx(0.1) and search_half == pytest.approx(half - margin)
+    assert u_max == pytest.approx(half - margin, abs=1e-3)
+    assert (v_min, v_max) == pytest.approx((-(half - margin), half - margin), abs=1e-3)
+    rect = _run(code, "112x90")
+    assert rect.returncode == 0, rect.stderr
+    u_max, v_min, v_max, half, margin, search_half = json.loads(rect.stdout)
+    assert search_half == pytest.approx(half - margin)
+    assert max(u_max, -v_min, v_max) == pytest.approx(half, abs=1e-3)
 
 
 _ELLIPSE_SEARCH = ("import sys, json, numpy as np; sys.path.insert(0, '../remapper_designs/freeform_mirror'); "

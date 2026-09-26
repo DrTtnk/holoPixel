@@ -6,7 +6,9 @@
   rectangle. The display then has a black mask over the lenslets outside
   the design's own image of the ellipse.
 - The 2-lens glass pancake at the 100 x 80 ellipse is now the best wide
-  design. Its coverage (0.969) is above that of the 84 x 61 rectangle.
+  design. After an edge polish it passes the coverage mark (0.983 against
+  0.98; the 84 x 61 rectangle has 0.945), with ghost 0.010. Blur is the one
+  metric that still fails.
 - Wider ellipses fail: from 107.5 x 86 deg the ghosts come back (0.36).
 - The Cycles evaluation is about **3.4x faster**: about 10 min became 3.0 min.
   The render and mesh changes are bit-identical. The GPU metrics agree with
@@ -20,7 +22,8 @@ All numbers come from the Cycles evaluation (`lf_evaluate.py`, 2560 px panel).
 |---|---|---|---|---|---|---|
 | 84 x 61 | rectangle | 0.945 | 5.4 / 9.5 | 0.001 | 0.39 % | 18.4 mm |
 | 100 x 80 | rectangle | 0.890 | 7.7 / 13.5 | 0.104 | 3.2 % | 15.0 mm |
-| **100 x 80** | **ellipse** | **0.969** | **6.7 / 11.8** | **0.025** | **1.3 %** | 15.2 mm |
+| 100 x 80 | ellipse, before the edge polish | 0.969 | 6.7 / 11.8 | 0.025 | 1.3 % | 15.2 mm |
+| **100 x 80** | **ellipse, edge polish (stored)** | **0.983** | **6.6 / 10.6** | **0.010** | **0.67 %** | 15.2 mm |
 | 107.5 x 86 | ellipse | 0.925 | 8.3 / 13.2 | 0.355 | 6.5 % | 15.3 mm |
 | 112.84 x 90.27 (same area as 100 x 80) | ellipse | 0.848 | 10.9 / 16.8 | 0.373 | 11.7 % | 15.1 mm |
 
@@ -28,17 +31,32 @@ Result file: `remapper_designs/freeform_mirror/results_pancake/best_pancake_el2_
 (rank 0). Search, export and evaluation all need
 `HOLOPIXEL_FIELD_DEG=100x80 HOLOPIXEL_FIELD_SHAPE=ellipse`.
 
-The ghost figure (0.025; 0.027 under the stricter stray rule below) is below the 0.05 pass mark. Coverage (0.969 against
-0.98) and blur (p90 11.8 against 0.75) still fail.
+The stored design passes coverage (0.983 >= 0.98), ghost (0.010 <= 0.05) and
+eye relief (15.2 >= 15 mm). Blur (p90 10.6 against 0.75) still fails. The
+polished rows use the stricter stray rule and the target edge described
+below.
+
+**Edge polish.** The target map now stretches the ellipse to the search's
+panel limit (`foveation_target.EDGE_MARGIN_MM`, 0.1 mm inside the panel
+edge), not to the panel edge, so the map and panel terms no longer pull
+against each other at the edge. Two 60-iteration polishes started from the
+design before the polish:
+
+| Polish | Coverage | Blur median / p90 | Ghost | Stray |
+|---|---|---|---|---|
+| Before (re-evaluated under the new target) | 0.969 | 6.84 / 11.95 | 0.026 | 1.30 % |
+| A: `--weight panel=3000` | 0.997 | 7.83 / 12.74 | 0.019 | 0.99 % |
+| **B: `--weight panel=1000 --weight map=2` (stored)** | 0.983 | 6.61 / 10.60 | 0.010 | 0.67 % |
+
+B was chosen: it passes coverage and is the best on every other metric.
 
 ![coverage and ghost](img_oval/coverage_ghost_ell100x80.png)
 
 - The remaining coverage loss is at the left and right edge middles, beyond
-  about +-47 deg, where the design lands its field off the panel. There are
-  also thin slivers at the top and bottom.
-- The remaining ghosts are the map fold at the bottom centre, with a weaker
-  one at the top. The ellipse keeps those directions. The diagonal ghost
-  bands of the rectangle's corners are gone.
+  about +-47 deg, where the design lands its field off the panel.
+- The remaining ghosts are the map fold at the bottom centre. The ellipse
+  keeps those directions. The diagonal ghost bands of the rectangle's corners
+  are gone.
 
 ![mask](img_oval/mask_ell100x80.png)
 
@@ -115,6 +133,6 @@ map compresses the periphery. It covers 19 % of the lenses.
 
 1. At the 100 x 80 ellipse, remove the bottom-centre map fold (the main ghost
    area).
-2. Bring the edge middles back onto the panel (the panel polish of the
-   84 x 61 work), for coverage 0.98.
+2. Done: the edge polish (coverage 0.983). Polish A reached 0.997 at a blur
+   cost; a run between A and B could get both.
 3. Speed-up: the renders are now most of an evaluation (one pass, ~1 s a view).

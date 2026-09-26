@@ -120,9 +120,15 @@ def _boundary():
     return _unscaled(np.radians(tx), np.radians(tz))
 
 
+# The searches keep every chief ray EDGE_MARGIN_MM inside the panel edge. An
+# elliptic field is stretched to that limit, so the target and the search's panel
+# limit agree; a rectangular one keeps the whole panel, as its stored designs
+# were made for.
+EDGE_MARGIN_MM = 0.1
+_STRETCH_HALF_MM = HALF_PANEL_MM - (EDGE_MARGIN_MM if spec.FIELD_SHAPE == "ellipse" else 0.0)
 _BX, _BZ = _boundary()
-GX_MM = HALF_PANEL_MM / np.abs(_BX).max()
-GZ_MM = spec.PANEL_MM / (_BZ.max() - _BZ.min())
+GX_MM = _STRETCH_HALF_MM / np.abs(_BX).max()
+GZ_MM = 2.0 * _STRETCH_HALF_MM / (_BZ.max() - _BZ.min())
 V0_MM = -0.5 * (_BZ.max() + _BZ.min()) * GZ_MM
 
 

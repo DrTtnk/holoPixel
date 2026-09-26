@@ -73,7 +73,7 @@ MIN_GLASS_MM, MIN_AIR_MM = 1.0, 0.5
 TILT_MAX_DEG = 30.0
 SIN2_MAX, DOMAIN_MIN = 0.9, 0.05  # TIR and sag-domain barriers start here
 RATIO_BAND = (0.85, 1.2)
-PANEL_HALF_MM = spec.PANEL_MM / 2.0 - 0.1
+PANEL_HALF_MM = ft.HALF_PANEL_MM - ft.EDGE_MARGIN_MM
 MIRROR_R0_MM, LENS_R0_MM = 20.0, 10.0
 TERMS = ((0, 2), (2, 0), (0, 3), (2, 1), (0, 4), (2, 2), (4, 0), (0, 5), (2, 3), (4, 1), (0, 6), (2, 4), (4, 2),
          (6, 0))
