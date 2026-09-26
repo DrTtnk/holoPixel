@@ -940,3 +940,16 @@ tilted beam enters the lenslets far off their axis. A continuation with
 --weight tilt=30 --tilt-max-deg 20 (and --weight map=5) gave, at the same
 field, ghosts 0.001-0.002 and a lower blur: 84 x 61 rank 1 coverage 0.925,
 blur 5.4/9.5, ghost 0.002 (the untilted chain: 0.966, 6.8/12.8, 0.065).
+
+## At 100 x 80 the stray light is the lenslet array's edge, not the optics
+
+A thin-lens model of the lenslets would not have helped: for the stray rays of
+the 76 x 52 1-lens design, the lens Cycles says they entered sits where the
+tracer lands them (14 um median). The stray light there came from directions
+beyond the field (|tz| ~29.5 deg for a 26 deg half-height), half to three
+quarters of them rays the tracer loses. A black aperture on each lens beyond
+its traced footprint changed nothing on the 100 x 80 design (stray 3.2 % ->
+3.2 %) and was removed. On that design nearly all the stray light reaches the
+outermost pixel ring through no lens (entered code -1: the array's floor): the
+old 0.28 % edge leak through the panel gap, grown with the field. Next: a
+black side wall around the lenslet array floor and the panel gap.
