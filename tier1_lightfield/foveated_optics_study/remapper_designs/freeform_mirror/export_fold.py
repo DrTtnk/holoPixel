@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -289,7 +290,9 @@ def export_entry(entry, out_dir, device="cuda", source={}):
 
 
 _HX, _HZ = spec.FIELD_HALF_DEG
-FAN_FIELDS = ((0.0, 0.0), (0.0, _HZ), (0.0, -_HZ), (_HX, 0.0), (_HX, _HZ), (_HX, -_HZ), (17.0 * _HX / 35.0, 0.0))
+_CORNER = 1.0 if spec.FIELD_SHAPE == "rect" else math.sqrt(0.5)     # the field's corner, or the ellipse's diagonal
+FAN_FIELDS = ((0.0, 0.0), (0.0, _HZ), (0.0, -_HZ), (_HX, 0.0), (_CORNER * _HX, _CORNER * _HZ),
+              (_CORNER * _HX, -_CORNER * _HZ), (17.0 * _HX / 35.0, 0.0))
 FAN_PUPIL = tuple((0.0, py) for py in (-1.0, -0.5, 0.0, 0.5, 1.0))
 
 

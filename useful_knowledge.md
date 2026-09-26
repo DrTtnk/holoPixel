@@ -956,3 +956,40 @@ panel gap, grown with the field; the rest of its 3.2 % is not yet split. Its
 main ghost areas are a map fold at the top and bottom centre (ratio > 3,
 unlit lenses), not the edge. Lesson: a two-view sample is not the whole
 stray budget; check the maps before naming the main cause.
+
+## A mask placed by the target map needs a panel term that follows the mask
+
+The first elliptic-field run (100 x 80 ellipse, 35 iterations from the
+rectangular best) put the black mask at the target map's image of the ellipse,
+but kept the old panel term (land anywhere on the panel). The design's map is
+3-7 % wider than the target at the edge: the field edge (50, 0) landed at
+9.90 mm against the target's 9.22 mm, beyond even the panel. The whole edge
+band then fell behind the mask and Cycles coverage dropped from 0.89 to 0.74
+(blur and stray got better). Wrong assumption: that the map term keeps the
+edge on the target. With a mask, "on the panel" becomes "inside the mask
+opening". A panel term against the target's opening (at weight 300) pulled
+the edge in only a little (0.69 -> 0.59 mm short; coverage 0.81). The mask
+now follows each design instead: its opening is the design's own image of the
+ellipse edge (fold_search.opening_polygon), written by the exporter
+(mask.npz); the tracer estimate of the coverage it keeps was 0.96. The same
+check showed the stored 100 x 80 rectangle design folding back beyond ~57 deg
+horizontally: rays from there land up to 1 mm inside its own field image.
+
+## Evaluation speed: measure before guessing
+
+The guess "the ZIP EXR round trip dominates" was wrong: codec NONE saved only
+~0.1-0.6 s of a 4.5 s view. The render call itself was 3.6-5 s, and ~1 s of
+it is a fixed cost per call (a 512 px render still took 1.05 s). What worked,
+all bit-identical on the stored views:
+- one render tile (tile_size >= the 3479 px resolution): 4.5 -> 3.2 s a view;
+- Blender multi-view renders, 16 views per call: -> ~1.5 s a view. Trap:
+  Blender finds a view's camera by swapping the view suffix at the END of the
+  ACTIVE camera's name; if that name ends in no view suffix it silently renders
+  every view with the active camera (all views identical). Make the first
+  view camera (<cam>_0) active;
+- mla_mesh.build_variable rebuilt a 4.8 M-element array inside the border loop
+  (~6000 times): hoisted, 76 -> 25 s;
+- lf_evaluate.metrics: one pass fewer, no np.isin / np.unique: 80 -> 53 s.
+GPU + CPU rendering was slower (4.7 s) and NOT identical (every view differs).
+cProfile lumps numpy's C work into the calling function's own time: use
+section timers to find the slow lines.

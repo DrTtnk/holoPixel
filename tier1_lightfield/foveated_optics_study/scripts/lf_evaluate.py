@@ -6,7 +6,9 @@
     {"focal_um": lenslet focal length        (a uniform array), or
      "lenslets": "variable_retina",          (variable_lenslets, with "lenslet_flip_v": +1 or -1)
      "panel_pose": {"origin_mm": [x, y, z], "basis": [u_world, v_world, w_world]},
-     "remapper_npz": "remapper.npz"}          (relative to design_dir)
+     "remapper_npz": "remapper.npz",          (relative to design_dir)
+     "mask_npz": "mask.npz"}                  (exactly when HOLOPIXEL_FIELD_SHAPE=ellipse: the black
+                                              mask over the lenslets: grid_u, grid_v, open)
 
 remapper.npz: n_surfaces, and per surface k: surf{k}_verts (N, 3) world mm,
 surf{k}_faces (M, 3), surf{k}_normals (3M, 3) optional loop normals,
@@ -78,8 +80,15 @@ def _field_deg(d):
 
 
 def _in_fov(d):
-    tx, tz = _field_deg(d)
-    return (np.abs(tx) <= FOV_X_DEG) & (np.abs(tz) <= FOV_Z_DEG) & (d[..., 1] > 0)
+    return spec.in_field(*_field_deg(d)) & (d[..., 1] > 0)
+
+
+def coverage_grid():
+    """The field directions coverage is scored on: a 0.25 deg grid inside the
+    field, (tx, tz) rad, flat."""
+    gx, gz = np.meshgrid(np.arange(-FOV_X_DEG, FOV_X_DEG + 1e-9, 0.25), np.arange(-FOV_Z_DEG, FOV_Z_DEG + 1e-9, 0.25))
+    keep = spec.in_field(gx, gz)
+    return np.radians(gx[keep]), np.radians(gz[keep])
 
 
 def _ecc(d):
@@ -143,9 +152,12 @@ def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_
     if design["field_deg"] != spec.FIELD_DEG:
         raise ValueError(f"{design_dir}: the design was made for a {design['field_deg']} deg field, "
                          f"not this run's {spec.FIELD_DEG} (HOLOPIXEL_FIELD_DEG)")
+    if ("mask_npz" in design) != (spec.FIELD_SHAPE == "ellipse"):
+        raise ValueError(f"{design_dir}: a design has a black mask (design.json mask_npz) exactly when its "
+                         f"field is elliptic; this field is {spec.FIELD_SHAPE}")
     remapper = (design_dir / design["remapper_npz"]).resolve()
     validate_surfaces(remapper)
-    mesh, gap, lenslets = lenslet_array(design, panel_pixels * PIXEL_UM, subdivisions)
+    mesh, gap, lenslets = lenslet_array(design, design_dir, panel_pixels * PIXEL_UM, subdivisions)
     work.mkdir(parents=True, exist_ok=True)
     np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
              face_lens=mesh.face_lens, face_wall=mesh.face_lens == mla_mesh.WALL)
@@ -176,9 +188,11 @@ def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0
     return report
 
 
-def lenslet_array(design, panel_um, subdivisions):
+def lenslet_array(design, design_dir, panel_um, subdivisions):
     """The design's lenslet array: exactly one of "focal_um" (uniform) or
-    "lenslets": "variable_retina". Returns the mesh, the air gap and a summary."""
+    "lenslets": "variable_retina", the latter with the design's black mask
+    (variable_lenslets.with_mask) when it names one ("mask_npz": grid_u, grid_v,
+    open). Returns the mesh, the air gap and a summary."""
     kinds = [k for k in ("focal_um", "lenslets") if k in design]
     if len(kinds) != 1:
         raise ValueError(f"design.json needs exactly one of focal_um, lenslets; has {kinds}")
@@ -193,6 +207,9 @@ def lenslet_array(design, panel_um, subdivisions):
     if abs(panel_um - vl.PANEL_UM) > 1e-6:
         raise ValueError("the retina-matched lenslet array is defined on the full panel")
     v = vl.build(int(design["lenslet_flip_v"]), subdivisions)
+    if "mask_npz" in design:
+        m = np.load(Path(design_dir) / design["mask_npz"])
+        v = vl.with_mask(v, (m["grid_u"], m["grid_v"], m["open"]))
     return v.mesh, v.gap_um, {"lenslets": "variable_retina", "lenslet_flip_v": int(design["lenslet_flip_v"]),
                               "focal_um_range": [float(v.focal_um.min()), float(v.focal_um.max())]}
 
@@ -239,10 +256,10 @@ def metrics(view_dir, views, centres, panel_pixels):
         ok = pix >= 0
         return np.nonzero(ok)[0], pix[ok], ent[ok]
 
-    def stray(idx, ent):
-        """Rays through no lens, or far from their lens's chief direction."""
+    def stray(di, ent):
+        """Rays (directions di) through no lens, or far from their lens's chief direction."""
         lens = np.maximum(ent, 0)
-        far = chief[lens] & (np.einsum("ij,ij->i", d[idx], mean[lens]) < math.cos(math.radians(STRAY_DEG)))
+        far = chief[lens] & (np.einsum("ij,ij->i", di, mean[lens]) < math.cos(math.radians(STRAY_DEG)))
         return (ent < 0) | far
 
     idx, pix, ent = rays(order[0])
@@ -250,7 +267,7 @@ def metrics(view_dir, views, centres, panel_pixels):
     mean = np.stack([_group_median(ent[lensed], d[idx[lensed], c], n_lens) for c in range(3)], axis=1)
     chief = np.bincount(ent[lensed], minlength=n_lens) > 0
     mean[chief] = _unit(mean[chief])
-    good = ~stray(idx, ent)
+    good = ~stray(d[idx], ent)
     idx, pix, ent = idx[good], pix[good], ent[good]
     count = np.bincount(ent, minlength=n_lens)
     chief &= count > 0                                                 # every centre ray stray: no direction
@@ -266,19 +283,25 @@ def metrics(view_dir, views, centres, panel_pixels):
     pix_n = np.zeros(panel_pixels**2)
     seen, total, sq_all, delivered = (np.zeros(n_lens) for _ in range(4))
     n_stray = n_reach = 0
+    in_fov = _in_fov(d)
+    n_fov = int(in_fov.sum())
+    reached = []                                                       # throughput: in-field rays through a lens
     for k in order:
         idx, pix, ent = rays(k)
-        bad = stray(idx, ent)
+        reached.append(int(in_fov[idx[ent >= 0]].sum()) / n_fov)
+        di = d[idx]
+        bad = stray(di, ent)
         conflict[pix[bad]] = True
         n_stray, n_reach = n_stray + int(bad.sum()), n_reach + len(pix)
         delivered += np.bincount(ent[ent >= 0], minlength=n_lens)     # every ray a lens sends, stray or not
-        idx, pix, ent = idx[~bad], pix[~bad], ent[~bad]
+        di, pix, ent = di[~bad], pix[~bad], ent[~bad]
         for c in range(3):
-            pix_sum[:, c] += np.bincount(pix, weights=d[idx, c], minlength=panel_pixels**2)
+            pix_sum[:, c] += np.bincount(pix, weights=di[:, c], minlength=panel_pixels**2)
         pix_n += np.bincount(pix, minlength=panel_pixels**2)
-        seen[np.unique(ent)] += 1
-        ang = np.arccos(np.clip(np.einsum("ij,ij->i", d[idx], mean[ent]), -1.0, 1.0))
-        total += np.bincount(ent, minlength=n_lens)
+        per_lens = np.bincount(ent, minlength=n_lens)
+        seen += per_lens > 0
+        ang = np.arccos(np.clip(np.einsum("ij,ij->i", di, mean[ent]), -1.0, 1.0))
+        total += per_lens
         sq_all += np.bincount(ent, weights=ang**2, minlength=n_lens)
         new = first[pix] < 0
         first[pix[new]] = ent[new]
@@ -336,18 +359,11 @@ def metrics(view_dir, views, centres, panel_pixels):
     has = valid & (spacing_n > 0)
     ratio = spacing_sum[has] / spacing_n[has] / pitch[has]
 
-    gx, gz = np.meshgrid(np.radians(np.arange(-FOV_X_DEG, FOV_X_DEG + 1e-9, 0.25)),
-                         np.radians(np.arange(-FOV_Z_DEG, FOV_Z_DEG + 1e-9, 0.25)))
-    grid = _unit(np.stack([np.tan(gx), np.ones_like(gx), np.tan(gz)], axis=-1).reshape(-1, 3))
+    gx, gz = coverage_grid()
+    grid = _unit(np.stack([np.tan(gx), np.ones_like(gx), np.tan(gz)], axis=-1))
     dist, _ = cKDTree(mean[chief]).query(grid)
-    coverage = float(np.mean(dist <= ft.target_pitch_rad(gx.ravel(), gz.ravel())))
+    coverage = float(np.mean(dist <= ft.target_pitch_rad(gx, gz)))
 
-    fov_rays = np.nonzero(_in_fov(d))[0]
-    reached = []
-    for k in order:
-        idx, _, ent = rays(k)
-        idx = idx[ent >= 0]
-        reached.append(np.isin(fov_rays, idx, assume_unique=True).mean())
     throughput = float(np.mean(reached))
 
     tx, tz = _field_deg(mean[valid])

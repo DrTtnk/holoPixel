@@ -116,11 +116,8 @@ def _unscaled(theta_x, theta_z):
 
 
 def _boundary():
-    s = np.radians(np.linspace(-1.0, 1.0, 4001))
-    hx, hz = np.radians(FIELD_HALF_DEG[0]), np.radians(FIELD_HALF_DEG[1])
-    tx = np.concatenate([s / s[-1] * hx, s / s[-1] * hx, np.full_like(s, hx), np.full_like(s, -hx)])
-    tz = np.concatenate([np.full_like(s, hz), np.full_like(s, -hz), s / s[-1] * hz, s / s[-1] * hz])
-    return _unscaled(tx, tz)
+    tx, tz = spec.field_boundary_deg(4001)
+    return _unscaled(np.radians(tx), np.radians(tz))
 
 
 _BX, _BZ = _boundary()
@@ -220,6 +217,8 @@ def lenslet_focal_um(u_um, v_um, pitch_um=spec.LENS_PITCH_UM):
 def _sampling_range():
     tx, tz = np.meshgrid(np.radians(np.linspace(-FIELD_HALF_DEG[0], FIELD_HALF_DEG[0], 61)),
                          np.radians(np.linspace(-FIELD_HALF_DEG[1], FIELD_HALF_DEG[1], 61)))
+    keep = spec.in_field(np.degrees(tx), np.degrees(tz))
+    tx, tz = tx[keep], tz[keep]
     ratio = target_pitch_rad(tx.ravel(), tz.ravel()) / retina_pitch_rad(tx.ravel(), tz.ravel())
     return float(ratio.min()), float(ratio.max())
 

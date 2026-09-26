@@ -283,3 +283,31 @@ def test_the_space_term_sees_a_knife_edge_rim_and_not_a_thick_one(knife_edge, de
     batch, diag, alive = _traced(lay, x, idx, device)
     space, _ = fs.fold_constraints(batch, diag, alive, lay, x)
     assert float(space) >= float(rims[0])                              # the rim enters the space term
+
+
+def test_the_polygon_depth_is_the_signed_distance_and_matches_the_mask_table():
+    """fold_search.polygon_depth (torch, the search) is the exact signed distance,
+    positive inside; variable_lenslets.mask_table (numpy, the exporter's mask) is
+    open on the same side, off the edge."""
+    sq = torch.tensor([[[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]], dtype=torch.float64)
+    p = torch.tensor([[[0.0, 0.0], [0.5, 0.0], [3.0, 0.0], [2.0, 2.0], [0.0, -0.9]]], dtype=torch.float64)
+    assert fs.polygon_depth(p, sq)[0].tolist() == pytest.approx([1.0, 0.5, -2.0, -math.sqrt(2.0), 0.1])
+    rng = np.random.default_rng(3)
+    a = np.sort(rng.uniform(0.0, 2 * np.pi, 40))
+    r = rng.uniform(4.0, 8.0, 40)
+    poly = np.column_stack([r * np.cos(a), r * np.sin(a)])
+    gu, gv, is_open = fs.vl.mask_table(poly)
+    q = rng.uniform(-9.0, 9.0, (500, 2))
+    i, j = np.rint((q[:, 0] - gu[0]) / (gu[1] - gu[0])).astype(int), np.rint((q[:, 1] - gv[0]) / (gv[1] - gv[0])).astype(int)
+    got = fs.polygon_depth(torch.tensor(np.column_stack([gu[i], gv[j]])[None]), torch.tensor(poly[None]))[0].numpy()
+    off_edge = np.abs(got) > 0.03                                       # 1.5 table steps
+    assert np.array_equal(got[off_edge] > 0, is_open[i, j][off_edge])
+    assert 0 < (got[off_edge] > 0).sum() < off_edge.sum()
+
+
+def test_the_polygon_outside_term_is_the_depth_inside_the_opening_plus_the_margin():
+    sq = torch.tensor([[[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]], dtype=torch.float64)
+    land = torch.tensor([[[0.0, 0.0], [1.1, 0.0], [3.0, 0.0], [0.0, 0.0]]], dtype=torch.float64)
+    alive = torch.tensor([[True, True, True, False]])
+    got = fs.outside_violation_polygon(land, alive, sq)
+    assert got[0].tolist() == pytest.approx([1.0 + fs.OUT_MARGIN_MM, fs.OUT_MARGIN_MM - 0.1, 0.0, 0.0])

@@ -221,7 +221,7 @@ def save_scene(name, out_dir):
         np.save(content / "wide.npy", he.angle_chart().astype(np.float32))
         np.save(content / "fovea.npy", he.foveal_chart().astype(np.float32))
     design = json.loads((design_dir / "design.json").read_text())
-    mesh, gap, _ = ev.lenslet_array(design, spec.PANEL_MM * 1e3, 2)
+    mesh, gap, _ = ev.lenslet_array(design, design_dir, spec.PANEL_MM * 1e3, 2)
     np.savez(base / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
              face_lens=mesh.face_lens, face_wall=mesh.face_lens == mla_mesh.WALL)
     remapper = dispersive_remapper(design_dir, base / "remapper_dispersive.npz")

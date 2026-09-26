@@ -14,6 +14,8 @@ import math
 import os
 import re
 
+import numpy as np
+
 PANEL_PIXELS = 2560
 PIXEL_UM = 7.2
 PANEL_MM = PANEL_PIXELS * PIXEL_UM * 1e-3
@@ -38,4 +40,31 @@ def _field_half_deg(text):
 # the foveation map, the searches, the exporters and the evaluator. Designs and
 # results record it and are refused under another one.
 FIELD_HALF_DEG = _field_half_deg(os.environ.get("HOLOPIXEL_FIELD_DEG", "70x45"))
-FIELD_DEG = [2.0 * FIELD_HALF_DEG[0], 2.0 * FIELD_HALF_DEG[1]]
+# The field's outline: "rect" (the whole <width>x<height> box) or "ellipse" (the
+# ellipse inscribed in it; the panel then carries a black mask outside the
+# ellipse's image). A design records it in FIELD_DEG, after the size.
+FIELD_SHAPE = os.environ.get("HOLOPIXEL_FIELD_SHAPE", "rect")
+if FIELD_SHAPE not in ("rect", "ellipse"):
+    raise ValueError(f"HOLOPIXEL_FIELD_SHAPE must be rect or ellipse, not {FIELD_SHAPE!r}")
+FIELD_DEG = [2.0 * FIELD_HALF_DEG[0], 2.0 * FIELD_HALF_DEG[1]] + ([] if FIELD_SHAPE == "rect" else [FIELD_SHAPE])
+
+
+def in_field(tx_deg, tz_deg):
+    """True for the directions (tangent-plane angles, deg) inside the field."""
+    x, z = np.asarray(tx_deg, float) / FIELD_HALF_DEG[0], np.asarray(tz_deg, float) / FIELD_HALF_DEG[1]
+    if FIELD_SHAPE == "rect":
+        return (np.abs(x) <= 1.0) & (np.abs(z) <= 1.0)
+    return x**2 + z**2 <= 1.0 + 1e-12
+
+
+def field_boundary_deg(n):
+    """(tx, tz) deg of n points along each edge of the rectangle, or of 4 n points
+    round the ellipse."""
+    hx, hz = FIELD_HALF_DEG
+    if FIELD_SHAPE == "rect":
+        s = np.linspace(-1.0, 1.0, n)
+        one = np.ones_like(s)
+        return (np.concatenate([s * hx, s * hx, one * hx, -one * hx]),
+                np.concatenate([one * hz, -one * hz, s * hz, s * hz]))
+    a = np.linspace(0.0, 2.0 * np.pi, 4 * n, endpoint=False)
+    return hx * np.cos(a), hz * np.sin(a)

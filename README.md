@@ -62,7 +62,9 @@ for remapper designs (contract in its docstring); its blur is the per-pixel
 beam width at the eye.
 
 Remapper design searches (GPU, float64), under `remapper_designs/`. The target field of view is
-`HOLOPIXEL_FIELD_DEG` (`<width>x<height>` degrees, default `70x45`); results and designs record it, and a
+`HOLOPIXEL_FIELD_DEG` (`<width>x<height>` degrees, default `70x45`) and `HOLOPIXEL_FIELD_SHAPE`
+(`rect`, the default, or `ellipse`: the inscribed ellipse; `export_pancake.py` then writes a black mask
+over the lenslets outside the design's own image of the ellipse); results and designs record both, and a
 design is refused under another field (the older families are fixed at 70 x 45):
 
 ```bash
@@ -78,6 +80,8 @@ python freeform_mirror/fold_search.py <out> --elements 1 --material glass --seed
 python freeform_mirror/pancake_search.py <out> --elements 1 --material glass --seed-from freeform_mirror/results_pancake/best_pancake_el1_glass_spline4.json
 # field continuation: seeds searched for another field, accepted only on request
 HOLOPIXEL_FIELD_DEG=72x47 python freeform_mirror/pancake_search.py <out> --elements 1 --material glass --seed-from freeform_mirror/results_pancake/best_pancake_el1_glass_spline4.json --seed-other-field
+# an elliptic field (search, export and evaluation all need the same two settings)
+HOLOPIXEL_FIELD_DEG=100x80 HOLOPIXEL_FIELD_SHAPE=ellipse python freeform_mirror/pancake_search.py <out> --elements 2 --material glass --seed-from freeform_mirror/results_pancake/best_pancake_el2_glass_fov100x80.json --seed-other-field
 # --weight NAME=VALUE (repeatable) replaces a merit weight, --tilt-max-deg the chief-ray tilt limit; results record both
 python freeform_mirror/pancake_search.py <out> --elements 1 --material resin   # pancake: polarisation fold, round lens
 python freeform_mirror/export_fold.py <out>/best_fold_el1_resin.json <design_dir>

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent
                        / "tier1_lightfield" / "foveated_optics_study" / "scripts"))
 
 import foveation_target as ft  # noqa: E402
+import mla_mesh  # noqa: E402
 import variable_lenslets as vl  # noqa: E402
 
 
@@ -46,3 +47,32 @@ def test_a_72_um_array_has_a_quarter_of_the_lenses_on_its_own_vertex_surface():
     c = a72.mesh.centres
     assert a72.centre_height_um == pytest.approx(vl.vertex_height_um(c[:, 0], c[:, 1], 1, pitch_um=72.0), abs=1e-9)
     assert a72.focal_um == pytest.approx(vl.focal_of_position(1, pitch_um=72.0)(c[:, 0], c[:, 1]), rel=1e-12)
+
+
+def _circle_table(r, c):
+    a = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
+    return vl.mask_table(np.column_stack([c[0] + r * np.cos(a), c[1] + r * np.sin(a)]))
+
+
+def test_the_mask_table_is_open_inside_the_opening_polygon():
+    gu, gv, is_open = _circle_table(5.0, (1.0, -2.0))
+    at = lambda u, v: bool(is_open[np.argmin(np.abs(gu - u)), np.argmin(np.abs(gv - v))])  # noqa: E731
+    assert at(1.0, -2.0) and at(5.9, -2.0) and not at(6.1, -2.0) and not at(1.0, 5.0)
+    assert gu[0] < -ft.HALF_PANEL_MM and gu[-1] > ft.HALF_PANEL_MM
+
+
+def test_the_lenses_outside_the_opening_are_black():
+    """masked: a lens is behind the mask when its centre is outside the opening;
+    with_mask blackens exactly those lenses' faces."""
+    table = _circle_table(5.0, (1.0, -2.0))
+    c = np.array([[1000.0, -2000.0], [5500.0, -2000.0], [6500.0, -2000.0], [-9000.0, 9000.0]])
+    assert vl.masked(c, table).tolist() == [False, False, True, True]
+    arr = vl.build(1)
+    masked = vl.with_mask(arr, table)
+    hidden = vl.masked(arr.mesh.centres, table)
+    lens = arr.mesh.face_lens
+    was_lens = lens >= 0
+    assert np.all(masked.mesh.face_lens[was_lens & hidden[np.maximum(lens, 0)]] == mla_mesh.WALL)
+    keep = ~(was_lens & hidden[np.maximum(lens, 0)])
+    assert np.array_equal(masked.mesh.face_lens[keep], lens[keep])
+    assert 0 < hidden.sum() < len(hidden)

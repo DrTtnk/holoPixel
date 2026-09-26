@@ -26,7 +26,9 @@ Merit, in the units the acceptance evaluator (lf_evaluate.py) uses:
           target's orientation and at least Q_MIN of its area (the 117 sampled
           fields cannot see a fold between them).
   outside directions beyond the field of view land off the panel (or are lost):
-          a pixel must not be seen from two directions.
+          a pixel must not be seen from two directions. An elliptic field has a
+          black mask outside each design's own image of the ellipse: there they
+          must land outside that image.
   space   no hardware (corrector hits, panel corners) inside the eye's view
           cone to the mirror, nearer the pupil than CLEARANCE_MM, or behind
           the face plane MIN_Z_MM; glass at least MIN_GLASS_MM along every ray
@@ -83,6 +85,7 @@ DENSE_STEP_DEG = 1.25           # chief-ray grid for the fold term
 Q_MIN = 0.2                     # a grid cell's signed area over the target's, at least
 RING_BEYOND_DEG = (1.0, 3.0, 6.0, 9.0)   # rings of directions beyond the field of view
 OUT_MARGIN_MM = 0.2             # they land at least this far beyond the panel edge
+N_EDGE = 97                     # chief rays along the elliptic field's edge (x half): its image, the mask opening
 W = {"blur": 1.0, "hinge": 10.0, "ratio": 30.0, "panel": 30.0, "tilt": 1.0, "space": 3.0, "barrier": 30.0,
      "map": 10.0, "fold": 3000.0, "outside": 3000.0}    # a folded map or a stray direction is a failure, not a trade
 
@@ -337,7 +340,15 @@ def pupil_samples(spacing_mm=PUPIL_SPACING_MM):
 
 
 def field_grid():
-    return np.array([(fx, fy) for fx in FIELDS_X_DEG for fy in FIELDS_Y_DEG])
+    """The sampled fields: the FIELDS_X_DEG x FIELDS_Y_DEG grid. For an elliptic
+    field, a grid point beyond the ellipse moves radially onto its edge (once)."""
+    f = np.array([(fx, fy) for fx in FIELDS_X_DEG for fy in FIELDS_Y_DEG])
+    if spec.FIELD_SHAPE == "rect":
+        return f
+    rho = np.hypot(f[:, 0] / _HX, f[:, 1] / _HZ)
+    f = f / np.maximum(rho, 1.0)[:, None]
+    _, first = np.unique(np.round(f, 9), axis=0, return_index=True)
+    return f[np.sort(first)]
 
 
 def pupil_cells(fields_deg, pupil):
@@ -358,16 +369,26 @@ def pupil_cells(fields_deg, pupil):
 
 
 def dense_grid():
-    """Chief-ray field grid over the searched half field, (nx, ny) in degrees."""
+    """Chief-ray field grid over the searched half field's box, (nx, ny) in degrees."""
     tx = np.arange(0.0, FIELDS_X_DEG[-1] + 1e-9, DENSE_STEP_DEG)
     tz = np.arange(FIELDS_Y_DEG[0], FIELDS_Y_DEG[-1] + 1e-9, DENSE_STEP_DEG)
     return np.stack(np.meshgrid(tx, tz, indexing="ij"), -1)
 
 
+def dense_in_field(dense):
+    """(nx, ny) mask of the dense grid points inside the field: only they are traced."""
+    return spec.in_field(dense[..., 0], dense[..., 1])
+
+
 def ring_fields():
-    """Directions beyond the field of view (half field, degrees)."""
+    """Directions beyond the field of view (half field, degrees): rings RING_BEYOND_DEG
+    beyond its edge, the ellipse's rings being ellipses of semi-axes (hx + d, hz + d)."""
     out = []
     for d in RING_BEYOND_DEG:
+        if spec.FIELD_SHAPE == "ellipse":
+            a = np.linspace(-math.pi / 2, math.pi / 2, 49)
+            out.append(np.column_stack([(_HX + d) * np.cos(a), (_HZ + d) * np.sin(a)]))
+            continue
         x, y = FIELDS_X_DEG[-1] + d, FIELDS_Y_DEG[-1] + d
         top = np.linspace(0.0, x, 15)
         side = np.linspace(-y, y, 19)
@@ -395,6 +416,41 @@ def outside_violation(land, alive):
     return torch.relu(PANEL_HALF_MM + OUT_MARGIN_MM - land.abs().amax(-1)) * alive.double()
 
 
+def boundary_fields(n=N_EDGE):
+    """n directions along the edge of the elliptic field's x half, bottom to top (deg)."""
+    a = np.linspace(-math.pi / 2, math.pi / 2, n)
+    return np.column_stack([_HX * np.cos(a), _HZ * np.sin(a)])
+
+
+def opening_polygon(edge_land):
+    """A design's own image of the elliptic field: the closed polygon of the chief-ray
+    landings of boundary_fields (B, N_EDGE, 2), the other x half mirrored (the
+    design is plane-symmetric). (B, 2 N_EDGE - 2, 2) on the image surface."""
+    other = edge_land[:, 1:-1].flip(1) * torch.tensor([-1.0, 1.0], dtype=edge_land.dtype, device=edge_land.device)
+    return torch.cat([edge_land, other], 1)
+
+
+def polygon_depth(p, poly):
+    """Signed distance (B, R) of points p (B, R, 2) to the edge of the closed polygon
+    poly (B, M, 2), positive inside (even-odd rule)."""
+    a = poly[:, None]                                                  # (B, 1, M, 2)
+    e = torch.roll(poly, -1, 1)[:, None] - a
+    q = p[:, :, None] - a                                              # (B, R, M, 2)
+    t = torch.clamp((q * e).sum(-1) / (e**2).sum(-1), 0.0, 1.0)
+    dist = torch.linalg.norm(q - t[..., None] * e, dim=-1).amin(-1)
+    ya, yb = a[..., 1], a[..., 1] + e[..., 1]
+    crosses = (ya > p[:, :, None, 1]) != (yb > p[:, :, None, 1])
+    x_at = a[..., 0] + (p[:, :, None, 1] - ya) * e[..., 0] / torch.where(e[..., 1] == 0.0, 1.0, e[..., 1])
+    inside = (crosses & (p[:, :, None, 0] < x_at)).sum(-1) % 2 == 1
+    return torch.where(inside, dist, -dist)
+
+
+def outside_violation_polygon(land, alive, poly):
+    """How deep inside a design's own image of the field (plus margin) an
+    out-of-field ray lands, mm: there the black mask of an elliptic field is open."""
+    return torch.relu(polygon_depth(land, poly) + OUT_MARGIN_MM) * alive.double()
+
+
 def weight_overrides(pairs):
     """["name=value", ...] -> W with those merit weights replaced; a name must be a
     merit term and a value a number."""
@@ -418,6 +474,7 @@ def context(device, weights=W, tilt_max_deg=TILT_MAX_DEG):
     onehot = torch.nn.functional.one_hot(t(ids, torch.int64), n_cells).double()   # (F, P, K)
     fd = np.concatenate([fields, fields + [FD_DEG, 0.0], fields + [0.0, FD_DEG]])
     dense = dense_grid()
+    dense_in = dense_in_field(dense)
     rd = np.radians(dense)
     det_t = cell_det(np.stack(ft.field_to_panel_mm(rd[..., 0], rd[..., 1]), -1)[None])[0]
     if not (np.all(det_t > 0) or np.all(det_t < 0)):
@@ -426,9 +483,11 @@ def context(device, weights=W, tilt_max_deg=TILT_MAX_DEG):
             "tol": t(ft.blur_tolerance_rad(np.radians(fields[:, 0]), np.radians(fields[:, 1]))),
             "jac_target": t(jac_t), "sv_target": t(np.linalg.svd(jac_t, compute_uv=False)),
             "panel_target": t(panel_t), "n_fields": len(fields),
-            "dense_fields": t(dense.reshape(-1, 2)), "dense_shape": dense.shape[:2],
+            "dense_fields": t(dense[dense_in]), "dense_index": t(np.flatnonzero(dense_in), torch.int64),
+            "dense_shape": dense.shape[:2],
             "dense_det": t(np.abs(det_t)), "dense_sign": float(np.sign(det_t[0, 0])),
-            "ring_fields": t(ring_fields())}
+            "ring_fields": t(ring_fields()),
+            **({} if spec.FIELD_SHAPE == "rect" else {"boundary_fields": t(boundary_fields())})}
 
 
 def jacobian(land_fd, n_fields):
@@ -502,14 +561,24 @@ def residuals(x, indices, lay, ctx):
     r_tilt = (torch.relu(torch.rad2deg(torch.acos(torch.clamp(cos_t, max=1.0 - 1e-12))) - ctx["tilt_max_deg"])
               * torch.sqrt(ctx["weights"]["tilt"] * okd / F))
 
-    nd = ctx["dense_fields"].shape[0]
-    land_c, _, alive_c = ot.trace(batch, torch.cat([ctx["dense_fields"], ctx["ring_fields"]]), chief)
+    nd, nr = ctx["dense_fields"].shape[0], ctx["ring_fields"].shape[0]
+    extra = [] if spec.FIELD_SHAPE == "rect" else [ctx["boundary_fields"]]
+    land_c, _, alive_c = ot.trace(batch, torch.cat([ctx["dense_fields"], ctx["ring_fields"]] + extra), chief)
     dense_ok = alive_c[:, :nd, 0]
+    n_dense = ctx["dense_shape"][0] * ctx["dense_shape"][1]
+    land_d = torch.zeros(B, n_dense, 2, dtype=x.dtype, device=x.device)
+    land_d[:, ctx["dense_index"]] = land_c[:, :nd, 0]
+    ok_d = torch.zeros(B, n_dense, dtype=torch.bool, device=x.device)
+    ok_d[:, ctx["dense_index"]] = dense_ok
     sign = lay["flip_u"] * lay["flip_v"] * ctx["dense_sign"]
-    fold = fold_violation(land_c[:, :nd, 0].reshape(B, *ctx["dense_shape"], 2),
-                          dense_ok.reshape(B, *ctx["dense_shape"]), ctx["dense_det"], sign)
+    fold = fold_violation(land_d.reshape(B, *ctx["dense_shape"], 2), ok_d.reshape(B, *ctx["dense_shape"]),
+                          ctx["dense_det"], sign)
     r_fold = fold.reshape(B, -1) * math.sqrt(ctx["weights"]["fold"] / fold[0].numel())
-    out = outside_violation(land_c[:, nd:, 0], alive_c[:, nd:, 0])
+    if spec.FIELD_SHAPE == "rect":
+        out = outside_violation(land_c[:, nd:, 0], alive_c[:, nd:, 0])
+    else:
+        poly = opening_polygon(land_c[:, nd + nr:, 0])
+        out = outside_violation_polygon(land_c[:, nd:nd + nr, 0], alive_c[:, nd:nd + nr, 0], poly)
     r_out = out * math.sqrt(ctx["weights"]["outside"] / out.shape[1])
 
     space, barrier = FAMILIES[lay["family"]]["constraints"](batch, diag, alive, lay, x)
@@ -519,7 +588,9 @@ def residuals(x, indices, lay, ctx):
                    r_tilt, r_fold, r_out, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
     # exactly 1.0 when every ray lives: CUDA divides by a scalar through its
     # reciprocal, so n / n alone can come out as 0.9999999999999999
-    n_live, n_all = alive.sum((1, 2)) + ok_c.sum(1) + dense_ok.sum(1), alive[0].numel() + ok_c.shape[1] + nd
+    edge_ok = alive_c[:, nd + nr:, 0]                                  # the elliptic field's edge (none: rect)
+    n_live = alive.sum((1, 2)) + ok_c.sum(1) + dense_ok.sum(1) + edge_ok.sum(1)
+    n_all = alive[0].numel() + ok_c.shape[1] + nd + edge_ok.shape[1]
     alive_all = torch.where(n_live == n_all, 1.0, n_live.double() / n_all)
     sq = lambda t: (t**2).reshape(B, -1).sum(1)  # noqa: E731
     return r, {"blur": sq(r_blur), "hinge": sq(r_hinge), "ratio": sq(r_ratio), "panel": sq(r_panel),

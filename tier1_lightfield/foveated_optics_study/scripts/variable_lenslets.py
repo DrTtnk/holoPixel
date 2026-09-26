@@ -13,9 +13,11 @@ remapper must focus the field there); bowl_table tabulates it for the tracers.
 """
 from __future__ import annotations
 
+import dataclasses
 from functools import lru_cache
 
 import numpy as np
+from matplotlib.path import Path
 
 import foveation_target as ft
 import mla_mesh
@@ -39,6 +41,36 @@ def _side_um(pitch_um):
 def _profile(flip_v, pitch_um):
     return dict(panel_um=PANEL_UM, side_um=_side_um(pitch_um), focal_of_position=focal_of_position(flip_v, pitch_um),
                 index=spec.LENS_INDEX, min_thickness_um=spec.LENS_MIN_THICKNESS_UM)
+
+
+MASK_STEP_MM = 0.02
+
+
+def mask_table(polygon_mm):
+    """A black mask's opening as a table: (grid_u mm, grid_v mm, open) over the
+    panel plus 1 mm, open where the grid point is inside the closed polygon (M, 2)
+    in array coordinates."""
+    g = np.arange(-TABLE_HALF_MM - 0.8, TABLE_HALF_MM + 0.8 + 1e-9, MASK_STEP_MM)
+    U, V = np.meshgrid(g, g, indexing="ij")
+    return g, g, Path(polygon_mm).contains_points(np.column_stack([U.ravel(), V.ravel()])).reshape(U.shape)
+
+
+def masked(centres_um, table):
+    """True for the lenses behind the mask: their centre is outside its opening."""
+    gu, gv, is_open = table
+    c = np.asarray(centres_um, float) * 1e-3
+    i = np.rint((c[:, 0] - gu[0]) / (gu[1] - gu[0])).astype(int)
+    j = np.rint((c[:, 1] - gv[0]) / (gv[1] - gv[0])).astype(int)
+    if i.min() < 0 or j.min() < 0 or i.max() >= len(gu) or j.max() >= len(gv):
+        raise ValueError("a lens lies beyond the mask table")
+    return ~is_open[i, j]
+
+
+def with_mask(arr, table):
+    """The array with the top faces of the lenses behind the mask black, like the walls."""
+    hidden = np.nonzero(masked(arr.mesh.centres, table))[0]
+    face_lens = np.where(np.isin(arr.mesh.face_lens, hidden), mla_mesh.WALL, arr.mesh.face_lens)
+    return dataclasses.replace(arr, mesh=dataclasses.replace(arr.mesh, face_lens=face_lens))
 
 
 def build(flip_v, subdivisions=2, pitch_um=spec.LENS_PITCH_UM):

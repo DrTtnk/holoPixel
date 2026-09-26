@@ -70,7 +70,7 @@ def build(design_dir, out_dir, work, name, aperture_mm=0.0, resolution=1024, sam
     work.mkdir(parents=True, exist_ok=True)
     plain = design.get("lenslets") == "none"       # a plain display: the panel itself is the image
     if not plain:
-        mesh, gap, _ = ev.lenslet_array(design, spec.PANEL_MM * 1e3, 2)
+        mesh, gap, _ = ev.lenslet_array(design, design_dir, spec.PANEL_MM * 1e3, 2)
         np.savez(work / "mla_mesh.npz", verts=mesh.verts, faces=mesh.faces, loop_normals=mesh.loop_normals,
                  face_lens=mesh.face_lens, face_wall=mesh.face_lens == mla_mesh.WALL)
     np.save(work / "panel.npy", test_chart() if panel_rgb is None else panel_rgb.astype(np.float32))

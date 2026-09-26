@@ -59,6 +59,9 @@ def _plate_with_hole(z, half_hole_x, half_hole_y):
     return verts, np.array(faces)
 
 
+MASK_EDGE_POINTS = 1001        # chief rays along the elliptic field's edge (x half) that outline the mask
+
+
 def export(best_json, out_dir, rank=0, device="cuda"):
     entry = json.loads(Path(best_json).read_text())[rank]
     dev = torch.device(device)
@@ -139,6 +142,17 @@ def export(best_json, out_dir, rank=0, device="cuda"):
               "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
               "source": {"design": Path(best_json).name, "rank": rank, "material": entry["material"],
                          "family": "pancake"}}
+    if fs.spec.FIELD_SHAPE == "ellipse":
+        # the black mask: open over the design's own image of the ellipse, in array coordinates
+        with torch.no_grad():
+            edge, _, alive_e = ot.trace(fs.to_batch(x, idx, lay), torch.tensor(fs.boundary_fields(MASK_EDGE_POINTS), dtype=torch.float64, device=dev),
+                                        torch.zeros(1, 2, dtype=torch.float64, device=dev))
+        if not bool(alive_e.all()):
+            raise ValueError("the design loses a chief ray of the field's edge; its mask is undefined")
+        poly = fs.opening_polygon(edge[:, :, 0])[0].cpu().numpy() * [1.0, float(np.sign(v @ axes[1]))]
+        gu, gv, is_open = vl.mask_table(poly)
+        np.savez(out / "mask.npz", grid_u=gu, grid_v=gv, open=is_open)
+        design["mask_npz"] = "mask.npz"
     (out / "design.json").write_text(json.dumps(design, indent=1))
     np.savez(out / "rays.npz", **ef.fans(entry, dev, family="pancake"))
     return out
