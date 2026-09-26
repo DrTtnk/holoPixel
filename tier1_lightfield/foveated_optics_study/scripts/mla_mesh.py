@@ -276,13 +276,13 @@ def build_variable(panel_um, side_um, focal_of_position, index, min_thickness_um
     bottom_id = {int(v): n_copies + k for k, v in enumerate(loop)}
     verts.append(np.column_stack([uv[loop], np.zeros(len(loop))]))
     border = []
+    hs = np.concatenate([copy_h, np.zeros(len(loop))])
     for t, t_next in zip(loop, np.roll(loop, -1)):
         i = directed[(int(t), int(t_next))]
         f = e_face[i]
         ht, hn = copy_h[top_faces[f, e_k0[i]]], copy_h[top_faces[f, e_k1[i]]]
         p = chain(int(t), ht, 0.0) + [bottom_id[int(t)]]
         q = chain(int(t_next), hn, 0.0) + [bottom_id[int(t_next)]]
-        hs = np.concatenate([copy_h, np.zeros(len(loop))])
         border += _zip_chains(p, q, hs[p], hs[q])
     centre_index = n_copies + len(loop)
     b = np.array([bottom_id[int(v)] for v in loop])

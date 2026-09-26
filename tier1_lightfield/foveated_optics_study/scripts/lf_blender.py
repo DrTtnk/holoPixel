@@ -93,10 +93,11 @@ def setup(cfg):
     sc.view_settings.view_transform = "Standard"
     sc.view_settings.look = "None"
     sc.render.resolution_x = sc.render.resolution_y = cfg["camera"]["resolution"]
+    c.tile_size = max(2048, cfg["camera"]["resolution"])      # one tile: 3.3 s a view, not 4.5 s in four
     sc.render.resolution_percentage = 100
     sc.render.image_settings.file_format = "OPEN_EXR"
     sc.render.image_settings.color_depth = "32"
-    sc.render.image_settings.exr_codec = "ZIP"
+    sc.render.image_settings.exr_codec = "NONE"      # read back at once and deleted: compressing only costs time
     world = bpy.data.worlds.new("black")
     world.use_nodes = True
     world.node_tree.nodes["Background"].inputs["Color"].default_value = (0, 0, 0, 1)
@@ -625,26 +626,74 @@ def _decode(channel, what, k):
     return np.where(valid, np.rint(channel) - 1, -1).astype(np.int32)
 
 
+MULTIVIEW_BATCH = 16    # views per render call: ~1 s of fixed cost per call is shared; 16 views are ~3 GB of result
+
+
+def view_cameras(cam, views_mm):
+    """One camera per pupil view (<cam>_<k>) and one multi-view render view each
+    (suffix _<k>). Blender picks a view's camera by swapping the view suffix at
+    the end of the ACTIVE camera's name, and silently keeps the active camera
+    when that name ends in no view suffix: the first view camera is made active."""
+    sc = bpy.context.scene
+    cams = []
+    for k, view in enumerate(views_mm):
+        c = bpy.data.objects.new(f"{cam.name}_{k}", cam.data)
+        sc.collection.objects.link(c)
+        c.rotation_euler = cam.rotation_euler
+        place(c, view, None)
+        cams.append(c)
+    sc.camera = cams[0]
+    sc.render.use_multiview = True
+    sc.render.views_format = "MULTIVIEW"
+    for v in sc.render.views:
+        v.use = False
+    views = [sc.render.views.new(f"view{k}") for k in range(len(views_mm))]
+    for k, v in enumerate(views):
+        v.camera_suffix = f"_{k}"
+    sc.render.image_settings.views_format = "INDIVIDUAL"
+    return views
+
+
+def render_views(views, stem, out_dir):
+    """(k, RGBA image) of every view, MULTIVIEW_BATCH views per render call."""
+    sc = bpy.context.scene
+    res = sc.render.resolution_x
+    for start in range(0, len(views), MULTIVIEW_BATCH):
+        batch = range(start, min(start + MULTIVIEW_BATCH, len(views)))
+        for k, v in enumerate(views):
+            v.use = k in batch
+        sc.render.filepath = str(out_dir / f"{stem}.exr")
+        bpy.ops.render.render(write_still=True)
+        for k in batch:
+            path = out_dir / f"{stem}_{k}.exr"                            # the view's suffix
+            img = bpy.data.images.load(str(path))
+            a = np.empty(res * res * 4, np.float32)
+            img.pixels.foreach_get(a)
+            bpy.data.images.remove(img)
+            path.unlink()
+            yield k, a.reshape(res, res, 4)
+
+
 def evaluate(cfg, cam, out_dir):
     """Per view: the panel pixel each camera ray reaches (pix_k, flat j*N+i), and
     the lens it enters (entered_k), read from a second render in which the MLA
     is opaque and emits its own lens id. All pixel renders first, then all lens
-    renders: the material changes once, not twice per view."""
+    renders: the material changes once, not twice per view. The views render as
+    multi-view batches (view_cameras), the same pixels as one render per view."""
     sc = bpy.context.scene
     sc.cycles.samples = 1
     sc.cycles.filter_width = 0.01
     n = cfg["panel_pixels"]
     mla = bpy.data.objects["MLA"]
-    for k, view in enumerate(cfg["views_mm"]):
-        place(cam, view, None)
-        a = render(out_dir / f"eval_{k}.exr")
+    views = view_cameras(cam, cfg["views_mm"])
+    for k, a in render_views(views, "eval", out_dir):
         i, j = _decode(a[:, :, 1], "pixel column", k), _decode(a[:, :, 2], "pixel row", k)
         np.save(out_dir / f"pix_{k}.npy", np.where((i >= 0) & (j >= 0), j * n + i, -1).astype(np.int32))
     mla.data.materials[0] = lens_id_material()
-    for k, view in enumerate(cfg["views_mm"]):
-        place(cam, view, None)
-        a = render(out_dir / f"entered_{k}.exr")
+    for k, a in render_views(views, "entered", out_dir):
         np.save(out_dir / f"entered_{k}.npy", _decode(a[:, :, 0], "entered lens", k))
+    sc.render.use_multiview = False
+    sc.camera = cam
     hide_all_meshes()
     direction_world()
     place(cam, cfg["views_mm"][0], None)
