@@ -8,7 +8,7 @@
 - The 2-lens glass pancake at the 100 x 80 ellipse is now the best wide
   design. Its coverage (0.969) is above that of the 84 x 61 rectangle.
 - Wider ellipses fail: from 107.5 x 86 deg the ghosts come back (0.36).
-- The Cycles evaluation is about **2x faster**: about 10 min became ~5 min.
+- The Cycles evaluation is about **2.5x faster**: about 10 min became 3.9 min.
   The render and mesh changes are bit-identical. The GPU metrics agree with
   the CPU ones to 2e-14 in the report.
 
@@ -85,13 +85,16 @@ map compresses the periphery. It covers 19 % of the lenses.
 | Lenslet mesh: an array rebuilt inside a loop | 76 s | 25 s |
 | Metrics: one pass fewer, no `np.isin` / `np.unique` | 80 s | 53 s |
 | Metrics: per-view passes on the GPU (fp64 torch) | 53 s | 16 s |
-| **Whole evaluation (100 x 80)** | **~10 min** | **~5 min** |
+| Blender scene: lenslet mesh by `foreach_set`, not `from_pydata` | 33.6 s start-up | 25.7 s |
+| View decoding in threads, while the next batch renders | 160 s for 40 views | 137 s |
+| **Whole evaluation (100 x 80)** | **~10 min** | **3.9 min** |
 
 - Each CPU change was checked bitwise: the per-view pixel and lens arrays,
   the lenslet mesh for both flips, and `report.json` end to end (5.7 min).
 - The GPU metrics sum floats with atomic adds, in no fixed order (chosen for
   speed). Every count-based number is exact; the blur percentiles differ by
-  up to 2e-14 relative, and per-lens blur by up to 6e-11.
+  up to 2e-14 relative, and per-lens blur by up to 6e-11. End to end (3.9 min)
+  the report differs from the stored one in 3 blur values, by <= 1.4e-13.
 - GPU + CPU rendering was slower (4.7 s a view) and not identical, so it is
   not used.
 - A trap in Blender's multi-view render: a view's camera is found by swapping
@@ -104,5 +107,4 @@ map compresses the periphery. It covers 19 % of the lenses.
    area).
 2. Bring the edge middles back onto the panel (the panel polish of the
    84 x 61 work), for coverage 0.98.
-3. Speed-up: the renders are now ~80 % of an evaluation (~1.5 s a view,
-   ~3 min).
+3. Speed-up: the renders are now most of an evaluation (~1 s a view, ~2 min).

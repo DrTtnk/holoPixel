@@ -46,6 +46,7 @@ Modes:
 import json
 import math
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import bpy
@@ -129,14 +130,26 @@ def panel_to_world(uvw_um, cfg):
 
 
 def link(name, verts, faces, loop_normals, material):
+    """A triangle mesh object. Built with foreach_set, not from_pydata (which
+    walks the arrays in Python: 11 s for the 10 M-face lenslet array); the two
+    give the same mesh, edges and corner normals."""
+    verts, faces = np.asarray(verts), np.asarray(faces)
     mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata(verts, [], faces)
+    mesh.vertices.add(len(verts))
+    mesh.vertices.foreach_set("co", verts.astype(np.float32).ravel())
+    mesh.loops.add(faces.size)
+    mesh.loops.foreach_set("vertex_index", faces.astype(np.int32).ravel())
+    mesh.polygons.add(len(faces))
+    mesh.polygons.foreach_set("loop_start", np.arange(0, faces.size, 3, dtype=np.int32))
+    mesh.update(calc_edges=True)
     mesh.validate(clean_customdata=False)
     if len(mesh.polygons) != len(faces):
         raise RuntimeError(f"{name}: validate removed faces: {len(faces)} -> {len(mesh.polygons)}")
+    # flat faces unless custom normals are given (polygons.add leaves them smooth,
+    # from_pydata made them flat)
+    mesh.polygons.foreach_set("use_smooth", np.full(len(mesh.polygons), loop_normals is not None))
     if loop_normals is not None:
-        mesh.polygons.foreach_set("use_smooth", np.ones(len(mesh.polygons), dtype=bool))
-        mesh.normals_split_custom_set(np.asarray(loop_normals).tolist())
+        mesh.normals_split_custom_set(np.asarray(loop_normals).tolist())       # a list parses 3x faster than an array
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
     mesh.materials.append(material)
@@ -686,12 +699,22 @@ def evaluate(cfg, cam, out_dir):
     n = cfg["panel_pixels"]
     mla = bpy.data.objects["MLA"]
     views = view_cameras(cam, cfg["views_mm"])
-    for k, a in render_views(views, "eval", out_dir):
+
+    def save_pix(k, a):
         i, j = _decode(a[:, :, 1], "pixel column", k), _decode(a[:, :, 2], "pixel row", k)
         np.save(out_dir / f"pix_{k}.npy", np.where((i >= 0) & (j >= 0), j * n + i, -1).astype(np.int32))
-    mla.data.materials[0] = lens_id_material()
-    for k, a in render_views(views, "entered", out_dir):
+
+    def save_entered(k, a):
         np.save(out_dir / f"entered_{k}.npy", _decode(a[:, :, 0], "entered lens", k))
+
+    # the numpy decoding runs in threads while the next batch renders (a render
+    # releases the GIL); bpy itself (the image loads) stays on this thread
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for job in [pool.submit(save_pix, k, a) for k, a in render_views(views, "eval", out_dir)]:
+            job.result()
+        mla.data.materials[0] = lens_id_material()
+        for job in [pool.submit(save_entered, k, a) for k, a in render_views(views, "entered", out_dir)]:
+            job.result()
     sc.render.use_multiview = False
     sc.camera = cam
     hide_all_meshes()

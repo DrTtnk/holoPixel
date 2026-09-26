@@ -999,3 +999,13 @@ the same assignment on CUDA keeps an arbitrary one. The evaluator's "first
 lens of a pixel" depends on it, so the GPU metrics pick the last ray per pixel
 explicitly (scatter_reduce "amax" of the ray position). Only the float sums
 then differ from the CPU run (atomic order, <= 2e-14 in the report).
+
+Blender mesh building: `from_pydata` walks numpy arrays in Python (11 s for
+the 10 M-face lenslet array); `foreach_set` on vertices / loops / polygons and
+`update(calc_edges=True)` gives the same mesh in ~3 s. Trap: `polygons.add`
+leaves the faces SMOOTH, `from_pydata` makes them FLAT. My first probe only
+covered meshes with custom normals, so the prisms and wedges of the Blender
+tests (no normals) turned smooth and refracted wrongly; set `use_smooth`
+explicitly. `normals_split_custom_set` parses a list 3x faster than a numpy
+array (tolist is worth it). A Cycles render releases the GIL: numpy work in a
+Python thread runs alongside it (bpy calls must stay on the main thread).
