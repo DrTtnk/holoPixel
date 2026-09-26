@@ -949,7 +949,10 @@ tracer lands them (14 um median). The stray light there came from directions
 beyond the field (|tz| ~29.5 deg for a 26 deg half-height), half to three
 quarters of them rays the tracer loses. A black aperture on each lens beyond
 its traced footprint changed nothing on the 100 x 80 design (stray 3.2 % ->
-3.2 %) and was removed. On that design nearly all the stray light reaches the
-outermost pixel ring through no lens (entered code -1: the array's floor): the
-old 0.28 % edge leak through the panel gap, grown with the field. Next: a
-black side wall around the lenslet array floor and the panel gap.
+3.2 %) and was removed. On that design, in the two pupil views checked
+(of 61), 0.5 % of the rays reach the outermost pixel ring through no lens
+(entered code -1: the array's floor), the old 0.28 % edge leak through the
+panel gap, grown with the field; the rest of its 3.2 % is not yet split. Its
+main ghost areas are a map fold at the top and bottom centre (ratio > 3,
+unlit lenses), not the edge. Lesson: a two-view sample is not the whole
+stray budget; check the maps before naming the main cause.
