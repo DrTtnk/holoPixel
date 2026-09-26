@@ -137,7 +137,7 @@ def mla_indices():
 
 
 FOVEA_RES, FOVEA_FOV_DEG = 1200, 12.0          # 0.6 arcmin per view pixel over the fovea
-WIDE_RES, WIDE_FOV_DEG = 2048, 76.0
+WIDE_RES, WIDE_FOV_DEG = ev.CAMERA_RESOLUTION, ev.CAMERA_FOV_DEG   # the evaluation camera: the field + 3 deg
 DISPLAY_SAMPLES = 64
 
 

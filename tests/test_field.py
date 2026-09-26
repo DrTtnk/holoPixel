@@ -64,6 +64,22 @@ def test_the_search_fields_the_view_cone_and_the_chart_follow_the_field():
         assert json.loads(out.stdout) == [0.0, hx, -hz, hz, hz, hx, hz, chart]
 
 
+def test_the_evaluation_camera_sees_the_whole_field_at_the_same_central_pixel_angle():
+    """The Cycles evaluation camera (a square rectilinear view) must see the field
+    plus a margin in both axes (at 70 x 45 its old fixed 76 deg, 2048 px), with the
+    pixel angle at its centre unchanged, so wider fields are not cut at +-38 deg."""
+    code = ("import json, math, lf_evaluate as ev; "
+            "print(json.dumps([ev.CAMERA_FOV_DEG, ev.CAMERA_RESOLUTION, "
+            "math.tan(math.radians(ev.CAMERA_FOV_DEG / 2)) / ev.CAMERA_RESOLUTION]))")
+    base, wide = _run(code), _run(code, "100x80")
+    assert base.returncode == 0 and wide.returncode == 0, base.stderr + wide.stderr
+    fov, res, pixel = json.loads(base.stdout)
+    assert (fov, res) == (76.0, 2048)
+    fov_w, res_w, pixel_w = json.loads(wide.stdout)
+    assert fov_w == 2 * (50.0 + 3.0)
+    assert pixel_w == pytest.approx(pixel, rel=1e-3)
+
+
 def test_a_design_of_another_field_is_refused_before_rendering(tmp_path):
     """A design records its field; the evaluator must not score it against another."""
     code = ("import json, sys, lf_evaluate as ev; from pathlib import Path; "

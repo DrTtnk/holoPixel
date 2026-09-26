@@ -879,3 +879,35 @@ Jacobian (36 full traces). What made it faster, with results the same to
 What did not help: unrolling the 28 Newton steps into one compiled kernel (same
 speed; for the spline surface the unrolled graph took over 10 minutes to
 compile) and tracing the never-converging ring fields apart from the dense grid.
+
+## Widening the pancake: what the tracer merit does not see
+
+A field continuation (70 x 45 -> 100 x 80 in 2 deg steps, each step seeded from
+the last) keeps the good basin only for a while. Four lessons:
+- The Cycles ghost count can jump while the merit looks fine: at 76 x 52 the
+  1-lens rank 0 had ghost 0.25 (0.037 at 72 x 47), nearly all of it stray light
+  (3 %: rays that enter a lens more than 10 deg from its chief direction), from
+  directions near the fovea and beyond the field edge. It is not the export:
+  a 3x finer lens mesh changed nothing, the dense-pupil tracer loses no ray
+  (no TIR), and the Cycles pixel of every pupil view lands where the tracer
+  lands (median 25 um, 0.07 % beyond 0.2 mm). The tracer stops at the lenslet
+  vertex surface, so the lenslet entry itself is not in the merit.
+- Rank by Cycles, not by merit: at 76 x 52 the 2-lens rank 1 had ghost 0.004,
+  its rank 0 0.125.
+- Random seeds that join each step can take the chain over: the 1-lens chain
+  left the conical-lens-back basin at 80 x 57 for the flat-back basin of the
+  random 100 x 80 designs.
+- A 2-lens seed made from a 1-lens design needs a corrector that follows the
+  lens back (a thin even shell): a flat plate cuts through the strongly curved
+  back (merit 387 -> 5662, 14 of 18 designs lose rays); the shell gives 387 -> 453.
+
+## The evaluation camera was still 76 deg wide after the field became a parameter
+
+When the field of view became HOLOPIXEL_FIELD_DEG, lf_evaluate's Cycles camera
+kept its fixed fov_deg=76 (+-38 deg), and design_scenes its WIDE_FOV_DEG=76.
+Every evaluation of a wider field was cut at +-38 deg: the first 100 x 80
+pancake's "coverage 0.65, ~76 deg across" was the camera, not the optics. The
+camera is now CAMERA_FOV_DEG = 2 (max half field + 3 deg), with the resolution
+scaled so its central pixel angle stays that of 76 deg over 2048 px. Lesson:
+when a constant becomes a parameter, grep for every number derived from its old
+value (76 = 2 x (35 + 3)), not only for its name.

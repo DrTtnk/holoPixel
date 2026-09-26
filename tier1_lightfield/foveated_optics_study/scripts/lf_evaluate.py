@@ -45,6 +45,10 @@ import variable_lenslets as vl
 SIDE_UM, PIXEL_UM, INDEX, MIN_THICKNESS_UM = (spec.LENS_SIDE_UM, spec.PIXEL_UM, spec.LENS_INDEX,
                                               spec.LENS_MIN_THICKNESS_UM)
 FOV_X_DEG, FOV_Z_DEG = spec.FIELD_HALF_DEG
+# The evaluation camera (square, rectilinear) sees the field plus 3 deg, with the
+# pixel angle at its centre of 76 deg over 2048 px (its size at 70 x 45).
+CAMERA_FOV_DEG = 2.0 * (max(FOV_X_DEG, FOV_Z_DEG) + 3.0)
+CAMERA_RESOLUTION = round(2048 * math.tan(math.radians(CAMERA_FOV_DEG / 2)) / math.tan(math.radians(38.0)))
 HEX_RMS_PITCH = math.sqrt(5.0 / 12.0) / math.sqrt(3.0)
 # A ray this far from its lens's chief direction is stray light, not the lens's
 # light field: pupil parallax keeps a lens's own rays within ~5 deg (99.99 % of
@@ -128,8 +132,8 @@ def validate_surfaces(remapper):
             raise ValueError(f"surface {k}: glass is wound inwards (negative signed volume)")
 
 
-def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5, resolution=2048,
-                 fov_deg=76.0, subdivisions=2, mla_index=INDEX):
+def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5,
+                 resolution=CAMERA_RESOLUTION, fov_deg=CAMERA_FOV_DEG, subdivisions=2, mla_index=INDEX):
     """The Cycles pass alone: per pupil view, the panel pixel and the entered lens
     of every camera ray (work/views). The lenslets are built for INDEX and render
     at mla_index (another wavelength). Returns the design, remapper path, lenslet
@@ -157,8 +161,8 @@ def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_
     return design, remapper, mesh, gap, lenslets, views
 
 
-def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5, resolution=2048,
-             fov_deg=76.0, subdivisions=2):
+def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5,
+             resolution=CAMERA_RESOLUTION, fov_deg=CAMERA_FOV_DEG, subdivisions=2):
     work = Path(work)
     design, remapper, mesh, gap, lenslets, views = render_views(design_dir, work, panel_pixels, view_spacing_mm,
                                                                 resolution, fov_deg, subdivisions)
