@@ -62,10 +62,10 @@ def _plate_with_hole(z, half_hole_x, half_hole_y):
 MASK_EDGE_POINTS = 1001        # chief rays along the elliptic field's edge (x half) that outline the mask
 
 
-def export(best_json, out_dir, rank=0, device="cuda"):
+def export(best_json, out_dir, rank=0, device="cuda", decentre_lens1_mm=0.0):
     entry = json.loads(Path(best_json).read_text())[rank]
     dev = torch.device(device)
-    lay = fs.entry_layout(entry, "pancake")
+    lay = dict(fs.entry_layout(entry, "pancake"), decentre_lens1_mm=decentre_lens1_mm)
     x = torch.tensor([entry["x"]], dtype=torch.float64, device=dev)
     idx = torch.tensor([entry["indices"]], dtype=torch.float64, device=dev)
     batch = fs.to_batch(x, idx, lay)
@@ -138,7 +138,7 @@ def export(best_json, out_dir, rank=0, device="cuda"):
     basis = np.stack([u, v, w]) @ ef.TRACER_TO_WORLD
     origin = ef.to_world(o) - float(vl.vertex_height_um(0.0, 0.0, array_flip)) * 1e-3 * basis[2]
     design = {"lenslets": fs.LENSLETS, "lenslet_flip_v": array_flip, "remapper_npz": "remapper.npz",
-              "field_deg": entry["field_deg"],
+              "field_deg": entry["field_deg"], "decentre_lens1_mm": decentre_lens1_mm,
               "panel_pose": {"origin_mm": origin.tolist(), "basis": basis.tolist()},
               "source": {"design": Path(best_json).name, "rank": rank, "material": entry["material"],
                          "family": "pancake"}}
@@ -163,8 +163,10 @@ def main():
     ap.add_argument("best_json")
     ap.add_argument("out_dir")
     ap.add_argument("--rank", type=int, default=0)
+    ap.add_argument("--decentre-lens1-mm", type=float, default=0.0,
+                    help="vertical decentre of lens 1 and its half-mirror (surfaces 0, 2, 3); the polariser stays put")
     args = ap.parse_args()
-    print(export(args.best_json, args.out_dir, args.rank))
+    print(export(args.best_json, args.out_dir, args.rank, decentre_lens1_mm=args.decentre_lens1_mm))
 
 
 if __name__ == "__main__":

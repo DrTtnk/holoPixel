@@ -32,6 +32,8 @@ import export_fold as ef
 import fold_search as fs
 import offaxis_tracer as ot
 
+DECENTRE_LENS1_SURFACES = [0, 2, 3]   # half-mirror (reflect), half-mirror (transmit), lens 1 back; the polariser (1) stays
+
 EYE_RELIEF_MIN_MM = 15.0
 TRACK_MAX_MM = 40.0          # pupil to lenslet array: the point of a pancake
 HM_R0_MM, LENS_R0_MM = 20.0, 10.0
@@ -49,7 +51,8 @@ def layout(n_el, flip_u=1, flip_v=1):
         i += n
         return s
 
-    lay = {"family": "pancake", "n_el": n_el, "flip_u": flip_u, "flip_v": flip_v, "cavity": take(2),
+    lay = {"family": "pancake", "n_el": n_el, "flip_u": flip_u, "flip_v": flip_v, "decentre_lens1_mm": 0.0,
+           "cavity": take(2),
            "hm_shape": take(fs.N_SHAPE), "lens1": {"thickness": take(1), "back": take(fs.N_SHAPE)}, "elements": []}
     for _ in range(n_el - 1):
         lay["elements"].append({"pose": take(2), "front": take(fs.N_SHAPE), "back": take(fs.N_SHAPE)})
@@ -131,7 +134,9 @@ def to_batch(x, indices, lay):
     add(z + x[:, lay["image"]][:, 0], flat, one)
     st = lambda v: torch.stack(v, 1)  # noqa: E731
     S = len(zs)
-    return ot.Batch(y=torch.zeros(B, S, dtype=x.dtype, device=x.device), z=st(zs),
+    y = torch.zeros(B, S, dtype=x.dtype, device=x.device)
+    y[:, DECENTRE_LENS1_SURFACES] = lay["decentre_lens1_mm"]                 # 0 unless a steered fovea is modelled
+    return ot.Batch(y=y, z=st(zs),
                     rx=torch.zeros(B, S, dtype=x.dtype, device=x.device), c=st(cs), k=st(ks), xy=st(Cs), n=st(ns),
                     mirror=(True, True) + (False,) * (S - 2), terms=fs.TERMS,
                     image_sag=fs.bowl(x.device, lay["flip_v"], light_along_z=1))
