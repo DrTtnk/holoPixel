@@ -311,3 +311,62 @@ def test_the_polygon_outside_term_is_the_depth_inside_the_opening_plus_the_margi
     alive = torch.tensor([[True, True, True, False]])
     got = fs.outside_violation_polygon(land, alive, sq)
     assert got[0].tolist() == pytest.approx([1.0 + fs.OUT_MARGIN_MM, fs.OUT_MARGIN_MM - 0.1, 0.0, 0.0])
+
+
+def test_the_parallax_term_is_the_angle_beyond_its_limit_that_a_pupil_edge_ray_is_off():
+    """A pupil-edge landing shifted by J (12 deg) from the chief landing is 12 deg off
+    (J the design's own local Jacobian): PARALLAX_MAX_DEG less is the violation;
+    below the limit, or lost, none."""
+    J = torch.tensor([[[[2.0, 0.3], [-0.4, 1.5]]]], dtype=torch.float64)                # (B, N, 2, 2) mm per rad
+    step = lambda deg, direction: (J[0, 0] @ torch.tensor(direction, dtype=torch.float64)) * math.radians(deg)  # noqa: E731
+    chief = torch.tensor([[[1.0, -2.0]]], dtype=torch.float64)
+    edge = torch.stack([chief[0, 0] + step(12.0, [1.0, 0.0]), chief[0, 0] + step(5.0, [0.0, 1.0]),
+                        chief[0, 0] + step(14.0, [0.6, 0.8]), chief[0, 0] + step(20.0, [1.0, 0.0])])[None, None]
+    alive = torch.tensor([[[True, True, True, False]]])
+    got = fs.parallax_violation(edge, chief, J, alive)
+    assert got[0, 0].tolist() == pytest.approx([12.0 - fs.PARALLAX_MAX_DEG, 0.0, 14.0 - fs.PARALLAX_MAX_DEG, 0.0])
+
+
+def test_the_dense_jacobian_is_the_design_s_own_including_the_symmetry_axis():
+    """Central differences on the dense grid are exact for a quadratic, plane-symmetric
+    map (x odd, y even in theta_x); the tx = 0 column uses the mirror image. A point
+    with a lost or missing neighbour has no Jacobian."""
+    dense = fs.dense_grid()
+    t = torch.tensor(np.radians(dense), dtype=torch.float64)[None]                    # (1, nx, ny, 2)
+    a, c, d, e = 3.0, 0.7, 2.5, -0.9
+    land = torch.stack([a * t[..., 0] + c * t[..., 0] * t[..., 1], d * t[..., 1] + e * t[..., 0] ** 2], -1)
+    ok = torch.ones(land.shape[:3], dtype=torch.bool)
+    ok[0, 5, 7] = False
+    jac, valid = fs.dense_jacobian(land, ok, math.radians(fs.DENSE_STEP_DEG))
+    want = torch.stack([torch.stack([a + c * t[..., 1], c * t[..., 0]], -1),
+                        torch.stack([2 * e * t[..., 0], torch.full_like(t[..., 0], d)], -1)], -2)
+    inner = valid[0]
+    assert jac[0][inner].numpy() == pytest.approx(want[0][inner].numpy(), abs=1e-9)
+    assert bool(valid[0, 0, 3]) and not bool(valid[0, 5, 7]) and not bool(valid[0, 4, 7]) and not bool(valid[0, 5, 6])
+    assert not bool(valid[0, -1, 3]) and not bool(valid[0, 3, 0]) and not bool(valid[0, 3, -1])
+
+
+def test_the_parallax_term_enters_the_merit(designs, device):
+    lay, x, idx = designs
+    ctx = fs.context(device)
+    with torch.no_grad():
+        _, info = fs.residuals(x, idx, lay, ctx)
+        batch = fs.to_batch(x, idx, lay)
+        chief = torch.zeros(1, 2, dtype=torch.float64, device=device)
+        land, _, alive = ot.trace(batch, ctx["dense_fields"], chief)
+        edge, _, edge_alive = ot.trace(batch, ctx["dense_fields"], ctx["pupil_edge"])
+        B, n = len(x), ctx["dense_shape"][0] * ctx["dense_shape"][1]
+        grid = torch.zeros(B, n, 2, dtype=torch.float64, device=device)
+        grid[:, ctx["dense_index"]] = land[:, :, 0]
+        okg = torch.zeros(B, n, dtype=torch.bool, device=device)
+        okg[:, ctx["dense_index"]] = alive[:, :, 0]
+        jac, valid = fs.dense_jacobian(grid.reshape(B, *ctx["dense_shape"], 2), okg.reshape(B, *ctx["dense_shape"]),
+                                       math.radians(fs.DENSE_STEP_DEG))
+        jac = jac.reshape(B, n, 2, 2)[:, ctx["dense_index"]]
+        valid = valid.reshape(B, n)[:, ctx["dense_index"]]
+        sign = lay["flip_u"] * lay["flip_v"] * ctx["dense_sign"]
+        valid = valid & (sign * torch.linalg.det(jac) / ctx["dense_point_det"] >= fs.Q_MIN)
+        jac = torch.where(valid[..., None, None], jac, torch.eye(2, dtype=torch.float64, device=device))
+        par = fs.parallax_violation(edge, land[:, :, 0], jac, edge_alive & valid[..., None])
+    expected = fs.W["parallax"] * (par**2).sum((1, 2)) / par[0].numel()
+    assert info["parallax"].cpu().numpy() == pytest.approx(expected.cpu().numpy(), rel=1e-9, abs=1e-12)

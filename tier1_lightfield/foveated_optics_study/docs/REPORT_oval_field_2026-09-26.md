@@ -6,9 +6,9 @@
   rectangle. The display then has a black mask over the lenslets outside
   the design's own image of the ellipse.
 - The 2-lens glass pancake at the 100 x 80 ellipse is now the best wide
-  design. After an edge polish it passes the coverage mark (0.983 against
-  0.98; the 84 x 61 rectangle has 0.945), with ghost 0.010. Blur is the one
-  metric that still fails.
+  design: coverage 0.979 (the 84 x 61 rectangle has 0.945), blur 5.6 / 8.9
+  (better than 84 x 61's 5.4 / 9.5 at p90), ghost 0.006. An edge polish and
+  a new pupil-parallax merit term removed its bottom-centre ghost patch.
 - Wider ellipses fail: from 107.5 x 86 deg the ghosts come back (0.36).
 - The Cycles evaluation is about **3.4x faster**: about 10 min became 3.0 min.
   The render and mesh changes are bit-identical. The GPU metrics agree with
@@ -23,7 +23,8 @@ All numbers come from the Cycles evaluation (`lf_evaluate.py`, 2560 px panel).
 | 84 x 61 | rectangle | 0.945 | 5.4 / 9.5 | 0.001 | 0.39 % | 18.4 mm |
 | 100 x 80 | rectangle | 0.890 | 7.7 / 13.5 | 0.104 | 3.2 % | 15.0 mm |
 | 100 x 80 | ellipse, before the edge polish | 0.969 | 6.7 / 11.8 | 0.025 | 1.3 % | 15.2 mm |
-| **100 x 80** | **ellipse, edge polish (stored)** | **0.983** | **6.6 / 10.6** | **0.010** | **0.67 %** | 15.2 mm |
+| 100 x 80 | ellipse, edge polish (B) | 0.983 | 6.6 / 10.6 | 0.010 | 0.67 % | 15.2 mm |
+| **100 x 80** | **ellipse, parallax polish (stored)** | **0.979** | **5.6 / 8.9** | **0.006** | **0.48 %** | 15.0 mm |
 | 107.5 x 86 | ellipse | 0.925 | 8.3 / 13.2 | 0.355 | 6.5 % | 15.3 mm |
 | 112.84 x 90.27 (same area as 100 x 80) | ellipse | 0.848 | 10.9 / 16.8 | 0.373 | 11.7 % | 15.1 mm |
 
@@ -31,10 +32,10 @@ Result file: `remapper_designs/freeform_mirror/results_pancake/best_pancake_el2_
 (rank 0). Search, export and evaluation all need
 `HOLOPIXEL_FIELD_DEG=100x80 HOLOPIXEL_FIELD_SHAPE=ellipse`.
 
-The stored design passes coverage (0.983 >= 0.98), ghost (0.010 <= 0.05) and
-eye relief (15.2 >= 15 mm). Blur (p90 10.6 against 0.75) still fails. The
-polished rows use the stricter stray rule and the target edge described
-below.
+The stored design passes ghost (0.006 <= 0.05) and eye relief (15.0 mm);
+coverage misses the 0.98 mark by 0.001, and blur (p90 8.9 against 0.75) still
+fails. The polished rows use the stricter stray rule and the target edge
+described below.
 
 **Edge polish.** The target map now stretches the ellipse to the search's
 panel limit (`foveation_target.EDGE_MARGIN_MM`, 0.1 mm inside the panel
@@ -48,15 +49,34 @@ design before the polish:
 | A: `--weight panel=3000` | 0.997 | 7.83 / 12.74 | 0.019 | 0.99 % |
 | **B: `--weight panel=1000 --weight map=2` (stored)** | 0.983 | 6.61 / 10.60 | 0.010 | 0.67 % |
 
-B was chosen: it passes coverage and is the best on every other metric.
+B passed coverage and was the best on every other metric.
+
+**The bottom-centre ghost patch was pupil parallax, not a map fold.** On B,
+only 0.5 % of the patch's pixels were shared with a lens more than 3 pitches
+away, but 34 % were lit by stray light: rays from the bottom edge of the
+pupil (view z = -1.73 mm) that arrive from tz ~ -37 deg and enter lenses whose
+direction is tz ~ -26 deg, 10.0-10.8 deg away (the stray limit is 10 deg).
+The landing moves 0.5-0.7 mm across the pupil, and where the retina-matched
+map is compressed that is a large angle: the lenslet plane's virtual image
+there is ~4.5 mm from the eye. No merit term limited this, and the
+pupil-traced fields have no row between -25 and -40 deg. A new merit term,
+`parallax` (on by default, weight 3000), traces the dense chief grid also from
+the four 2 mm pupil-edge points and keeps each landing shift, as an angle
+through the design's own local Jacobian, within `PARALLAX_MAX_DEG` = 10 deg
+(~8.7 deg at the evaluator's outermost view). Polish C (from B, B's weights
+plus parallax, 60 iterations):
+
+| Polish C | Coverage | Blur median / p90 | Ghost | Stray |
+|---|---|---|---|---|
+| rank 0 | 0.983 | 6.86 / 11.29 | 0.004 | 0.46 % |
+| **rank 1 (stored, chosen by Cycles)** | 0.979 | 5.58 / 8.88 | 0.006 | 0.48 % |
 
 ![coverage and ghost](img_oval/coverage_ghost_ell100x80.png)
 
 - The remaining coverage loss is at the left and right edge middles, beyond
   about +-47 deg, where the design lands its field off the panel.
-- The remaining ghosts are the map fold at the bottom centre. The ellipse
-  keeps those directions. The diagonal ghost bands of the rectangle's corners
-  are gone.
+- The ghost patch at the bottom centre is gone (see the parallax polish).
+  The diagonal ghost bands of the rectangle's corners are gone too.
 
 ![mask](img_oval/mask_ell100x80.png)
 
@@ -131,8 +151,7 @@ map compresses the periphery. It covers 19 % of the lenses.
 
 ## Next steps
 
-1. At the 100 x 80 ellipse, remove the bottom-centre map fold (the main ghost
-   area).
+1. Done: the bottom-centre ghost (pupil parallax, the `parallax` term).
 2. Done: the edge polish (coverage 0.983). Polish A reached 0.997 at a blur
    cost; a run between A and B could get both.
 3. Speed-up: the renders are now most of an evaluation (one pass, ~1 s a view).

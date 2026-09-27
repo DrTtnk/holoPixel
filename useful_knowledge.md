@@ -1016,3 +1016,15 @@ fraction by 3e-5. True, but the ghost mean moved 6 % (0.0254 -> 0.0271),
 because a stray ray makes its PIXEL a ghost pixel and every ray on that pixel
 becomes a ghost. Estimate a rule change through the metric that aggregates
 it, not through the count of rays it touches.
+
+## The 100 x 80 "map fold" was pupil parallax
+
+I called the bottom-centre ghost patch of the 100 x 80 designs a map fold
+(in the report of 2026-09-26 and in memory). Wrong: the chief-ray map there
+is one-to-one. The patch was stray light from the pupil's bottom edge, 10-11
+deg off the lenses it entered, because the landing shift across the pupil
+(~0.6 mm) is a large angle where the map is compressed. Check the mechanism
+(which rays, which pupil views) before naming it. A first parallax term that
+converted the shift through the TARGET map's Jacobian flagged 64 % of the
+field; the design's own Jacobian (dense-grid differences) flagged only the
+band Cycles shows.

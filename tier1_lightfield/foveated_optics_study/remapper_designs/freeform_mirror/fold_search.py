@@ -29,6 +29,12 @@ Merit, in the units the acceptance evaluator (lf_evaluate.py) uses:
           a pixel must not be seen from two directions. An elliptic field has a
           black mask outside each design's own image of the ellipse: there they
           must land outside that image.
+  parallax  seen from the pupil's edge, a direction must still land near its own
+          chief landing: the shift, as a field angle through the design's own
+          local Jacobian (dense_jacobian), stays within PARALLAX_MAX_DEG on the
+          dense grid (the evaluator calls a ray more than 10 deg off its lens
+          stray light). Only where the map is not collapsed (area ratio at
+          least Q_MIN, the fold term's test): there the linear angle is meaningless.
   space   no hardware (corrector hits, panel corners) inside the eye's view
           cone to the mirror, nearer the pupil than CLEARANCE_MM, or behind
           the face plane MIN_Z_MM; glass at least MIN_GLASS_MM along every ray
@@ -85,9 +91,11 @@ DENSE_STEP_DEG = 1.25           # chief-ray grid for the fold term
 Q_MIN = 0.2                     # a grid cell's signed area over the target's, at least
 RING_BEYOND_DEG = (1.0, 3.0, 6.0, 9.0)   # rings of directions beyond the field of view
 OUT_MARGIN_MM = 0.2             # they land at least this far beyond the panel edge
+PARALLAX_MAX_DEG = 10.0         # at the 2 mm pupil edge; ~8.7 at the evaluator's outermost view (1.73 mm), where 10 is stray
+PUPIL_EDGE = ((0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0))   # normalised pupil points, the 2 mm edge
 N_EDGE = 97                     # chief rays along the elliptic field's edge (x half): its image, the mask opening
 W = {"blur": 1.0, "hinge": 10.0, "ratio": 30.0, "panel": 30.0, "tilt": 1.0, "space": 3.0, "barrier": 30.0,
-     "map": 10.0, "fold": 3000.0, "outside": 3000.0}    # a folded map or a stray direction is a failure, not a trade
+     "map": 10.0, "fold": 3000.0, "outside": 3000.0, "parallax": 3000.0}    # a fold or stray light is a failure, not a trade
 
 
 def fold_layout(n_el, flip_u=1, flip_v=1):
@@ -411,6 +419,34 @@ def fold_violation(land, alive, det_target, sign):
     return torch.relu(Q_MIN - q) * ok.double()
 
 
+def dense_jacobian(land, ok, step):
+    """The design's own local Jacobian on the dense grid, (B, nx, ny, 2, 2) mm per
+    rad (columns d/dtheta_x, d/dtheta_z), by central differences of the chief
+    landings (B, nx, ny, 2); the tx = 0 column's missing neighbour is its mirror
+    image (the design is plane-symmetric). valid (B, nx, ny): the point and its
+    four neighbours are traced and alive."""
+    mirror = torch.tensor([-1.0, 1.0], dtype=land.dtype, device=land.device)
+    land_x = torch.cat([land[:, 1:2] * mirror, land], 1)                     # column -1 = mirrored column 1
+    ok_x = torch.cat([ok[:, 1:2], ok], 1)
+    d_x = (land_x[:, 2:] - land_x[:, :-2]) / (2.0 * step)                    # (B, nx - 1, ny, 2)
+    d_z = (land[:, :, 2:] - land[:, :, :-2]) / (2.0 * step)                  # (B, nx, ny - 2, 2)
+    jac = torch.zeros(*land.shape[:3], 2, 2, dtype=land.dtype, device=land.device)
+    jac[:, :-1, :, :, 0] = d_x
+    jac[:, :, 1:-1, :, 1] = d_z
+    valid = torch.zeros_like(ok)
+    valid[:, :-1, 1:-1] = (ok[:, :-1, 1:-1] & ok_x[:, :-2, 1:-1] & ok_x[:, 2:, 1:-1]
+                           & ok[:, :-1, :-2] & ok[:, :-1, 2:])
+    return jac, valid
+
+
+def parallax_violation(edge_land, chief_land, jac, alive):
+    """Degrees beyond PARALLAX_MAX_DEG by which pupil-edge rays (B, N, P, 2) land
+    off their chief landing (B, N, 2), as a field angle through the local
+    Jacobian (B, N, 2, 2); zero where not alive."""
+    shift = torch.linalg.solve(jac[:, :, None], (edge_land - chief_land[:, :, None])[..., None])[..., 0]
+    return torch.relu(torch.rad2deg(torch.linalg.norm(shift, dim=-1)) - PARALLAX_MAX_DEG) * alive.double()
+
+
 def outside_violation(land, alive):
     """How deep inside the panel (plus margin) an out-of-field ray lands, mm."""
     return torch.relu(PANEL_HALF_MM + OUT_MARGIN_MM - land.abs().amax(-1)) * alive.double()
@@ -484,6 +520,8 @@ def context(device, weights=W, tilt_max_deg=TILT_MAX_DEG):
             "jac_target": t(jac_t), "sv_target": t(np.linalg.svd(jac_t, compute_uv=False)),
             "panel_target": t(panel_t), "n_fields": len(fields),
             "dense_fields": t(dense[dense_in]), "dense_index": t(np.flatnonzero(dense_in), torch.int64),
+            "pupil_edge": t(PUPIL_EDGE),
+            "dense_point_det": t(np.abs(np.linalg.det(ft.jacobian_mm_per_rad(*np.radians(dense[dense_in]).T)))),
             "dense_shape": dense.shape[:2],
             "dense_det": t(np.abs(det_t)), "dense_sign": float(np.sign(det_t[0, 0])),
             "ring_fields": t(ring_fields()),
@@ -580,12 +618,21 @@ def residuals(x, indices, lay, ctx):
         poly = opening_polygon(land_c[:, nd + nr:, 0])
         out = outside_violation_polygon(land_c[:, nd:nd + nr, 0], alive_c[:, nd:nd + nr, 0], poly)
     r_out = out * math.sqrt(ctx["weights"]["outside"] / out.shape[1])
+    edge_land, _, edge_alive = ot.trace(batch, ctx["dense_fields"], ctx["pupil_edge"])
+    jac_d, valid_d = dense_jacobian(land_d.reshape(B, *ctx["dense_shape"], 2), ok_d.reshape(B, *ctx["dense_shape"]),
+                                    math.radians(DENSE_STEP_DEG))
+    jac_d = jac_d.reshape(B, n_dense, 2, 2)[:, ctx["dense_index"]].detach()          # a fixed metric, as for blur
+    valid_d = valid_d.reshape(B, n_dense)[:, ctx["dense_index"]]
+    valid_d = valid_d & (sign * torch.linalg.det(jac_d) / ctx["dense_point_det"] >= Q_MIN)   # collapsed: the fold term's
+    jac_d = torch.where(valid_d[..., None, None], jac_d, torch.eye(2, dtype=x.dtype, device=x.device))
+    par = parallax_violation(edge_land, land_c[:, :nd, 0], jac_d, edge_alive & valid_d[..., None])
+    r_par = par.reshape(B, -1) * math.sqrt(ctx["weights"]["parallax"] / par[0].numel())
 
     space, barrier = FAMILIES[lay["family"]]["constraints"](batch, diag, alive, lay, x)
     norm = lambda v: torch.sqrt(v + 1e-30)  # noqa: E731
     r = torch.cat([r_blur.reshape(B, -1), r_hinge.reshape(B, -1), r_ratio.reshape(B, -1), r_panel.reshape(B, -1),
                    r_map.reshape(B, -1),
-                   r_tilt, r_fold, r_out, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
+                   r_tilt, r_fold, r_out, r_par, norm(ctx["weights"]["space"] * space)[:, None], norm(ctx["weights"]["barrier"] * barrier)[:, None]], 1)
     # exactly 1.0 when every ray lives: CUDA divides by a scalar through its
     # reciprocal, so n / n alone can come out as 0.9999999999999999
     edge_ok = alive_c[:, nd + nr:, 0]                                  # the elliptic field's edge (none: rect)
@@ -595,7 +642,7 @@ def residuals(x, indices, lay, ctx):
     sq = lambda t: (t**2).reshape(B, -1).sum(1)  # noqa: E731
     return r, {"blur": sq(r_blur), "hinge": sq(r_hinge), "ratio": sq(r_ratio), "panel": sq(r_panel),
                "map": sq(r_map),
-               "tilt": sq(r_tilt), "fold": sq(r_fold), "outside": sq(r_out), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
+               "tilt": sq(r_tilt), "fold": sq(r_fold), "outside": sq(r_out), "parallax": sq(r_par), "space": ctx["weights"]["space"] * space, "barrier": ctx["weights"]["barrier"] * barrier,
                "alive_all": alive_all}
 
 

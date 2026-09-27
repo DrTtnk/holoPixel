@@ -130,7 +130,9 @@ and some lenses get no light).
 
 ## Next steps
 
-1. **At 100 x 80, find the cause of the map fold** at the top and bottom
+1. (Later, REPORT_oval_field_2026-09-26.md: on the 100 x 80 ELLIPSE design the
+   bottom-centre patch was pupil parallax, not a map fold; the rectangle was
+   not rechecked.) **At 100 x 80, find the cause of the map fold** at the top and bottom
    centre. The dense chief-ray fold check was clean at 76 x 52, but it was not
    run on this design.
 2. **Analyse all 61 pupil views of the 100 x 80 evaluation**, and split its
