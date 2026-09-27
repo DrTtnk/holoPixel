@@ -313,3 +313,21 @@ def test_a_gaze_rotates_the_pupil_samples_about_the_eye_s_centre_of_rotation():
     assert (g - centre) @ d == pytest.approx(np.zeros(len(views)), abs=1e-12)          # the disc stays normal to the gaze
     right = ev.gaze_views_mm(views, (20.0, 0.0))[np.argmin(np.linalg.norm(views, axis=1))]
     assert right[0] == pytest.approx(radius * math.sin(math.radians(20.0)), abs=1e-12) and right[2] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_optics_that_follow_the_pupil_cancel_its_shift():
+    """optics_follow="lateral": the optics move sideways with the pupil centre, so
+    the pupil centre is back on the axis at its own depth; "centre": they follow
+    it in 3D, so only the pupil's tilt remains. Moving the optics is moving the
+    pupil points the other way."""
+    views = lp.hex_views_mm(0.5, 2.0)
+    centre_index = np.argmin(np.linalg.norm(views, axis=1))
+    free = ev.gaze_views_mm(views, (20.0, -10.0))
+    lateral = ev.gaze_views_mm(views, (20.0, -10.0), "lateral")
+    full = ev.gaze_views_mm(views, (20.0, -10.0), "centre")
+    shift = free[centre_index] - np.array([0.0, lp.PUPIL_Y_MM, 0.0])
+    assert lateral == pytest.approx(free - [shift[0], 0.0, shift[2]], abs=1e-12)
+    assert full == pytest.approx(free - shift, abs=1e-12)
+    assert full[centre_index] == pytest.approx([0.0, lp.PUPIL_Y_MM, 0.0], abs=1e-12)
+    with pytest.raises(ValueError):
+        ev.gaze_views_mm(views, (20.0, 0.0), "rotate")

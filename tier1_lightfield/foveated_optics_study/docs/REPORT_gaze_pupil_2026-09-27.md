@@ -59,9 +59,35 @@ as well as a steered fovea. Most natural gaze shifts stay within about
 15-20 deg before the head turns too (see the research note), so the eyebox
 target is roughly +-20 deg of gaze, a pupil travel of +-3.4 mm.
 
+## Steered eyebox: the optics follow the pupil
+
+`--optics-follow lateral|centre` moves the whole optics (panel, lenslets,
+pancake) with the pupil centre, sideways or in 3D; in the evaluator that is
+the same as moving the pupil points back by that shift.
+
+| Gaze | Optics | Coverage | Blur median / p90 | Ghost | Stray | Throughput |
+|---|---|---|---|---|---|---|
+| 20 deg right | fixed | 0.862 | 7.69 / 27.43 | 0.074 | 0.59 % | 0.790 |
+| 20 deg right | follow sideways | 0.995 | 5.37 / 9.69 | 0.015 | 0.51 % | 0.945 |
+| 20 deg right | follow in 3D | 0.979 | 5.19 / 9.38 | 0.010 | 0.51 % | 0.901 |
+| 30 deg right | fixed | 0.798 | 9.42 / 40.04 | 0.208 | 1.87 % | 0.714 |
+| 30 deg right | follow sideways | 0.998 | 5.18 / 10.41 | 0.026 | 0.58 % | 0.976 |
+| 30 deg right | follow in 3D | 0.979 | 4.82 / 9.49 | 0.014 | 0.54 % | 0.903 |
+
+- Following the pupil centre gives back the straight-ahead numbers at 20
+  and 30 deg: the pupil's tilt does not matter. Sideways following alone is
+  nearly as good (ghosts a little higher).
+- **Actuator specification for the eyebox:** a sideways travel of
+  9.9 mm x sin(gaze): 1.7 / 3.4 / 5.0 mm at 10 / 20 / 30 deg, settled inside
+  the post-saccadic window. For 3.4 mm in ~60 ms that is ~60 mm/s on average.
+- This does not steer the fovea: the dense sampling stays straight ahead.
+  Rotating the optics about the eye's centre of rotation would move both the
+  eyebox and the fovea (by symmetry it is the same as gaze 0 for the eye),
+  but it moves a much larger mass along a larger path.
+
 ## Next
 
-A steered-eyebox study: model a moving element in the evaluator (for
-example the pancake following the pupil) and find which motion restores the
-straight-ahead numbers at 20-30 deg gaze. That motion is the actuator
-specification.
+- A steered fovea: what motion (or which second element) moves the dense
+  sampling to the gaze direction, and at what cost.
+- A gaze-aware search: include shifted pupils in the merit, to see how much
+  eyebox the fixed optics can give without an actuator.

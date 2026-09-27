@@ -116,18 +116,29 @@ def _axis_hit_mm(verts, faces, origin, direction):
     return float(t[hit].min()) if hit.any() else math.inf
 
 
-def gaze_views_mm(views, gaze_deg):
+OPTICS_FOLLOW = ("none", "lateral", "centre")
+
+
+def gaze_views_mm(views, gaze_deg, optics_follow="none"):
     """World positions (N, 3) of the pupil points views (N, 2: x, z in the pupil
     plane) when the eye looks along gaze_deg (tangent-plane angles): the pupil disc
     turns about the centre of rotation, the eye's axis onto the gaze direction by
-    the minimal rotation (Listing's law)."""
+    the minimal rotation (Listing's law). optics_follow: the optics move with the
+    pupil centre sideways ("lateral") or in 3D ("centre"), which is the same as
+    moving the pupil points back by that shift."""
+    if optics_follow not in OPTICS_FOLLOW:
+        raise ValueError(f"optics_follow must be one of {OPTICS_FOLLOW}, not {optics_follow!r}")
     d = _unit(np.array([math.tan(math.radians(gaze_deg[0])), 1.0, math.tan(math.radians(gaze_deg[1]))]))
     k = np.cross([0.0, 1.0, 0.0], d)
     K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
     R = np.eye(3) + K + K @ K / (1.0 + d[1])
     c = np.array([0.0, lp.EYE_ROTATION_Y_MM, 0.0])
     p = np.column_stack([views[:, 0], np.full(len(views), lp.PUPIL_Y_MM), views[:, 1]])
-    return c + (p - c) @ R.T
+    turned = c + (p - c) @ R.T
+    shift = c + (np.array([0.0, lp.PUPIL_Y_MM, 0.0]) - c) @ R.T - np.array([0.0, lp.PUPIL_Y_MM, 0.0])
+    if optics_follow == "lateral":
+        shift[1] = 0.0
+    return turned - (shift if optics_follow != "none" else 0.0)
 
 
 def validate_surfaces(remapper):
@@ -158,7 +169,7 @@ def validate_surfaces(remapper):
 
 def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5,
                  resolution=CAMERA_RESOLUTION, fov_deg=CAMERA_FOV_DEG, subdivisions=2, mla_index=INDEX,
-                 gaze_deg=(0.0, 0.0)):
+                 gaze_deg=(0.0, 0.0), optics_follow="none"):
     """The Cycles pass alone: per pupil view, the panel pixel and the entered lens
     of every camera ray (work/views). The lenslets are built for INDEX and render
     at mla_index (another wavelength). Returns the design, remapper path, lenslet
@@ -182,7 +193,7 @@ def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_
         "mode": "evaluate", "mla_npz": str(work / "mla_mesh.npz"), "index": mla_index,
         "panel_pose": design["panel_pose"], "gap_um": gap, "panel_pixels": panel_pixels,
         "pixel_um": PIXEL_UM, "camera": {"resolution": resolution, "fov_deg": fov_deg},
-        "views_mm": gaze_views_mm(views, gaze_deg).tolist(), "tmp_dir": str(work / "views"), "remapper_npz": str(remapper),
+        "views_mm": gaze_views_mm(views, gaze_deg, optics_follow).tolist(), "tmp_dir": str(work / "views"), "remapper_npz": str(remapper),
         "out_npz": str(work / "evaluate.npz"),
     }
     lp.run_blender(cfg, work)
@@ -190,17 +201,19 @@ def render_views(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_
 
 
 def evaluate(design_dir, work, panel_pixels=spec.PANEL_PIXELS, view_spacing_mm=0.5,
-             resolution=CAMERA_RESOLUTION, fov_deg=CAMERA_FOV_DEG, subdivisions=2, gaze_deg=(0.0, 0.0)):
+             resolution=CAMERA_RESOLUTION, fov_deg=CAMERA_FOV_DEG, subdivisions=2, gaze_deg=(0.0, 0.0),
+             optics_follow="none"):
     """gaze_deg: the eye looks there, its pupil turned about the centre of rotation
-    (gaze_views_mm); the metrics keep the straight-ahead retina and field."""
+    (gaze_views_mm, with optics_follow); the metrics keep the straight-ahead retina
+    and field."""
     work = Path(work)
     design, remapper, mesh, gap, lenslets, views = render_views(design_dir, work, panel_pixels, view_spacing_mm,
                                                                 resolution, fov_deg, subdivisions,
-                                                                gaze_deg=gaze_deg)
+                                                                gaze_deg=gaze_deg, optics_follow=optics_follow)
     report = metrics(work / "views", views, mesh.centres, panel_pixels)
     report["geometry"] = geometry(design, remapper, mesh, gap)
     report["design"] = {**lenslets, "gap_um": gap, "centre_thickness_um": mesh.centre_thickness,
-                        "n_views": len(views), "gaze_deg": list(gaze_deg),
+                        "n_views": len(views), "gaze_deg": list(gaze_deg), "optics_follow": optics_follow,
                         "panel_pixels": panel_pixels, "resolution": resolution}
     report["accept"] = acceptance(report)
     (work / "report.json").write_text(json.dumps(report, indent=1))
@@ -483,9 +496,12 @@ def main():
     ap.add_argument("--pixels", type=int, default=2044)
     ap.add_argument("--gaze-deg", type=float, nargs=2, default=(0.0, 0.0), metavar=("TX", "TZ"),
                     help="the eye looks there: the pupil turns about the eye's centre of rotation")
+    ap.add_argument("--optics-follow", choices=OPTICS_FOLLOW, default="none",
+                    help="the optics move with the pupil centre: sideways (lateral) or in 3D (centre)")
     args = ap.parse_args()
     work = Path(args.work) if args.work else Path(args.design_dir) / "evaluation"
-    rep = evaluate(args.design_dir, work, panel_pixels=args.pixels, gaze_deg=tuple(args.gaze_deg))
+    rep = evaluate(args.design_dir, work, panel_pixels=args.pixels, gaze_deg=tuple(args.gaze_deg),
+                   optics_follow=args.optics_follow)
     print(json.dumps({k: rep[k] for k in rep if k != "design"}, indent=1))
     print("ACCEPTED" if rep["accept"]["passed"] else "REJECTED")
 
