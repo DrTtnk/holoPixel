@@ -789,7 +789,9 @@ def family_orientation(n_el, material, rng, device, lo, hi, count=512, family="f
 def live_seeds(lay, count, material, rng, device, ctx, lo, hi, chunk=512):
     """Random designs in which every traced ray (and every chief ray of the
     Jacobian) reaches the panel. The search then never lets a ray die."""
-    xs, idxs, tried = [], [], 0
+    xs = [torch.zeros(0, lay["size"], dtype=torch.float64, device=device)]
+    idxs = [torch.zeros(0, lay["n_el"], dtype=torch.float64, device=device)]
+    tried = 0
     while sum(len(x) for x in xs) < count:
         x = torch.clamp(random_designs(lay, chunk, rng, device), lo, hi)
         idx = torch.tensor(rng.choice(INDEX_SETS[material], size=(chunk, lay["n_el"])), dtype=torch.float64,

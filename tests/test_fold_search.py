@@ -370,3 +370,13 @@ def test_the_parallax_term_enters_the_merit(designs, device):
         par = fs.parallax_violation(edge, land[:, :, 0], jac, edge_alive & valid[..., None])
     expected = fs.W["parallax"] * (par**2).sum((1, 2)) / par[0].numel()
     assert info["parallax"].cpu().numpy() == pytest.approx(expected.cpu().numpy(), rel=1e-9, abs=1e-12)
+
+
+def test_no_live_seeds_are_drawn_when_the_stored_seeds_fill_the_run(device):
+    """--designs equal to the number of stored seeds: live_seeds(count=0) returns
+    empty tensors, not an error."""
+    lay = fs.layout(1)
+    ctx = fs.context(device)
+    lo, hi = fs.bounds(lay, device)
+    x, idx, tried = fs.live_seeds(lay, 0, "glass", np.random.default_rng(0), device, ctx, lo, hi)
+    assert x.shape == (0, lay["size"]) and idx.shape == (0, 1) and tried == 0
