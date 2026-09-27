@@ -19,6 +19,7 @@ import screen_spec as spec
 HERE = Path(__file__).resolve().parent
 BLENDER_SCRIPT = HERE / "lf_blender.py"
 PUPIL_Y_MM = -3.6
+EYE_ROTATION_Y_MM = -13.5      # the eye's centre of rotation (blender/eye_and_screen.ROTATION_Y)
 
 
 @dataclass(frozen=True)

@@ -292,3 +292,24 @@ def test_the_tir_fold_loses_exactly_the_pupil_points_below_the_critical_angle(di
     predicted = seen_direct & (incidence > critical)
     assert np.sum(~(incidence > critical) & decided) >= 3
     assert np.array_equal(seen_tir[decided], predicted[decided])
+
+
+def test_a_gaze_rotates_the_pupil_samples_about_the_eye_s_centre_of_rotation():
+    """lf_evaluate.gaze_views_mm: the pupil disc (points at y = PUPIL_Y) turns about
+    the centre of rotation so that the eye's axis points along the gaze direction
+    (tangent-plane angles, Listing's minimal rotation). Straight ahead it is the
+    plain disc; at 20 deg to the right its centre moves 9.9 sin(20) mm to +x."""
+    views = lp.hex_views_mm(0.5, 2.0)
+    flat = ev.gaze_views_mm(views, (0.0, 0.0))
+    assert flat == pytest.approx(np.column_stack([views[:, 0], np.full(len(views), lp.PUPIL_Y_MM), views[:, 1]]))
+    g = ev.gaze_views_mm(views, (20.0, -10.0))
+    c = np.array([0.0, lp.EYE_ROTATION_Y_MM, 0.0])
+    radius = lp.PUPIL_Y_MM - lp.EYE_ROTATION_Y_MM
+    d = np.array([math.tan(math.radians(20.0)), 1.0, math.tan(math.radians(-10.0))])
+    d /= np.linalg.norm(d)
+    centre = g[np.argmin(np.linalg.norm(views, axis=1))]
+    assert centre == pytest.approx(c + radius * d, abs=1e-12)
+    assert np.linalg.norm(g - c, axis=1) == pytest.approx(np.linalg.norm(flat - c, axis=1), rel=1e-12)
+    assert (g - centre) @ d == pytest.approx(np.zeros(len(views)), abs=1e-12)          # the disc stays normal to the gaze
+    right = ev.gaze_views_mm(views, (20.0, 0.0))[np.argmin(np.linalg.norm(views, axis=1))]
+    assert right[0] == pytest.approx(radius * math.sin(math.radians(20.0)), abs=1e-12) and right[2] == pytest.approx(0.0, abs=1e-12)

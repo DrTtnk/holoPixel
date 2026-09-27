@@ -595,8 +595,16 @@ def add_camera(cfg):
 
 
 def place(cam, view_mm, aim_distance_mm):
-    """Pupil point (x, z), looking along +Y. With aim_distance_mm, an off-axis
-    lens shift keeps the axis point at that distance centred in frame."""
+    """Pupil point (x, z) in the pupil plane, or a world position (x, y, z) (a
+    turned eye's pupil), looking along +Y. With aim_distance_mm (pupil-plane
+    points only), an off-axis lens shift keeps the axis point at that distance
+    centred in frame."""
+    if len(view_mm) == 3:
+        if aim_distance_mm is not None:
+            raise ValueError("a lens shift is defined for pupil-plane points only")
+        cam.location = tuple(view_mm)
+        cam.data.shift_x = cam.data.shift_y = 0.0
+        return
     cam.location = (view_mm[0], eye.PUPIL_Y, view_mm[1])
     if aim_distance_mm is None:
         cam.data.shift_x = cam.data.shift_y = 0.0
