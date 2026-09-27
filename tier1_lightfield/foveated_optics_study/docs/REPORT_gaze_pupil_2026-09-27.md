@@ -85,9 +85,40 @@ the same as moving the pupil points back by that shift.
   eyebox and the fovea (by symmetry it is the same as gaze 0 for the eye),
   but it moves a much larger mass along a larger path.
 
+## Steered fovea: first numbers
+
+**A. Rotate the whole module about the eye's centre of rotation.** For the
+eye this is the same as gaze 0 (the numbers above, straight ahead). The glass
+of the stored design is ~23 g (two lenses, 43 and 26 mm across, n = 1.9,
+density assumed 5.0 g/cm^3) at 29-37 mm from the centre of rotation; with
+~2 g of panel and ~10 g of housing (assumed) the inertia is ~4e-5 kg m^2.
+Bang-bang moves: 10 deg in 50 ms needs 11.5 mN m and 0.08 W peak; 20 deg in
+60 ms needs 16 mN m, 0.19 W and a peak of 670 deg/s; 30 deg in 80 ms needs
+13.5 mN m. A slower move over the post-saccadic window (~150 ms) needs ~6x
+less torque. The hard parts are mechanical: a remote centre of motion 13.5
+mm inside the eye, ~10 mm of sweep at the front lens edge next to the face,
+the reaction torque on the head, and two of everything.
+
+**B. Decentre one pancake lens** (tracer, chief rays; the panel centre, where
+the foveal lenslets are, is seen at +1.06 deg straight ahead):
+
+| Element moved up | 0.5 mm | 1 mm | 2 mm | 4 mm |
+|---|---|---|---|---|
+| lens 2: panel centre seen at | +1.2 | +1.4 | +1.7 | +2.1 deg |
+| lens 1 + half-mirror: panel centre seen at | -0.2 | -1.5 | -4.4 | -12.6 deg |
+| lens 1: magnification there | 0.99 | 0.97 | 0.91 | 0.58 (3 % of rays lost) |
+
+Decentring the half-mirror lens (~12 g) steers the fovea by ~2.5-3 deg per mm
+up to about +-5 deg, with 9 % less magnification; beyond that the steered
+fovea soon gets coarse. Not yet checked: the variable-focal lenslets are
+matched to the undecentred map (a Cycles check needs exporter support for a
+decentred lens). The eyebox translation is still needed on top.
+
+**C. A steered foveal inset** (a second display and a combiner, as in Kim et
+al., Foveated AR, 2019) reaches any gaze but changes the architecture.
+
 ## Next
 
-- A steered fovea: what motion (or which second element) moves the dense
-  sampling to the gaze direction, and at what cost.
+- Choose between A, B (small gaze angles only) and C.
 - A gaze-aware search: include shifted pupils in the merit, to see how much
   eyebox the fixed optics can give without an actuator.
